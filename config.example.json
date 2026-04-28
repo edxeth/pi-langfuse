@@ -1,0 +1,14 @@
+{
+	"enabled": false,
+	"publicKey": "pk-lf-YOUR-KEY-HERE",
+	"secretKey": "sk-lf-YOUR-KEY-HERE",
+	"host": "https://cloud.langfuse.com",
+	"userId": "",
+	"defaultTags": ["team:platform", "env:local"],
+	"traceInputMaxChars": 2000,
+	"traceOutputMaxChars": 2000,
+	"toolArgsMaxChars": 500,
+	"toolOutputMaxChars": 2000,
+	"captureToolProgress": true,
+	"captureMessageUpdates": false
+}

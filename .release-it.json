@@ -1,0 +1,38 @@
+{
+	"git": {
+		"pushRepo": "origin",
+		"tagName": "v${version}",
+		"push": true,
+		"commitMessage": "chore: release v${version}"
+	},
+	"github": {
+		"release": false
+	},
+	"npm": {
+		"publish": true
+	},
+	"plugins": {
+		"@release-it/conventional-changelog": {
+			"infile": "CHANGELOG.md",
+			"header": "# Changelog\n\nAll notable changes to this project will be documented in this file.",
+			"preset": {
+				"name": "conventionalcommits",
+				"types": [
+					{ "type": "feat", "section": "🚀 Features" },
+					{ "type": "fix", "section": "🐛 Bug Fixes" },
+					{ "type": "chore", "section": "🧹 Miscellaneous Chores" },
+					{ "type": "docs", "section": "📝 Documentation" },
+					{ "type": "style", "section": "🎨 Styles" },
+					{ "type": "refactor", "section": "♻️ Code Refactoring" },
+					{ "type": "perf", "section": "⚡️ Performance Improvements" },
+					{ "type": "test", "section": "✅ Tests" }
+				]
+			}
+		}
+	},
+	"hooks": {
+		"before:init": ["npm run typecheck", "npm run test"],
+		"after:bump": "npm run build",
+		"after:release": "gh release create v${version} --repo hdkiller/pi-langfuse --title \"v${version}\" --notes \"${changelog}\""
+	}
+}
