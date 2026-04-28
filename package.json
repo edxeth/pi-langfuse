@@ -1,6 +1,6 @@
 {
-	"name": "@hdkiller/pi-langfuse",
-	"version": "0.2.2",
+	"name": "pi-langfuse",
+	"version": "1.0.0",
 	"description": "Production-grade Langfuse observability for Pi. Tracks prompts, turns, tools, and streaming assistant responses with native trace hierarchies, token usage, and cost monitoring.",
 	"type": "module",
 	"main": "dist/index.js",
@@ -32,8 +32,9 @@
 		"pi-coding-agent",
 		"extension"
 	],
-	"author": "hdkiller",
+	"author": "edxeth",
 	"contributors": [
+		"hdkiller",
 		"Saravanan Ravi (@saravananravi08)",
 		"Maksym Prokopov"
 	],
@@ -41,7 +42,7 @@
 		"extensions": [
 			"./dist/index.js"
 		],
-		"image": "https://raw.githubusercontent.com/hdkiller/pi-langfuse/main/docs/screenshot.jpg"
+		"image": "https://raw.githubusercontent.com/edxeth/pi-langfuse/main/docs/screenshot.jpg"
 	},
 	"dependencies": {
 		"langfuse": "^3.38.20"
@@ -68,11 +69,11 @@
 	},
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/hdkiller/pi-langfuse.git"
+		"url": "https://github.com/edxeth/pi-langfuse.git"
 	},
-	"homepage": "https://github.com/hdkiller/pi-langfuse#readme",
+	"homepage": "https://github.com/edxeth/pi-langfuse#readme",
 	"bugs": {
-		"url": "https://github.com/hdkiller/pi-langfuse/issues"
+		"url": "https://github.com/edxeth/pi-langfuse/issues"
 	},
 	"publishConfig": {
 		"access": "public"

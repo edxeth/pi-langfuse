@@ -6,7 +6,7 @@ Thank you for your interest in improving `pi-langfuse`! This project has recentl
 
 1. **Clone and Install**:
    ```bash
-   git clone https://github.com/hdkiller/pi-langfuse.git
+   git clone https://github.com/edxeth/pi-langfuse.git
    cd pi-langfuse
    npm install
    ```

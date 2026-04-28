@@ -43,7 +43,7 @@ This is the recommended private setup. It does **not** require Langfuse Cloud.
 ### 1. Install the extension
 
 ```bash
-pi install git:git:github.com/edxeth/pi-langfuse
+pi install git:github.com/edxeth/pi-langfuse
 ```
 
 For a local checkout, install dependencies and build first:

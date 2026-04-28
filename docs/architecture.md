@@ -1,4 +1,4 @@
-# Architecture: @hdkiller/pi-langfuse
+# Architecture: pi-langfuse
 
 This document describes the internal architecture of the Langfuse extension for Pi.
 

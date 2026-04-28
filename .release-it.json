@@ -33,6 +33,6 @@
 	"hooks": {
 		"before:init": ["npm run typecheck", "npm run test"],
 		"after:bump": "npm run build",
-		"after:release": "gh release create v${version} --repo hdkiller/pi-langfuse --title \"v${version}\" --notes \"${changelog}\""
+		"after:release": "gh release create v${version} --repo edxeth/pi-langfuse --title \"v${version}\" --notes \"${changelog}\""
 	}
 }
