@@ -42,6 +42,40 @@ describe("index (extension entry)", () => {
 		// we could potentially verify downstream effects if we mocked more.
 	});
 
+	it("should show Langfuse status in the footer status line on session_start", async () => {
+		mockPi.events.emit.mockImplementation((event, probe) => {
+			if (event === "extension:settings:get") {
+				probe.values = {
+					enabled: true,
+					"public-key": "pk-test",
+					"secret-key": "sk-test",
+					"base-url": "http://localhost:3100",
+				};
+			}
+		});
+		await registerExtension(mockPi as unknown as ExtensionArg);
+
+		const sessionStartCall = mockPi.on.mock.calls.find(
+			(call) => call[0] === "session_start",
+		);
+		if (!sessionStartCall)
+			throw new Error("session_start handler not registered");
+		const sessionStartHandler = sessionStartCall[1] as EventHandler;
+		const setStatus = vi.fn();
+
+		await sessionStartHandler(
+			{ reason: "test-reason" },
+			{
+				ui: { setStatus },
+				sessionManager: {
+					getSessionFile: () => "/path/to/test-session.jsonl",
+				},
+			},
+		);
+
+		expect(setStatus).toHaveBeenCalledWith("pi-langfuse:status", "Langfuse 🟢");
+	});
+
 	it("should update model on model_select", async () => {
 		await registerExtension(mockPi as unknown as ExtensionArg);
 

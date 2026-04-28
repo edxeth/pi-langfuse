@@ -87,6 +87,15 @@ let currentProvider = "";
 let promptState: PromptState | null = null;
 let compactCount = 0;
 
+const LANGFUSE_STATUS_KEY = "pi-langfuse:status";
+
+interface LangfuseUiContext {
+	ui?: {
+		setStatus?: (key: string, text: string | undefined) => void;
+	};
+	sessionManager?: { getSessionFile?: () => string | undefined };
+}
+
 function getLiveSettingsView(
 	settings: Partial<SettingsValues>,
 ): SettingsValues {
@@ -123,6 +132,31 @@ function announceConfigState(settings: Partial<SettingsValues>) {
 	for (const warning of getConfigWarnings(config)) {
 		console.warn(`📊 Langfuse: ${warning}`);
 	}
+}
+
+function getLangfuseStatus(config: Config, sessionFile?: string) {
+	if (!config.enabled) {
+		return { icon: "⚪", label: "OFF", detail: "disabled" };
+	}
+	if (!config.publicKey || !config.secretKey) {
+		return { icon: "⚪", label: "OFF", detail: "missing keys" };
+	}
+	if (config.skipUnpersistedSessions && !sessionFile) {
+		return { icon: "⚪", label: "OFF", detail: "no session file" };
+	}
+	return { icon: "🟢", label: "ON", detail: config.host };
+}
+
+function updateLangfuseStatusLine(
+	ctx: LangfuseUiContext | undefined,
+	config: Config,
+) {
+	const setStatus = ctx?.ui?.setStatus;
+	if (!setStatus) return;
+
+	const sessionFile = ctx?.sessionManager?.getSessionFile?.();
+	const status = getLangfuseStatus(config, sessionFile);
+	setStatus(LANGFUSE_STATUS_KEY, `Langfuse ${status.icon}`);
 }
 
 function truncate(text: string, max = 1200) {
@@ -351,6 +385,7 @@ async function finalizePrompt(config: Config | undefined, flush = false) {
 
 export default async function (pi: ExtensionAPI) {
 	let settings = getStoredSettingsValues(pi);
+	let lastUiContext: LangfuseUiContext | undefined;
 
 	const refreshConfig = async () => {
 		settings = getStoredSettingsValues(pi);
@@ -358,6 +393,7 @@ export default async function (pi: ExtensionAPI) {
 		await finalizePrompt(resolveConfig(settings), true);
 		await shutdownClient();
 		announceConfigState(settings);
+		updateLangfuseStatusLine(lastUiContext, resolveConfig(settings));
 	};
 
 	pi.events.on("pi-extension-settings:ready", () => {
@@ -394,6 +430,8 @@ export default async function (pi: ExtensionAPI) {
 			await refreshConfig();
 
 			const next = resolveConfig(settings);
+			lastUiContext = ctx;
+			updateLangfuseStatusLine(ctx, next);
 			const status = next.enabled ? `enabled → ${next.host}` : "disabled";
 			ctx.ui?.notify?.(`Langfuse tracing ${status}`, "info");
 		},
@@ -403,6 +441,8 @@ export default async function (pi: ExtensionAPI) {
 	announceConfigState(settings);
 
 	pi.on("session_start", async (event, ctx) => {
+		lastUiContext = ctx;
+		updateLangfuseStatusLine(ctx, resolveConfig(settings));
 		const sessionFile = ctx.sessionManager.getSessionFile();
 		currentSessionFile = sessionFile || "";
 		if (sessionFile) {
@@ -436,7 +476,9 @@ export default async function (pi: ExtensionAPI) {
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
+		lastUiContext = ctx;
 		const config = resolveConfig(settings);
+		updateLangfuseStatusLine(ctx, config);
 		if (!canTrace(config)) return;
 		const sessionFile = ctx.sessionManager.getSessionFile();
 		if (config.skipUnpersistedSessions && !sessionFile) return;

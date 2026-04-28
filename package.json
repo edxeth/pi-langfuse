@@ -1,85 +1,90 @@
 {
-	"name": "pi-langfuse",
-	"version": "1.0.1",
-	"description": "Production-grade Langfuse observability for Pi. Tracks prompts, turns, tools, and streaming assistant responses with native trace hierarchies, token usage, and cost monitoring.",
-	"type": "module",
-	"main": "dist/index.js",
-	"types": "dist/index.d.ts",
-	"files": [
-		"dist"
-	],
-	"scripts": {
-		"build": "tsc",
-		"check": "biome check --write .",
-		"format": "biome format --write .",
-		"typecheck": "tsc -p tsconfig.typecheck.json",
-		"test": "vitest run",
-		"test:e2e": "RUN_LANGFUSE_E2E=1 vitest run test/e2e.test.ts",
-		"test:watch": "vitest",
-		"prepare": "husky",
-		"release": "release-it"
-	},
-	"lint-staged": {
-		"src/**/*.{js,ts,json}": "biome check --write",
-		"test/**/*.{js,ts,json}": "biome check --write"
-	},
-	"keywords": [
-		"pi-package",
-		"langfuse",
-		"observability",
-		"tracing",
-		"monitoring",
-		"pi-coding-agent",
-		"extension"
-	],
-	"author": "edxeth",
-	"contributors": [
-		"hdkiller",
-		"Saravanan Ravi (@saravananravi08)",
-		"Maksym Prokopov"
-	],
-	"pi": {
-		"extensions": [
-			"./dist/index.js"
-		],
-		"image": "https://raw.githubusercontent.com/edxeth/pi-langfuse/main/docs/screenshot.jpg"
-	},
-	"dependencies": {
-		"langfuse": "^3.38.20"
-	},
-	"devDependencies": {
-		"@biomejs/biome": "^2.3.5",
-		"@release-it/conventional-changelog": "^11.0.0",
-		"@types/node": "^20.0.0",
-		"husky": "^9.1.7",
-		"lint-staged": "^16.4.0",
-		"release-it": "^18.1.1",
-		"tsx": "^4.20.3",
-		"typescript": "^5.9.2",
-		"vitest": "^2.0.0"
-	},
-	"peerDependencies": {
-		"@axnic/pi-extension-settings": "^0.2.0",
-		"@mariozechner/pi-coding-agent": "*"
-	},
-	"peerDependenciesMeta": {
-		"@axnic/pi-extension-settings": {
-			"optional": true
-		}
-	},
-	"repository": {
-		"type": "git",
-		"url": "https://github.com/edxeth/pi-langfuse.git"
-	},
-	"homepage": "https://github.com/edxeth/pi-langfuse#readme",
-	"bugs": {
-		"url": "https://github.com/edxeth/pi-langfuse/issues"
-	},
-	"publishConfig": {
-		"access": "public"
-	},
-	"license": "MIT",
-	"engines": {
-		"node": ">=18"
-	}
+  "name": "pi-langfuse",
+  "version": "1.0.1",
+  "description": "Production-grade Langfuse observability for Pi. Tracks prompts, turns, tools, and streaming assistant responses with native trace hierarchies, token usage, and cost monitoring.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "check": "biome check --write .",
+    "format": "biome format --write .",
+    "typecheck": "tsc -p tsconfig.typecheck.json",
+    "test": "vitest run",
+    "test:e2e": "RUN_LANGFUSE_E2E=1 vitest run test/e2e.test.ts",
+    "test:watch": "vitest",
+    "prepare": "husky",
+    "release": "release-it"
+  },
+  "lint-staged": {
+    "src/**/*.{js,ts,json}": "biome check --write",
+    "test/**/*.{js,ts,json}": "biome check --write"
+  },
+  "keywords": [
+    "pi-package",
+    "langfuse",
+    "observability",
+    "tracing",
+    "monitoring",
+    "pi-coding-agent",
+    "extension"
+  ],
+  "author": "edxeth",
+  "contributors": [
+    "hdkiller",
+    "Saravanan Ravi (@saravananravi08)",
+    "Maksym Prokopov"
+  ],
+  "pi": {
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "image": "https://raw.githubusercontent.com/edxeth/pi-langfuse/main/docs/screenshot.jpg"
+  },
+  "dependencies": {
+    "langfuse": "^3.38.20"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.3.5",
+    "@release-it/conventional-changelog": "^11.0.0",
+    "@types/node": "^20.0.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.4.0",
+    "release-it": "^18.1.1",
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.2",
+    "vitest": "^2.0.0"
+  },
+  "peerDependencies": {
+    "@axnic/pi-extension-settings": "^0.2.0",
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@axnic/pi-extension-settings": {
+      "optional": true
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/edxeth/pi-langfuse.git"
+  },
+  "homepage": "https://github.com/edxeth/pi-langfuse#readme",
+  "bugs": {
+    "url": "https://github.com/edxeth/pi-langfuse/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "trustedDependencies": [
+    "esbuild",
+    "koffi",
+    "protobufjs"
+  ]
 }
