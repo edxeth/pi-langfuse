@@ -28,6 +28,8 @@ const _mockConfig: Config = {
 	skipUnpersistedSessions: true,
 	captureProviderPayload: false,
 	providerPayloadMaxChars: 50_000,
+	rawTraceEnabled: false,
+	rawTraceDir: "",
 	localAutostart: false,
 	localAutostartDir: "",
 	localAutostartHealthUrl: "http://localhost:3100/api/public/health",

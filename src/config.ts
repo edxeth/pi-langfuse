@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { defaultRawTraceDir } from "./raw-trace.js";
 import { DEFAULT_SETTINGS, type SettingsValues } from "./settings.js";
 
 export interface Config {
@@ -21,6 +22,8 @@ export interface Config {
 	skipUnpersistedSessions: boolean;
 	captureProviderPayload: boolean;
 	providerPayloadMaxChars: number;
+	rawTraceEnabled: boolean;
+	rawTraceDir: string;
 	localAutostart: boolean;
 	localAutostartDir: string;
 	localAutostartHealthUrl: string;
@@ -200,6 +203,14 @@ export function resolveConfig(settings: Partial<SettingsValues>): Config {
 			50_000,
 			1_000,
 			1_000_000,
+		),
+		rawTraceEnabled:
+			(fileConfig.rawTraceEnabled as boolean | undefined) ??
+			process.env.PI_LANGFUSE_RAW_TRACE === "1",
+		rawTraceDir: String(
+			fileConfig.rawTraceDir ??
+				process.env.PI_LANGFUSE_RAW_TRACE_DIR ??
+				defaultRawTraceDir(),
 		),
 		localAutostart,
 		localAutostartDir: String(

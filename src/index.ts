@@ -16,6 +16,7 @@ import {
 } from "./langfuse-client.js";
 import { ensureLocalLangfuseStarted } from "./local-autostart.js";
 import { runLangfuseInit } from "./local-init.js";
+import { appendRawTrace } from "./raw-trace.js";
 import {
 	EXTENSION_ID,
 	getStoredSettingsValues,
@@ -34,7 +35,7 @@ interface PiUsage {
 }
 
 interface PromptState {
-	trace: LangfuseTrace;
+	trace?: LangfuseTrace;
 	promptSpan?: LangfuseSpan;
 	userPrompt: string;
 	systemPrompt: string;
@@ -73,6 +74,7 @@ interface ToolState {
 	startedAt: number;
 	span?: LangfuseSpan;
 	argsSummary: string;
+	argsRaw?: unknown;
 	partialOutput?: string;
 	resultOutput?: string;
 	isError?: boolean;
@@ -271,6 +273,39 @@ function getSessionRoot(sessionFile = currentSessionFile) {
 		: undefined;
 }
 
+function rawTraceBase(turnIndex?: number) {
+	return {
+		timestamp: new Date().toISOString(),
+		sessionId: currentSessionId || undefined,
+		sessionFile: currentSessionFile || undefined,
+		turnIndex,
+		provider: currentProvider || undefined,
+		model: currentModel || undefined,
+		runtime: getRuntimeName(),
+	};
+}
+
+function currentTurnIndex() {
+	if (!promptState) return undefined;
+	const activeTurns = Array.from(promptState.activeTurns.values());
+	return activeTurns.length > 0
+		? activeTurns[activeTurns.length - 1]?.index
+		: undefined;
+}
+
+function writeRawTrace(
+	config: Config,
+	record: { type: string } & Record<string, unknown>,
+) {
+	appendRawTrace(config, currentSessionFile, {
+		...rawTraceBase(
+			typeof record.turnIndex === "number" ? record.turnIndex : undefined,
+		),
+		traceId: promptState?.trace?.id,
+		...record,
+	});
+}
+
 function buildTraceTags(config: Config | undefined, cwd: string) {
 	const runtime = getRuntimeName();
 	const tags = [
@@ -342,7 +377,7 @@ async function finalizePrompt(config: Config | undefined, flush = false) {
 		},
 	});
 
-	promptState.trace.update({
+	promptState.trace?.update({
 		output: promptState.lastAssistantText || undefined,
 		userId: getUserId(config),
 		sessionId: currentSessionId || undefined,
@@ -458,6 +493,16 @@ export default async function (pi: ExtensionAPI) {
 		currentSessionReason = data.reason || "startup";
 		currentPreviousSessionFile = data.previousSessionFile || "";
 		compactCount = 0;
+		const config = resolveConfig(settings);
+		appendRawTrace(config, currentSessionFile, {
+			type: "session_start",
+			timestamp: new Date().toISOString(),
+			sessionId: currentSessionId || undefined,
+			sessionFile: currentSessionFile || undefined,
+			reason: currentSessionReason,
+			previousSessionFile: currentPreviousSessionFile || undefined,
+			runtime: getRuntimeName(),
+		});
 	});
 
 	pi.on("model_select", async (event, _ctx) => {
@@ -465,7 +510,7 @@ export default async function (pi: ExtensionAPI) {
 		currentProvider = event.model?.provider || "";
 		if (promptState) {
 			const config = resolveConfig(settings);
-			promptState.trace.update({
+			promptState.trace?.update({
 				metadata: {
 					model: currentModel,
 					provider: currentProvider,
@@ -479,26 +524,54 @@ export default async function (pi: ExtensionAPI) {
 		lastUiContext = ctx;
 		const config = resolveConfig(settings);
 		updateLangfuseStatusLine(ctx, config);
-		if (!canTrace(config)) return;
 		const sessionFile = ctx.sessionManager.getSessionFile();
 		if (config.skipUnpersistedSessions && !sessionFile) return;
+		if (!canTrace(config) && !config.rawTraceEnabled) return;
 		currentSessionFile = sessionFile || "";
 
-		await ensureLocalLangfuseStarted(config);
 		await finalizePrompt(config, false);
 
+		const eventData = event as typeof event & {
+			systemPromptOptions?: { cwd?: string };
+		};
+		const cwd = eventData.systemPromptOptions?.cwd || process.cwd();
+
+		if (!currentModel && ctx.model) {
+			currentModel = ctx.model.id || "";
+			currentProvider = ctx.model.provider || "";
+		}
+
+		promptState = {
+			userPrompt: event.prompt,
+			systemPrompt: event.systemPrompt || "",
+			cwd,
+			startedAt: Date.now(),
+			toolCalls: 0,
+			toolErrors: 0,
+			turns: 0,
+			tokensIn: 0,
+			tokensOut: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			lastAssistantText: "",
+			activeTurns: new Map(),
+			activeTools: new Map(),
+		};
+
+		writeRawTrace(config, {
+			type: "agent_prompt_start",
+			cwd,
+			prompt: event.prompt,
+			systemPrompt: event.systemPrompt || "",
+			sessionReason: currentSessionReason,
+			previousSessionFile: currentPreviousSessionFile || undefined,
+		});
+
 		try {
+			if (!canTrace(config)) return;
+
+			await ensureLocalLangfuseStarted(config);
 			const lf = await getClient(config);
-			const eventData = event as typeof event & {
-				systemPromptOptions?: { cwd?: string };
-			};
-			const cwd = eventData.systemPromptOptions?.cwd || process.cwd();
-
-			if (!currentModel && ctx.model) {
-				currentModel = ctx.model.id || "";
-				currentProvider = ctx.model.provider || "";
-			}
-
 			const trace = lf.trace({
 				name: "pi-agent",
 				input: truncate(event.prompt, config.traceInputMaxChars),
@@ -525,23 +598,7 @@ export default async function (pi: ExtensionAPI) {
 				},
 			});
 
-			promptState = {
-				trace,
-				userPrompt: event.prompt,
-				systemPrompt: event.systemPrompt || "",
-				cwd,
-				startedAt: Date.now(),
-				toolCalls: 0,
-				toolErrors: 0,
-				turns: 0,
-				tokensIn: 0,
-				tokensOut: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-				lastAssistantText: "",
-				activeTurns: new Map(),
-				activeTools: new Map(),
-			};
+			promptState.trace = trace;
 		} catch (e) {
 			console.warn("📊 Langfuse: Failed to create trace", e);
 		}
@@ -550,7 +607,7 @@ export default async function (pi: ExtensionAPI) {
 	pi.on("agent_start", async () => {
 		if (!promptState) return;
 		const config = resolveConfig(settings);
-		if (!canTrace(config)) return;
+		if (!canTrace(config) || !promptState.trace) return;
 		try {
 			const lf = await getClient(config);
 			promptState.promptSpan = lf.span({
@@ -572,13 +629,13 @@ export default async function (pi: ExtensionAPI) {
 	pi.on("turn_start", async (event) => {
 		if (!promptState) return;
 		const config = resolveConfig(settings);
-		if (!canTrace(config)) return;
 		promptState.turns += 1;
 		const turnState: TurnState = {
 			index: event.turnIndex,
 			startedAt: Date.now(),
 		};
 		promptState.activeTurns.set(event.turnIndex, turnState);
+		if (!canTrace(config) || !promptState.trace) return;
 		try {
 			const lf = await getClient(config);
 			turnState.span = lf.span({
@@ -623,6 +680,14 @@ export default async function (pi: ExtensionAPI) {
 		if (!tool) return;
 		const config = resolveConfig(settings);
 		tool.argsSummary = summarizeToolArgs(config, event.toolName, event.input);
+		tool.argsRaw = event.input;
+		writeRawTrace(config, {
+			type: "tool_call",
+			turnIndex: currentTurnIndex(),
+			toolCallId: event.toolCallId,
+			toolName: event.toolName,
+			input: event.input,
+		});
 		tool.span?.update?.({
 			input: tool.argsSummary,
 			metadata: {
@@ -635,7 +700,6 @@ export default async function (pi: ExtensionAPI) {
 	pi.on("tool_execution_start", async (event) => {
 		if (!promptState) return;
 		const config = resolveConfig(settings);
-		if (!canTrace(config)) return;
 
 		promptState.toolCalls += 1;
 		const activeTurns = Array.from(promptState.activeTurns.values());
@@ -645,9 +709,18 @@ export default async function (pi: ExtensionAPI) {
 			toolName: event.toolName,
 			startedAt: Date.now(),
 			argsSummary: summarizeToolArgs(config, event.toolName, event.args),
+			argsRaw: event.args,
 		};
 		promptState.activeTools.set(event.toolCallId, toolState);
+		writeRawTrace(config, {
+			type: "tool_execution_start",
+			turnIndex: activeTurn?.index,
+			toolCallId: event.toolCallId,
+			toolName: event.toolName,
+			args: event.args,
+		});
 
+		if (!canTrace(config) || !promptState.trace) return;
 		try {
 			const lf = await getClient(config);
 			toolState.span = lf.span({
@@ -688,6 +761,15 @@ export default async function (pi: ExtensionAPI) {
 		const config = resolveConfig(settings);
 		tool.resultOutput = summarizeToolResult(config, { content: event.content });
 		tool.isError = event.isError;
+		writeRawTrace(config, {
+			type: "tool_result_first_seen",
+			turnIndex: currentTurnIndex(),
+			toolCallId: event.toolCallId,
+			toolName: event.toolName,
+			input: event.input,
+			content: event.content,
+			isError: event.isError,
+		});
 	});
 
 	pi.on("tool_execution_end", async (event) => {
@@ -699,9 +781,19 @@ export default async function (pi: ExtensionAPI) {
 			promptState.toolErrors += 1;
 		}
 		const durationMs = Date.now() - tool.startedAt;
+		writeRawTrace(config, {
+			type: "tool_execution_end",
+			turnIndex: currentTurnIndex(),
+			toolCallId: event.toolCallId,
+			toolName: event.toolName,
+			args: tool.argsRaw,
+			result: event.result,
+			isError: event.isError,
+			durationMs,
+		});
 		const output =
-			summarizeToolResult(config, event.result) ||
 			tool.resultOutput ||
+			summarizeToolResult(config, event.result) ||
 			tool.partialOutput;
 		tool.span?.end({
 			isError: event.isError,
@@ -719,7 +811,7 @@ export default async function (pi: ExtensionAPI) {
 	pi.on("message_start", async (event) => {
 		if (!promptState) return;
 		const config = resolveConfig(settings);
-		if (!canTrace(config)) return;
+		if (!canTrace(config) || !promptState.trace) return;
 
 		const message = event.message as { role?: string };
 		if (message.role !== "assistant") return;
@@ -804,7 +896,6 @@ export default async function (pi: ExtensionAPI) {
 	pi.on("message_end", async (event) => {
 		if (!promptState) return;
 		const config = resolveConfig(settings);
-		if (!canTrace(config)) return;
 
 		const message = event.message as {
 			role?: string;
@@ -817,7 +908,7 @@ export default async function (pi: ExtensionAPI) {
 		const activeTurns = Array.from(promptState.activeTurns.values());
 		const turnState =
 			activeTurns.length > 0 ? activeTurns[activeTurns.length - 1] : undefined;
-		if (!turnState?.generation) return;
+		if (!turnState) return;
 
 		const outputText = extractTextFromContent(message.content).trim();
 		const finalOutput =
@@ -834,6 +925,14 @@ export default async function (pi: ExtensionAPI) {
 			config.traceOutputMaxChars,
 		);
 		promptState.lastUsage = usage;
+		writeRawTrace(config, {
+			type: "assistant_output",
+			turnIndex: turnState.index,
+			text: finalOutput,
+			thinking: turnState.streamingThinking || undefined,
+			usage,
+			messageModel: message.model || undefined,
+		});
 
 		if (usage) {
 			promptState.tokensIn +=
@@ -842,6 +941,9 @@ export default async function (pi: ExtensionAPI) {
 			promptState.cacheRead += usage.cacheRead ?? 0;
 			promptState.cacheWrite += usage.cacheWrite ?? 0;
 		}
+
+		if (!canTrace(config) || !promptState.trace || !turnState.generation)
+			return;
 
 		try {
 			turnState.generation.end({
@@ -891,7 +993,6 @@ export default async function (pi: ExtensionAPI) {
 	pi.on("turn_end", async (event) => {
 		if (!promptState) return;
 		const config = resolveConfig(settings);
-		if (!canTrace(config)) return;
 
 		const message = event.message as {
 			role?: string;
@@ -906,26 +1007,27 @@ export default async function (pi: ExtensionAPI) {
 		const usageDetails = usageDetailsFromUsage(usage);
 		const costDetails = costDetailsFromUsage(usage);
 
-		turnState?.span?.end({
-			output: outputText
-				? truncate(outputText, config.traceOutputMaxChars)
-				: undefined,
-			usage: standardUsage,
-			usageDetails,
-			costDetails,
-			metadata: {
-				turnIndex: event.turnIndex,
-				durationMs: turnState ? Date.now() - turnState.startedAt : undefined,
-				toolResults: event.toolResults?.length ?? 0,
-			},
-		});
+		if (canTrace(config)) {
+			turnState?.span?.end({
+				output: outputText
+					? truncate(outputText, config.traceOutputMaxChars)
+					: undefined,
+				usage: standardUsage,
+				usageDetails,
+				costDetails,
+				metadata: {
+					turnIndex: event.turnIndex,
+					durationMs: turnState ? Date.now() - turnState.startedAt : undefined,
+					toolResults: event.toolResults?.length ?? 0,
+				},
+			});
+		}
 		promptState.activeTurns.delete(event.turnIndex);
 	});
 
 	pi.on("before_provider_request", async (event) => {
 		if (!promptState) return;
 		const config = resolveConfig(settings);
-		if (!canTrace(config)) return;
 
 		const activeTurns = Array.from(promptState.activeTurns.values());
 		const turnState =
@@ -933,6 +1035,11 @@ export default async function (pi: ExtensionAPI) {
 		if (!turnState) return;
 
 		try {
+			writeRawTrace(config, {
+				type: "provider_request",
+				turnIndex: turnState.index,
+				payload: event.payload,
+			});
 			const payloadText = JSON.stringify(event.payload);
 			const payloadSize = payloadText.length;
 			if (!turnState.requests) turnState.requests = [];
@@ -990,7 +1097,11 @@ export default async function (pi: ExtensionAPI) {
 
 	pi.on("session_compact", async () => {
 		compactCount += 1;
-		promptState?.trace.update({
+		writeRawTrace(resolveConfig(settings), {
+			type: "session_compact",
+			compactCount,
+		});
+		promptState?.trace?.update({
 			metadata: {
 				compactCount,
 				lastCompactedAt: new Date().toISOString(),
