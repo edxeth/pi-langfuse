@@ -1,8 +1,9 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { type RedactionConfig, sanitizeForTelemetry } from "./redaction.js";
 
-interface RawTraceConfig {
+interface RawTraceConfig extends RedactionConfig {
 	rawTraceEnabled: boolean;
 	rawTraceDir: string;
 }
@@ -22,7 +23,11 @@ interface RawTraceBaseRecord {
 type RawTraceRecord = RawTraceBaseRecord & Record<string, unknown>;
 
 export function defaultRawTraceDir() {
-	return join(homedir(), ".pi", "agent", "langfuse", "raw-traces");
+	return join(
+		process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"),
+		"langfuse",
+		"raw-traces",
+	);
 }
 
 export function rawTracePathForSession(
@@ -67,7 +72,12 @@ export function appendRawTrace(
 	if (!path) return;
 	try {
 		mkdirSync(dirname(path), { recursive: true });
-		appendFileSync(path, `${JSON.stringify(record, jsonReplacer)}\n`, "utf-8");
+		const sanitizedRecord = sanitizeForTelemetry(config, record);
+		appendFileSync(
+			path,
+			`${JSON.stringify(sanitizedRecord, jsonReplacer)}\n`,
+			"utf-8",
+		);
 	} catch (error) {
 		console.warn("📊 Langfuse: Failed to write raw trace", error);
 	}

@@ -22,6 +22,8 @@ export interface Config {
 	skipUnpersistedSessions: boolean;
 	captureProviderPayload: boolean;
 	providerPayloadMaxChars: number;
+	redactionEnabled: boolean;
+	redactionAdditionalSecrets: string[];
 	rawTraceEnabled: boolean;
 	rawTraceDir: string;
 	localAutostart: boolean;
@@ -82,19 +84,30 @@ function defaultLocalAutostartDir() {
 	return join(defaultAgentDir(), "langfuse");
 }
 
-function parseTags(value: unknown): string[] {
+function parseList(value: unknown, maxItems: number): string[] {
 	if (Array.isArray(value)) {
 		return value
 			.map((item) => String(item).trim())
 			.filter(Boolean)
-			.slice(0, 20);
+			.slice(0, maxItems);
 	}
 	if (typeof value !== "string") return [];
 	return value
 		.split(",")
 		.map((tag) => tag.trim())
 		.filter(Boolean)
-		.slice(0, 20);
+		.slice(0, maxItems);
+}
+
+function parseTags(value: unknown): string[] {
+	return parseList(value, 20);
+}
+
+function parseBooleanEnv(value: string | undefined) {
+	if (value === undefined) return undefined;
+	if (["1", "true", "yes", "on"].includes(value.toLowerCase())) return true;
+	if (["0", "false", "no", "off"].includes(value.toLowerCase())) return false;
+	return undefined;
 }
 
 export function resolveConfig(settings: Partial<SettingsValues>): Config {
@@ -113,6 +126,15 @@ export function resolveConfig(settings: Partial<SettingsValues>): Config {
 			: envAutostart === "1"
 				? true
 				: ((fileConfig.localAutostart as boolean | undefined) ?? false);
+	const envRedaction =
+		process.env.PI_LANGFUSE_UNREDACTED === "1"
+			? false
+			: parseBooleanEnv(process.env.PI_LANGFUSE_REDACTION);
+	const redactionEnabled =
+		settings["redaction-enabled"] ??
+		(fileConfig.redactionEnabled as boolean | undefined) ??
+		envRedaction ??
+		DEFAULT_SETTINGS["redaction-enabled"];
 
 	return {
 		enabled: settings.enabled ?? fileConfig.enabled ?? DEFAULT_SETTINGS.enabled,
@@ -204,12 +226,21 @@ export function resolveConfig(settings: Partial<SettingsValues>): Config {
 			1_000,
 			1_000_000,
 		),
+		redactionEnabled,
+		redactionAdditionalSecrets: parseList(
+			fileConfig.redactionAdditionalSecrets ??
+				process.env.PI_LANGFUSE_REDACTION_SECRETS,
+			100,
+		),
 		rawTraceEnabled:
+			settings["raw-trace-enabled"] ??
 			(fileConfig.rawTraceEnabled as boolean | undefined) ??
-			process.env.PI_LANGFUSE_RAW_TRACE === "1",
+			parseBooleanEnv(process.env.PI_LANGFUSE_RAW_TRACE) ??
+			false,
 		rawTraceDir: String(
-			fileConfig.rawTraceDir ??
-				process.env.PI_LANGFUSE_RAW_TRACE_DIR ??
+			settings["raw-trace-dir"] ||
+				fileConfig.rawTraceDir ||
+				process.env.PI_LANGFUSE_RAW_TRACE_DIR ||
 				defaultRawTraceDir(),
 		),
 		localAutostart,
@@ -245,6 +276,11 @@ export function getConfigWarnings(config: Config): string[] {
 	}
 	if (config.defaultTags.length >= 20) {
 		warnings.push("default tags were capped at 20 entries");
+	}
+	if (!config.redactionEnabled) {
+		warnings.push(
+			"secret redaction is disabled; Langfuse and raw traces may store sensitive data",
+		);
 	}
 	return warnings;
 }

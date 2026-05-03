@@ -22,6 +22,7 @@ vi.mock("node:fs", async (importOriginal) => {
 describe("settings", () => {
 	beforeEach(() => {
 		vi.mocked(fs.existsSync).mockReturnValue(false);
+		delete process.env.PI_CODING_AGENT_DIR;
 	});
 
 	it("should return default settings when file does not exist", () => {

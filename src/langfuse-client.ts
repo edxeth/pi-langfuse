@@ -1,5 +1,6 @@
 import { Langfuse } from "langfuse";
 import type { Config } from "./config.js";
+import { sanitizeForTelemetry } from "./redaction.js";
 
 type LangfuseMetadata = Record<string, unknown>;
 
@@ -110,6 +111,68 @@ export interface LangfuseClient {
 let client: LangfuseClient | null = null;
 let clientConfigKey = "";
 
+function sanitizeBody<T>(config: Config, body: T): T {
+	return sanitizeForTelemetry(config, body);
+}
+
+function wrapTrace(config: Config, trace: LangfuseTrace): LangfuseTrace {
+	return {
+		id: trace.id,
+		update(body) {
+			trace.update(sanitizeBody(config, body));
+		},
+	};
+}
+
+function wrapSpan(config: Config, span: LangfuseSpan): LangfuseSpan {
+	return {
+		id: span.id,
+		update(body) {
+			span.update?.(sanitizeBody(config, body));
+		},
+		end(body) {
+			span.end(sanitizeBody(config, body));
+		},
+	};
+}
+
+function wrapGeneration(
+	config: Config,
+	generation: LangfuseGeneration,
+): LangfuseGeneration {
+	return {
+		id: generation.id,
+		update(body) {
+			generation.update?.(sanitizeBody(config, body));
+		},
+		end(body) {
+			generation.end(sanitizeBody(config, body));
+		},
+	};
+}
+
+function wrapClient(config: Config, rawClient: LangfuseClient): LangfuseClient {
+	return {
+		trace(body) {
+			return wrapTrace(config, rawClient.trace(sanitizeBody(config, body)));
+		},
+		span(body) {
+			return wrapSpan(config, rawClient.span(sanitizeBody(config, body)));
+		},
+		generation(body) {
+			return wrapGeneration(
+				config,
+				rawClient.generation(sanitizeBody(config, body)),
+			);
+		},
+		score(body) {
+			rawClient.score(sanitizeBody(config, body));
+		},
+		flushAsync: rawClient.flushAsync?.bind(rawClient),
+		shutdownAsync: rawClient.shutdownAsync.bind(rawClient),
+	};
+}
+
 export async function flushClient() {
 	if (client?.flushAsync) {
 		await client.flushAsync();
@@ -144,5 +207,5 @@ export async function getClient(config: Config): Promise<LangfuseClient> {
 		clientConfigKey = nextConfigKey;
 	}
 
-	return client;
+	return wrapClient(config, client);
 }

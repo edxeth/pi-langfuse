@@ -21,6 +21,10 @@ describe("resolveConfig", () => {
 		delete process.env.LANGFUSE_SECRET_KEY;
 		delete process.env.LANGFUSE_BASE_URL;
 		delete process.env.LANGFUSE_HOST;
+		delete process.env.PI_LANGFUSE_REDACTION;
+		delete process.env.PI_LANGFUSE_UNREDACTED;
+		delete process.env.PI_LANGFUSE_REDACTION_SECRETS;
+		delete process.env.PI_CODING_AGENT_DIR;
 	});
 	it("should use default settings when no input is provided", () => {
 		const config = resolveConfig({});
@@ -74,5 +78,47 @@ describe("resolveConfig", () => {
 			"trace-input-max-chars": 50000, // above max (20000)
 		});
 		expect(config2.traceInputMaxChars).toBe(20000);
+	});
+
+	it("enables redaction by default and supports explicit env opt-out", () => {
+		expect(resolveConfig({}).redactionEnabled).toBe(true);
+
+		process.env.PI_LANGFUSE_UNREDACTED = "1";
+		expect(resolveConfig({}).redactionEnabled).toBe(false);
+	});
+
+	it("does not let env unredacted override settings redaction", () => {
+		process.env.PI_LANGFUSE_UNREDACTED = "1";
+
+		expect(resolveConfig({ "redaction-enabled": true }).redactionEnabled).toBe(
+			true,
+		);
+	});
+
+	it("parses additional redaction secrets from config/env", () => {
+		process.env.PI_LANGFUSE_REDACTION_SECRETS = "one-secret, two-secret";
+
+		expect(resolveConfig({}).redactionAdditionalSecrets).toEqual([
+			"one-secret",
+			"two-secret",
+		]);
+	});
+
+	it("allows settings to enable raw traces", () => {
+		const config = resolveConfig({
+			"raw-trace-enabled": true,
+			"raw-trace-dir": "/tmp/pi-langfuse-raw",
+		});
+
+		expect(config.rawTraceEnabled).toBe(true);
+		expect(config.rawTraceDir).toBe("/tmp/pi-langfuse-raw");
+	});
+
+	it("defaults raw traces under the active agent directory", () => {
+		process.env.PI_CODING_AGENT_DIR = "/tmp/pi-agent-test";
+
+		expect(resolveConfig({}).rawTraceDir).toBe(
+			"/tmp/pi-agent-test/langfuse/raw-traces",
+		);
 	});
 });

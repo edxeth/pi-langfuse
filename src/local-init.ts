@@ -3,8 +3,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 
@@ -31,10 +30,6 @@ type InitOptions = {
 	secretKey: string;
 };
 
-function extensionRoot() {
-	return resolve(dirname(fileURLToPath(import.meta.url)), "..");
-}
-
 function agentDir() {
 	return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 }
@@ -45,10 +40,6 @@ export function defaultLangfuseDir() {
 
 export function localConfigPath(dir = defaultLangfuseDir()) {
 	return join(dir, "pi-langfuse.json");
-}
-
-export function extensionConfigPath() {
-	return join(extensionRoot(), "config.json");
 }
 
 function token(bytes = 24) {
@@ -510,10 +501,6 @@ export async function runLangfuseInit(
 		localConfigPath(options.dir),
 		piLangfuseConfig(options, keys),
 	);
-
-	if (!existsSync(extensionConfigPath())) {
-		await safeWrite(extensionConfigPath(), piLangfuseConfig(options, keys));
-	}
 
 	if (options.mode === "local" && !options.noStart) {
 		ctx.ui.notify("Starting local Langfuse with Docker Compose...", "info");

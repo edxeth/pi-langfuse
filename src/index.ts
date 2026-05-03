@@ -6,6 +6,7 @@ import {
 	getConfigWarnings,
 	resolveConfig,
 } from "./config.js";
+import { exportRedactedData } from "./export.js";
 import {
 	flushClient,
 	getClient,
@@ -17,6 +18,7 @@ import {
 import { ensureLocalLangfuseStarted } from "./local-autostart.js";
 import { runLangfuseInit } from "./local-init.js";
 import { appendRawTrace } from "./raw-trace.js";
+import { redactionMetadata, redactString } from "./redaction.js";
 import {
 	EXTENSION_ID,
 	getStoredSettingsValues,
@@ -117,15 +119,15 @@ function getLiveSettingsView(
 		"tool-output-max-chars": config.toolOutputMaxChars,
 		"capture-tool-progress": config.captureToolProgress,
 		"capture-message-updates": config.captureMessageUpdates,
+		"redaction-enabled": config.redactionEnabled,
+		"raw-trace-enabled": config.rawTraceEnabled,
+		"raw-trace-dir": config.rawTraceDir,
 	};
 }
 
 function announceConfigState(settings: Partial<SettingsValues>) {
 	const config = resolveConfig(settings);
-	if (!config.enabled) {
-		console.log("📊 Langfuse: Tracing disabled in extension settings");
-		return;
-	}
+	if (!config.enabled) return;
 	if (!config.publicKey || !config.secretKey) {
 		console.log(
 			"📊 Langfuse: Configure public/secret key in settings, config.json, or LANGFUSE_* env vars to enable",
@@ -138,10 +140,10 @@ function announceConfigState(settings: Partial<SettingsValues>) {
 
 function getLangfuseStatus(config: Config, sessionFile?: string) {
 	if (!config.enabled) {
-		return { icon: "⚪", label: "OFF", detail: "disabled" };
+		return { icon: "⚪", label: "OFF", detail: "disabled in settings" };
 	}
 	if (!config.publicKey || !config.secretKey) {
-		return { icon: "⚪", label: "OFF", detail: "missing keys" };
+		return { icon: "⚪", label: "OFF", detail: "missing Langfuse keys" };
 	}
 	if (config.skipUnpersistedSessions && !sessionFile) {
 		return { icon: "⚪", label: "OFF", detail: "no session file" };
@@ -165,9 +167,18 @@ function truncate(text: string, max = 1200) {
 	return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
-function safeJson(value: unknown, max = 1200) {
+function telemetryText(config: Config, text: string, max: number) {
+	const scanLimit = Math.max(max * 2, max + 500);
+	const bounded =
+		text.length > scanLimit
+			? `${text.slice(0, scanLimit)}…[truncated ${text.length - scanLimit} chars]`
+			: text;
+	return truncate(redactString(config, bounded), max);
+}
+
+function safeJson(config: Config, value: unknown, max = 1200) {
 	try {
-		return truncate(JSON.stringify(value, null, 2), max);
+		return telemetryText(config, JSON.stringify(value, null, 2), max);
 	} catch {
 		return "[unserializable]";
 	}
@@ -175,21 +186,31 @@ function safeJson(value: unknown, max = 1200) {
 
 function summarizeToolArgs(config: Config, toolName: string, args: unknown) {
 	if (!args || typeof args !== "object")
-		return safeJson(args, config.toolArgsMaxChars);
+		return safeJson(config, args, config.toolArgsMaxChars);
 	const data = args as Record<string, unknown>;
 	switch (toolName) {
 		case "bash":
-			return truncate(String(data.command ?? ""), config.toolArgsMaxChars);
+			return telemetryText(
+				config,
+				String(data.command ?? ""),
+				config.toolArgsMaxChars,
+			);
 		case "read":
-			return truncate(
+			return telemetryText(
+				config,
 				`${String(data.path ?? "")}#${String(data.offset ?? 1)}:${String(data.limit ?? "")}`,
 				config.toolArgsMaxChars,
 			);
 		case "write":
 		case "edit":
-			return truncate(String(data.path ?? ""), config.toolArgsMaxChars);
+			return telemetryText(
+				config,
+				String(data.path ?? ""),
+				config.toolArgsMaxChars,
+			);
 		case "web_search":
-			return truncate(
+			return telemetryText(
+				config,
 				String(
 					data.query ??
 						(Array.isArray(data.queries) ? data.queries.join(" | ") : ""),
@@ -197,7 +218,7 @@ function summarizeToolArgs(config: Config, toolName: string, args: unknown) {
 				config.toolArgsMaxChars,
 			);
 		default:
-			return safeJson(args, config.toolArgsMaxChars);
+			return safeJson(config, args, config.toolArgsMaxChars);
 	}
 }
 
@@ -211,16 +232,73 @@ function extractTextFromContent(
 		.join("\n");
 }
 
+function summarizeMessageContent(config: Config, content: unknown) {
+	if (typeof content === "string") {
+		return telemetryText(config, content, config.traceInputMaxChars);
+	}
+	if (Array.isArray(content)) {
+		const text = extractTextFromContent(
+			content.slice(0, 20) as Array<{ type: string; text?: string }>,
+		);
+		if (text) return telemetryText(config, text, config.traceInputMaxChars);
+		return `[${content.length} content item(s)]`;
+	}
+	if (content && typeof content === "object") {
+		const maybeContent = (content as { content?: unknown }).content;
+		if (Array.isArray(maybeContent))
+			return summarizeMessageContent(config, maybeContent);
+		return "[object content]";
+	}
+	return content == null ? "" : String(content);
+}
+
+function summarizeMessages(
+	config: Config,
+	messages: Array<{ role?: string; content?: unknown }>,
+) {
+	const limit = 40;
+	const selected = messages.slice(-limit).map((message) => ({
+		role: message.role || "unknown",
+		content: summarizeMessageContent(config, message.content),
+	}));
+	if (messages.length > limit) {
+		selected.unshift({
+			role: "system",
+			content: `[truncated ${messages.length - limit} earlier message(s)]`,
+		});
+	}
+	return selected;
+}
+
+function summarizeProviderPayload(config: Config, payload: unknown) {
+	if (!payload || typeof payload !== "object") return { type: typeof payload };
+	const data = payload as Record<string, unknown>;
+	const messages = Array.isArray(data.messages)
+		? summarizeMessages(
+				config,
+				data.messages as Array<{ role?: string; content?: unknown }>,
+			)
+		: undefined;
+	return {
+		model: typeof data.model === "string" ? data.model : currentModel,
+		messageCount: Array.isArray(data.messages)
+			? data.messages.length
+			: undefined,
+		messages,
+		keys: Object.keys(data).slice(0, 50),
+	};
+}
+
 function summarizeToolResult(config: Config, result: unknown) {
 	if (!result) return "";
 	if (typeof result === "string")
-		return truncate(result, config.toolOutputMaxChars);
+		return telemetryText(config, result, config.toolOutputMaxChars);
 	if (typeof result === "object") {
 		const data = result as { content?: Array<{ type: string; text?: string }> };
 		const text = extractTextFromContent(data.content);
-		if (text) return truncate(text, config.toolOutputMaxChars);
+		if (text) return telemetryText(config, text, config.toolOutputMaxChars);
 	}
-	return safeJson(result, config.toolOutputMaxChars);
+	return safeJson(config, result, config.toolOutputMaxChars);
 }
 
 function usageDetailsFromUsage(usage?: PiUsage) {
@@ -301,9 +379,18 @@ function writeRawTrace(
 		...rawTraceBase(
 			typeof record.turnIndex === "number" ? record.turnIndex : undefined,
 		),
+		redaction: redactionMetadata(config),
 		traceId: promptState?.trace?.id,
 		...record,
 	});
+}
+
+function rawTraceSummary(
+	config: Config,
+	value: unknown,
+	max = config.toolOutputMaxChars,
+) {
+	return summarizeToolResult(config, value) || safeJson(config, value, max);
 }
 
 function buildTraceTags(config: Config | undefined, cwd: string) {
@@ -385,11 +472,15 @@ async function finalizePrompt(config: Config | undefined, flush = false) {
 		release: config?.release || undefined,
 		environment: config?.environment || undefined,
 		metadata: {
+			redaction: config ? redactionMetadata(config) : undefined,
 			cwd: promptState.cwd,
-			systemPrompt: truncate(
-				promptState.systemPrompt,
-				config?.traceInputMaxChars ?? 2000,
-			),
+			systemPrompt: config
+				? telemetryText(
+						config,
+						promptState.systemPrompt,
+						config.traceInputMaxChars,
+					)
+				: truncate(promptState.systemPrompt, 2000),
 			model: currentModel,
 			provider: currentProvider,
 			sessionReason: currentSessionReason,
@@ -449,6 +540,18 @@ export default async function (pi: ExtensionAPI) {
 		handler: runLangfuseInit,
 	});
 
+	pi.registerCommand("langfuse:export", {
+		description:
+			"Create a local redacted export of Pi sessions and pi-langfuse raw traces without uploading anywhere",
+		handler: async (args, ctx) => {
+			const report = exportRedactedData(resolveConfig(settings), args, ctx);
+			ctx.ui?.notify?.(
+				`Redacted export: ${report.summary.approved}/${report.summary.files} approved`,
+				report.summary.rejected > 0 ? "warning" : "info",
+			);
+		},
+	});
+
 	pi.registerCommand("langfuse:toggle", {
 		description:
 			"Toggle Langfuse tracing or force on/off with /langfuse:toggle [on|off]",
@@ -502,6 +605,7 @@ export default async function (pi: ExtensionAPI) {
 			reason: currentSessionReason,
 			previousSessionFile: currentPreviousSessionFile || undefined,
 			runtime: getRuntimeName(),
+			redaction: redactionMetadata(config),
 		});
 	});
 
@@ -574,15 +678,17 @@ export default async function (pi: ExtensionAPI) {
 			const lf = await getClient(config);
 			const trace = lf.trace({
 				name: "pi-agent",
-				input: truncate(event.prompt, config.traceInputMaxChars),
+				input: telemetryText(config, event.prompt, config.traceInputMaxChars),
 				sessionId: currentSessionId || undefined,
 				userId: getUserId(config),
 				tags: buildTraceTags(config, cwd),
 				release: config.release || undefined,
 				environment: config.environment || undefined,
 				metadata: {
+					redaction: redactionMetadata(config),
 					cwd,
-					systemPrompt: truncate(
+					systemPrompt: telemetryText(
+						config,
 						event.systemPrompt || "",
 						config.traceInputMaxChars,
 					),
@@ -613,8 +719,13 @@ export default async function (pi: ExtensionAPI) {
 			promptState.promptSpan = lf.span({
 				name: "agent.prompt",
 				traceId: promptState.trace.id,
-				input: truncate(promptState.userPrompt, config.traceInputMaxChars),
+				input: telemetryText(
+					config,
+					promptState.userPrompt,
+					config.traceInputMaxChars,
+				),
 				metadata: {
+					redaction: redactionMetadata(config),
 					cwd: promptState.cwd,
 					model: currentModel,
 					provider: currentProvider,
@@ -643,6 +754,7 @@ export default async function (pi: ExtensionAPI) {
 				traceId: promptState.trace.id,
 				parentObservationId: promptState.promptSpan?.id,
 				metadata: {
+					redaction: redactionMetadata(config),
 					turnIndex: event.turnIndex,
 					turnNumber: promptState.turns,
 					model: currentModel,
@@ -667,12 +779,12 @@ export default async function (pi: ExtensionAPI) {
 			activeTurns.length > 0 ? activeTurns[activeTurns.length - 1] : undefined;
 		if (!activeTurn) return;
 
-		// The context event provides a DEEP COPY of messages — safe to store.
-		// These are the messages that will be sent to the LLM for this turn.
-		promptState.lastMessages = event.messages as Array<{
-			role: string;
-			content: unknown;
-		}>;
+		// Keep only bounded message summaries on the live path. Full context belongs
+		// to Pi's canonical session and /langfuse:export, not synchronous telemetry.
+		promptState.lastMessages = summarizeMessages(
+			config,
+			event.messages as Array<{ role?: string; content?: unknown }>,
+		);
 	});
 
 	pi.on("tool_call", async (event) => {
@@ -766,8 +878,9 @@ export default async function (pi: ExtensionAPI) {
 			turnIndex: currentTurnIndex(),
 			toolCallId: event.toolCallId,
 			toolName: event.toolName,
-			input: event.input,
-			content: event.content,
+			inputSummary: summarizeToolArgs(config, event.toolName, event.input),
+			contentSummary: rawTraceSummary(config, { content: event.content }),
+			contentTruncated: true,
 			isError: event.isError,
 		});
 	});
@@ -786,8 +899,9 @@ export default async function (pi: ExtensionAPI) {
 			turnIndex: currentTurnIndex(),
 			toolCallId: event.toolCallId,
 			toolName: event.toolName,
-			args: tool.argsRaw,
-			result: event.result,
+			argsSummary: tool.argsSummary,
+			resultSummary: rawTraceSummary(config, event.result),
+			resultTruncated: true,
 			isError: event.isError,
 			durationMs,
 		});
@@ -830,7 +944,11 @@ export default async function (pi: ExtensionAPI) {
 		// instead of just the raw user text.
 		const generationInput = promptState.lastMessages
 			? promptState.lastMessages
-			: truncate(promptState.userPrompt, config.traceInputMaxChars);
+			: telemetryText(
+					config,
+					promptState.userPrompt,
+					config.traceInputMaxChars,
+				);
 
 		try {
 			const lf = await getClient(config);
@@ -841,6 +959,7 @@ export default async function (pi: ExtensionAPI) {
 				input: generationInput,
 				model: currentModel || undefined,
 				metadata: {
+					redaction: redactionMetadata(config),
 					turnIndex: turnState.index,
 					model: currentModel,
 					provider: currentProvider,
@@ -881,7 +1000,8 @@ export default async function (pi: ExtensionAPI) {
 		// Optionally update the generation in real-time if configured
 		if (config.captureMessageUpdates) {
 			turnState.generation.update?.({
-				output: truncate(
+				output: telemetryText(
+					config,
 					(turnState.streamingThinking || "") + (turnState.streamingText || ""),
 					config.traceOutputMaxChars,
 				),
@@ -920,7 +1040,8 @@ export default async function (pi: ExtensionAPI) {
 		const usageDetails = usageDetailsFromUsage(usage);
 		const costDetails = costDetailsFromUsage(usage);
 
-		promptState.lastAssistantText = truncate(
+		promptState.lastAssistantText = telemetryText(
+			config,
 			finalOutput,
 			config.traceOutputMaxChars,
 		);
@@ -947,7 +1068,9 @@ export default async function (pi: ExtensionAPI) {
 
 		try {
 			turnState.generation.end({
-				output: truncate(finalOutput, config.traceOutputMaxChars) || undefined,
+				output:
+					telemetryText(config, finalOutput, config.traceOutputMaxChars) ||
+					undefined,
 				usage: standardUsage,
 				usageDetails,
 				costDetails,
@@ -1010,7 +1133,7 @@ export default async function (pi: ExtensionAPI) {
 		if (canTrace(config)) {
 			turnState?.span?.end({
 				output: outputText
-					? truncate(outputText, config.traceOutputMaxChars)
+					? telemetryText(config, outputText, config.traceOutputMaxChars)
 					: undefined,
 				usage: standardUsage,
 				usageDetails,
@@ -1035,13 +1158,21 @@ export default async function (pi: ExtensionAPI) {
 		if (!turnState) return;
 
 		try {
+			const payloadSummary = summarizeProviderPayload(config, event.payload);
+			const payloadSummaryText = safeJson(
+				config,
+				payloadSummary,
+				config.providerPayloadMaxChars,
+			);
 			writeRawTrace(config, {
 				type: "provider_request",
 				turnIndex: turnState.index,
-				payload: event.payload,
+				payloadCaptured: config.captureProviderPayload,
+				payloadSummary: config.captureProviderPayload
+					? payloadSummaryText
+					: undefined,
 			});
-			const payloadText = JSON.stringify(event.payload);
-			const payloadSize = payloadText.length;
+			const payloadSize = payloadSummaryText.length;
 			if (!turnState.requests) turnState.requests = [];
 			const reqModel =
 				typeof (event.payload as Record<string, unknown>)?.model === "string"
@@ -1055,13 +1186,12 @@ export default async function (pi: ExtensionAPI) {
 
 			// Update turn span metadata with requests info. Full payload capture is
 			// intentionally opt-in because provider payloads can contain large context
-			// and sensitive data. For this private TIA setup it can be enabled in
-			// config.json with captureProviderPayload=true.
+			// and sensitive data. Enable it in config.json with captureProviderPayload=true.
 			turnState.span?.update?.({
 				metadata: {
 					requests: turnState.requests,
 					providerPayload: config.captureProviderPayload
-						? truncate(payloadText, config.providerPayloadMaxChars)
+						? payloadSummaryText
 						: undefined,
 				},
 			});
@@ -1086,7 +1216,8 @@ export default async function (pi: ExtensionAPI) {
 			const output = extractTextFromContent(lastAssistant.content).trim();
 			if (output) {
 				const config = resolveConfig(settings);
-				promptState.lastAssistantText = truncate(
+				promptState.lastAssistantText = telemetryText(
+					config,
 					output,
 					config.traceOutputMaxChars,
 				);

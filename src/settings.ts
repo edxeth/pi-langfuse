@@ -4,8 +4,14 @@ import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
 export const EXTENSION_ID = "pi-langfuse";
-const SETTINGS_FILE = join(homedir(), ".pi", "agent", "settings.json");
 const EXTENSIONS_SETTINGS_KEY = "extensions:settings";
+
+function settingsFile() {
+	return join(
+		process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"),
+		"settings.json",
+	);
+}
 
 export interface SettingsValues {
 	enabled: boolean;
@@ -22,6 +28,9 @@ export interface SettingsValues {
 	"tool-output-max-chars": number;
 	"capture-tool-progress": boolean;
 	"capture-message-updates": boolean;
+	"redaction-enabled": boolean;
+	"raw-trace-enabled": boolean;
+	"raw-trace-dir": string;
 }
 
 export const DEFAULT_SETTINGS: SettingsValues = {
@@ -39,6 +48,9 @@ export const DEFAULT_SETTINGS: SettingsValues = {
 	"tool-output-max-chars": 2000,
 	"capture-tool-progress": true,
 	"capture-message-updates": false,
+	"redaction-enabled": true,
+	"raw-trace-enabled": false,
+	"raw-trace-dir": "",
 };
 
 export const SETTINGS_DOCUMENTATION = `# Langfuse settings
@@ -53,6 +65,7 @@ These settings control how the Langfuse extension connects to your Langfuse proj
 - When a setting is empty, this panel shows the live fallback value currently resolved from config.json, environment variables, or built-in defaults.
 - Tag lists are comma-separated.
 - Character limits are bounded to sensible minimums/maximums during config resolution.
+- Secret redaction is enabled by default. Disable it only for explicit local debugging.
 `;
 
 export function createSettingsNodes(defaults: SettingsValues) {
@@ -146,13 +159,35 @@ export function createSettingsNodes(defaults: SettingsValues) {
 				"Reserved for future streaming assistant update capture. Currently stored but not used.",
 			default: defaults["capture-message-updates"],
 		},
+		"redaction-enabled": {
+			_tag: "boolean",
+			label: "Secret Redaction",
+			description:
+				"Redact known secrets and common token patterns before writing Langfuse or raw trace payloads. Disable only for explicit local debugging.",
+			default: defaults["redaction-enabled"],
+		},
+		"raw-trace-enabled": {
+			_tag: "boolean",
+			label: "Raw Trace Export",
+			description:
+				"Write redacted JSONL companion traces for audit/training workflows.",
+			default: defaults["raw-trace-enabled"],
+		},
+		"raw-trace-dir": {
+			_tag: "string",
+			label: "Raw Trace Directory",
+			description:
+				"Directory for raw trace JSONL files. Leave empty to use the default ~/.pi/agent/langfuse/raw-traces path.",
+			default: defaults["raw-trace-dir"],
+		},
 	} as const;
 }
 
 function loadSettingsFile(): Record<string, Record<string, unknown>> {
-	if (!existsSync(SETTINGS_FILE)) return {};
+	const file = settingsFile();
+	if (!existsSync(file)) return {};
 	try {
-		const parsed = JSON.parse(readFileSync(SETTINGS_FILE, "utf-8")) as Record<
+		const parsed = JSON.parse(readFileSync(file, "utf-8")) as Record<
 			string,
 			unknown
 		>;
@@ -166,13 +201,14 @@ function loadSettingsFile(): Record<string, Record<string, unknown>> {
 }
 
 function saveSettingsFile(values: Record<string, Record<string, unknown>>) {
-	const dir = dirname(SETTINGS_FILE);
+	const file = settingsFile();
+	const dir = dirname(file);
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
 	let fullContent: Record<string, unknown> = {};
-	if (existsSync(SETTINGS_FILE)) {
+	if (existsSync(file)) {
 		try {
-			fullContent = JSON.parse(readFileSync(SETTINGS_FILE, "utf-8")) as Record<
+			fullContent = JSON.parse(readFileSync(file, "utf-8")) as Record<
 				string,
 				unknown
 			>;
@@ -182,11 +218,7 @@ function saveSettingsFile(values: Record<string, Record<string, unknown>>) {
 	}
 
 	fullContent[EXTENSIONS_SETTINGS_KEY] = values;
-	writeFileSync(
-		SETTINGS_FILE,
-		`${JSON.stringify(fullContent, null, 2)}\n`,
-		"utf-8",
-	);
+	writeFileSync(file, `${JSON.stringify(fullContent, null, 2)}\n`, "utf-8");
 }
 
 export function getStoredSettingsValues(
@@ -232,6 +264,12 @@ export function getSettingsValues(pi?: ExtensionAPI): SettingsValues {
 		"capture-message-updates":
 			values["capture-message-updates"] ??
 			DEFAULT_SETTINGS["capture-message-updates"],
+		"redaction-enabled":
+			values["redaction-enabled"] ?? DEFAULT_SETTINGS["redaction-enabled"],
+		"raw-trace-enabled":
+			values["raw-trace-enabled"] ?? DEFAULT_SETTINGS["raw-trace-enabled"],
+		"raw-trace-dir":
+			values["raw-trace-dir"] ?? DEFAULT_SETTINGS["raw-trace-dir"],
 	};
 }
 
