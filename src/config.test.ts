@@ -1,5 +1,4 @@
 import * as fs from "node:fs";
-import { resolve } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveConfig } from "./config.js";
 import { DEFAULT_SETTINGS } from "./settings.js";
@@ -39,26 +38,6 @@ describe("resolveConfig", () => {
 		});
 		expect(config.enabled).toBe(false);
 		expect(config.host).toBe("https://custom.langfuse.com");
-	});
-
-	it("should load config.json from the project root", () => {
-		vi.mocked(fs.existsSync).mockReturnValue(true);
-		vi.mocked(fs.readFileSync).mockReturnValue(
-			JSON.stringify({
-				host: "https://file.langfuse.test",
-				publicKey: "file-public-key",
-				secretKey: "file-secret-key",
-			}),
-		);
-
-		const config = resolveConfig({});
-
-		expect(fs.existsSync).toHaveBeenCalledWith(
-			resolve(process.cwd(), "config.json"),
-		);
-		expect(config.host).toBe("https://file.langfuse.test");
-		expect(config.publicKey).toBe("file-public-key");
-		expect(config.secretKey).toBe("file-secret-key");
 	});
 
 	it("should parse tags correctly", () => {

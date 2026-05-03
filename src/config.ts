@@ -1,6 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { defaultRawTraceDir } from "./raw-trace.js";
 import { DEFAULT_SETTINGS, type SettingsValues } from "./settings.js";
 
@@ -43,18 +42,8 @@ function readConfigJson(path: string): Partial<Config> {
 	}
 }
 
-export function loadConfigFile(): Partial<Config> {
-	const extensionConfigPath = resolve(
-		dirname(fileURLToPath(import.meta.url)),
-		"..",
-		"config.json",
-	);
-	const localConfigPath = join(defaultLocalAutostartDir(), "pi-langfuse.json");
-
-	return {
-		...readConfigJson(extensionConfigPath),
-		...readConfigJson(localConfigPath),
-	};
+function loadConfigFile(): Partial<Config> {
+	return readConfigJson(join(defaultLocalAutostartDir(), "pi-langfuse.json"));
 }
 
 function clampNumber(

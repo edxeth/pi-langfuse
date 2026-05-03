@@ -53,22 +53,22 @@ export const DEFAULT_SETTINGS: SettingsValues = {
 	"raw-trace-dir": "",
 };
 
-export const SETTINGS_DOCUMENTATION = `# Langfuse settings
+const SETTINGS_DOCUMENTATION = `# Langfuse settings
 
 These settings control how the Langfuse extension connects to your Langfuse project.
 
 ## Notes
 
 - Settings entered here are stored in plain text by pi-extension-settings.
-- If you prefer not to store keys here, keep using config.json or environment variables.
-- Resolution order is: settings panel -> config.json -> environment variables -> defaults.
-- When a setting is empty, this panel shows the live fallback value currently resolved from config.json, environment variables, or built-in defaults.
+- If you prefer not to store keys here, keep using pi-langfuse.json or environment variables.
+- Resolution order is: settings panel -> pi-langfuse.json -> environment variables -> defaults.
+- When a setting is empty, this panel shows the live fallback value currently resolved from pi-langfuse.json, environment variables, or built-in defaults.
 - Tag lists are comma-separated.
 - Character limits are bounded to sensible minimums/maximums during config resolution.
 - Secret redaction is enabled by default. Disable it only for explicit local debugging.
 `;
 
-export function createSettingsNodes(defaults: SettingsValues) {
+function createSettingsNodes(defaults: SettingsValues) {
 	return {
 		enabled: {
 			_tag: "boolean",
@@ -80,28 +80,28 @@ export function createSettingsNodes(defaults: SettingsValues) {
 			_tag: "text",
 			label: "Public Key",
 			description:
-				"Langfuse public key. Empty means use config.json/env fallback shown here.",
+				"Langfuse public key. Empty means use pi-langfuse.json/env fallback shown here.",
 			default: defaults["public-key"],
 		},
 		"secret-key": {
 			_tag: "text",
 			label: "Secret Key",
 			description:
-				"Langfuse secret key. Empty means use config.json/env fallback shown here.",
+				"Langfuse secret key. Empty means use pi-langfuse.json/env fallback shown here.",
 			default: defaults["secret-key"],
 		},
 		"base-url": {
 			_tag: "text",
 			label: "Base URL",
 			description:
-				"Langfuse base URL. Empty means use config.json/env fallback shown here.",
+				"Langfuse base URL. Empty means use pi-langfuse.json/env fallback shown here.",
 			default: defaults["base-url"],
 		},
 		"user-id": {
 			_tag: "text",
 			label: "User ID Override",
 			description:
-				"Optional fixed user ID. Empty means use config.json/env fallback shown here.",
+				"Optional fixed user ID. Empty means use pi-langfuse.json/env fallback shown here.",
 			default: defaults["user-id"],
 		},
 		"default-tags": {

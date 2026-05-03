@@ -130,7 +130,7 @@ function announceConfigState(settings: Partial<SettingsValues>) {
 	if (!config.enabled) return;
 	if (!config.publicKey || !config.secretKey) {
 		console.log(
-			"📊 Langfuse: Configure public/secret key in settings, config.json, or LANGFUSE_* env vars to enable",
+			"📊 Langfuse: Configure public/secret key in settings, pi-langfuse.json, or LANGFUSE_* env vars to enable",
 		);
 	}
 	for (const warning of getConfigWarnings(config)) {
@@ -1186,7 +1186,7 @@ export default async function (pi: ExtensionAPI) {
 
 			// Update turn span metadata with requests info. Full payload capture is
 			// intentionally opt-in because provider payloads can contain large context
-			// and sensitive data. Enable it in config.json with captureProviderPayload=true.
+			// and sensitive data. Enable it with captureProviderPayload=true.
 			turnState.span?.update?.({
 				metadata: {
 					requests: turnState.requests,

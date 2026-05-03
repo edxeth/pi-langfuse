@@ -121,17 +121,4 @@ describe("/langfuse-init", () => {
 			"Remote Langfuse configured",
 		);
 	});
-
-	it("does not write secret config into the extension root", async () => {
-		const notifications: Notification[] = [];
-
-		await runLangfuseInit(
-			"--yes --remote --host https://cloud.langfuse.com --public-key pk-test --secret-key sk-test",
-			createContext(notifications),
-		);
-
-		await expect(
-			readFile(join(agentDir, "..", "config.json"), "utf-8"),
-		).rejects.toThrow();
-	});
 });

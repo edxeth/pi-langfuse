@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -34,11 +34,11 @@ function agentDir() {
 	return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 }
 
-export function defaultLangfuseDir() {
+function defaultLangfuseDir() {
 	return join(agentDir(), "langfuse");
 }
 
-export function localConfigPath(dir = defaultLangfuseDir()) {
+function localConfigPath(dir = defaultLangfuseDir()) {
 	return join(dir, "pi-langfuse.json");
 }
 
@@ -523,10 +523,4 @@ export async function runLangfuseInit(
 			: `Remote Langfuse configured at ${options.host}`,
 		"info",
 	);
-}
-
-export async function readLocalConfig(dir = defaultLangfuseDir()) {
-	const path = localConfigPath(dir);
-	if (!existsSync(path)) return {};
-	return JSON.parse(await readFile(path, "utf-8")) as Record<string, unknown>;
 }

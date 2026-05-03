@@ -60,7 +60,7 @@ export interface LangfuseGeneration {
 	end(body?: ObservationEndBody): void;
 }
 
-export interface LangfuseClient {
+interface LangfuseClient {
 	trace(body?: {
 		id?: string | null;
 		name: string;
