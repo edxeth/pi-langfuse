@@ -1,6 +1,8 @@
 # pi-langfuse
 
-Production-grade Langfuse observability for [Pi Coding Agent](https://github.com/mariozechner/pi-coding-agent).
+Full-stack Langfuse observability for [Pi Coding Agent](https://github.com/mariozechner/pi-coding-agent) — from live traces to redacted training exports.
+
+Every prompt, turn, tool call, and streaming response is traced with cost and token metadata. Secrets and PII are redacted at the extension boundary before anything leaves your machine. An optional append-only JSONL companion stream gives you training-ready, audit-safe data without touching Pi's original session files.
 
 ![Traces in Langfuse UI](./docs/screenshot-trace.png)
 ![Export pipeline output](./docs/screenshot-export.png)
@@ -320,7 +322,6 @@ Pi sessions + raw traces
 ### Known limitations
 
 - **Canonical session rewrite**: Not done. Pi core owns session persistence. Use export for redacted copies.
-- **Old Langfuse traces**: Not deleted automatically. Requires explicit operator action.
 - **Binary/media payloads**: Redacted as strings when seen in telemetry. No OCR or forensic inspection.
 - **Unknown secret formats**: Covered by configured literals, broad patterns, and export scanner. No scanner catches everything -- add literals via `PI_LANGFUSE_REDACTION_SECRETS`.
 - **Semantic confidentiality**: PII patterns catch tokens and identifiers. Business-sensitive content needs human review before sharing.
@@ -334,6 +335,10 @@ Pi sessions + raw traces
 - **Cost is zero?** Token usage can be captured even when model pricing is not configured.
 - **Large payloads in Langfuse UI?** Adjust the max-char limits in config/settings.
 - **No raw trace file?** Check `rawTraceEnabled`, `rawTraceDir`, and that the run uses a persisted session rather than `--no-session`.
+
+## Acknowledgments
+
+Heavily refactored fork of [hdkiller/pi-langfuse](https://github.com/hdkiller/pi-langfuse).
 
 ## License
 
