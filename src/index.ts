@@ -55,6 +55,7 @@ interface PromptState {
 	activeTurns: Map<number, TurnState>;
 	activeTools: Map<string, ToolState>;
 	lastMessages?: Array<{ role: string; content: unknown }>;
+	lastContextMessages?: Array<{ role: string; content: unknown }>;
 }
 
 interface TurnState {
@@ -289,6 +290,37 @@ function summarizeProviderPayload(config: Config, payload: unknown) {
 	};
 }
 
+function redactToolContent(config: Config, result: unknown): string {
+	if (!result) return "";
+	if (typeof result === "string") return redactString(config, result);
+	if (typeof result === "object") {
+		const data = result as {
+			content?: Array<{ type: string; text?: string }>;
+		};
+		if (data.content) {
+			const textParts: string[] = [];
+			let imageCount = 0;
+			for (const item of data.content) {
+				if (item.type === "text" && item.text) {
+					textParts.push(item.text);
+				} else if (item.type === "image" || item.type === "image_url") {
+					imageCount++;
+				}
+			}
+			let result = textParts.join("\n");
+			if (imageCount > 0) {
+				result += `${result ? "\n" : ""}[${imageCount} image content block(s) from tool result]`;
+			}
+			if (result) return redactString(config, result);
+		}
+	}
+	try {
+		return redactString(config, JSON.stringify(result, null, 2));
+	} catch {
+		return "[unserializable]";
+	}
+}
+
 function summarizeToolResult(config: Config, result: unknown) {
 	if (!result) return "";
 	if (typeof result === "string")
@@ -383,14 +415,6 @@ function writeRawTrace(
 		traceId: promptState?.trace?.id,
 		...record,
 	});
-}
-
-function rawTraceSummary(
-	config: Config,
-	value: unknown,
-	max = config.toolOutputMaxChars,
-) {
-	return summarizeToolResult(config, value) || safeJson(config, value, max);
 }
 
 function buildTraceTags(config: Config | undefined, cwd: string) {
@@ -772,6 +796,13 @@ export default async function (pi: ExtensionAPI) {
 	pi.on("context", async (event) => {
 		if (!promptState) return;
 		const config = resolveConfig(settings);
+
+		// Store full context messages for raw trace (redacted at write time).
+		promptState.lastContextMessages = event.messages as Array<{
+			role: string;
+			content: unknown;
+		}>;
+
 		if (!canTrace(config)) return;
 
 		const activeTurns = Array.from(promptState.activeTurns.values());
@@ -780,7 +811,7 @@ export default async function (pi: ExtensionAPI) {
 		if (!activeTurn) return;
 
 		// Keep only bounded message summaries on the live path. Full context belongs
-		// to Pi's canonical session and /langfuse:export, not synchronous telemetry.
+		// to Pi's canonical session and raw traces, not synchronous telemetry.
 		promptState.lastMessages = summarizeMessages(
 			config,
 			event.messages as Array<{ role?: string; content?: unknown }>,
@@ -873,14 +904,18 @@ export default async function (pi: ExtensionAPI) {
 		const config = resolveConfig(settings);
 		tool.resultOutput = summarizeToolResult(config, { content: event.content });
 		tool.isError = event.isError;
+		const imgCount = (event.content ?? []).filter(
+			(c: { type: string }) => c.type === "image" || c.type === "image_url",
+		).length;
 		writeRawTrace(config, {
 			type: "tool_result_first_seen",
 			turnIndex: currentTurnIndex(),
 			toolCallId: event.toolCallId,
 			toolName: event.toolName,
 			inputSummary: summarizeToolArgs(config, event.toolName, event.input),
-			contentSummary: rawTraceSummary(config, { content: event.content }),
-			contentTruncated: true,
+			contentSummary: redactToolContent(config, { content: event.content }),
+			contentTruncated: false,
+			imgBlocks: imgCount || undefined,
 			isError: event.isError,
 		});
 	});
@@ -900,8 +935,8 @@ export default async function (pi: ExtensionAPI) {
 			toolCallId: event.toolCallId,
 			toolName: event.toolName,
 			argsSummary: tool.argsSummary,
-			resultSummary: rawTraceSummary(config, event.result),
-			resultTruncated: true,
+			resultSummary: redactToolContent(config, event.result),
+			resultTruncated: false,
 			isError: event.isError,
 			durationMs,
 		});
@@ -1164,9 +1199,22 @@ export default async function (pi: ExtensionAPI) {
 				payloadSummary,
 				config.providerPayloadMaxChars,
 			);
+			const reqModel =
+				typeof (event.payload as Record<string, unknown>)?.model === "string"
+					? ((event.payload as Record<string, unknown>).model as string)
+					: currentModel;
+			// Source request messages from the actual provider payload (what was sent),
+			// falling back to the context event snapshot if the payload doesn't have messages.
+			const payloadMessages = Array.isArray(
+				(event.payload as Record<string, unknown>)?.messages,
+			)
+				? (event.payload as Record<string, unknown>).messages
+				: promptState?.lastContextMessages;
 			writeRawTrace(config, {
 				type: "provider_request",
 				turnIndex: turnState.index,
+				model: reqModel,
+				messages: payloadMessages,
 				payloadCaptured: config.captureProviderPayload,
 				payloadSummary: config.captureProviderPayload
 					? payloadSummaryText
@@ -1174,10 +1222,6 @@ export default async function (pi: ExtensionAPI) {
 			});
 			const payloadSize = payloadSummaryText.length;
 			if (!turnState.requests) turnState.requests = [];
-			const reqModel =
-				typeof (event.payload as Record<string, unknown>)?.model === "string"
-					? ((event.payload as Record<string, unknown>).model as string)
-					: currentModel;
 			turnState.requests.push({
 				timestamp: new Date().toISOString(),
 				payloadSize,
@@ -1241,7 +1285,16 @@ export default async function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
-		await finalizePrompt(resolveConfig(settings), true);
+		const config = resolveConfig(settings);
+		writeRawTrace(config, {
+			type: "session_end",
+			timestamp: new Date().toISOString(),
+			sessionId: currentSessionId || undefined,
+			sessionFile: currentSessionFile || undefined,
+			reason: "shutdown",
+			runtime: getRuntimeName(),
+		});
+		await finalizePrompt(config, true);
 		await shutdownClient();
 	});
 }

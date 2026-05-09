@@ -192,9 +192,11 @@ Raw trace:    <agent-dir>/langfuse/raw-traces/--project--/<session>.jsonl
 Fallback:     <agent-dir>/langfuse/raw-traces/--unknown--/<session>.jsonl
 ```
 
-Record types: `session_start`, `agent_prompt_start`, `provider_request`, `tool_call`, `tool_result_first_seen`, `tool_execution_end`, `assistant_output`, `session_compact`.
+Record types: `session_start`, `agent_prompt_start`, `provider_request`, `tool_call`, `tool_result_first_seen`, `tool_execution_end`, `assistant_output`, `session_compact`, `session_end`.
 
-The key record is `tool_result_first_seen`: it captures a bounded, redacted summary of tool output immediately, before later extensions can compress or rewrite it. Raw traces continue writing even if Langfuse tracing is disabled or the server is unavailable.
+The key record is `tool_result_first_seen`: it captures a redacted summary of tool output immediately (no truncation — only secrets are redacted), before later extensions can compress or rewrite it. Raw traces continue writing even if Langfuse tracing is disabled or the server is unavailable.
+
+`provider_request` records include the full redacted message array sent to the LLM, and `session_end` marks a clean session shutdown.
 
 #### Session lifecycle
 
