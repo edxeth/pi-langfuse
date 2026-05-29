@@ -1,5 +1,14 @@
 # pi-langfuse
 
+## 🌐 **Join the Community**
+
+> [!NOTE]
+> **Building with AI doesn’t have to be a solo grind.**  
+> Join our Discord community to meet other people exploring the latest models, tools, workflows, and ideas: **https://discord.gg/whhrDtCrSS**
+>
+> We talk about what’s new, what’s useful, and what’s actually worth paying attention to in AI.  
+> *And if you want more than conversation,* members also get access to **heavily discounted AI products and services** — including deals on tools like **ChatGPT Plus** and more for just a few dollars.
+
 Full-stack Langfuse observability for [Pi Coding Agent](https://github.com/mariozechner/pi-coding-agent) — from live traces to redacted training exports.
 
 Every prompt, turn, tool call, and streaming response is traced with cost and token metadata. Secrets and PII are redacted at the extension boundary before anything leaves your machine. An optional append-only JSONL companion stream gives you training-ready, audit-safe data without touching Pi's original session files.
