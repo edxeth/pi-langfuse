@@ -1,6 +1,6 @@
 {
 	"name": "pi-langfuse",
-	"version": "1.3.0",
+	"version": "1.3.1",
 	"description": "Production-grade Langfuse observability for Pi. Tracks prompts, turns, tools, and streaming assistant responses with native trace hierarchies, token usage, and cost monitoring.",
 	"type": "module",
 	"main": "dist/index.js",
