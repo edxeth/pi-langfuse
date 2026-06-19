@@ -290,6 +290,22 @@ function summarizeProviderPayload(config: Config, payload: unknown) {
 	};
 }
 
+function estimateJsonBytes(value: unknown) {
+	try {
+		return Buffer.byteLength(JSON.stringify(value), "utf-8");
+	} catch {
+		return undefined;
+	}
+}
+
+function summarizeProviderRequestMessages(config: Config, messages: unknown) {
+	if (!Array.isArray(messages)) return undefined;
+	return summarizeMessages(
+		config,
+		messages as Array<{ role?: string; content?: unknown }>,
+	);
+}
+
 function redactToolContent(config: Config, result: unknown): string {
 	if (!result) return "";
 	if (typeof result === "string") return redactString(config, result);
@@ -1210,16 +1226,39 @@ export default async function (pi: ExtensionAPI) {
 			)
 				? (event.payload as Record<string, unknown>).messages
 				: promptState?.lastContextMessages;
-			writeRawTrace(config, {
-				type: "provider_request",
-				turnIndex: turnState.index,
-				model: reqModel,
-				messages: payloadMessages,
-				payloadCaptured: config.captureProviderPayload,
-				payloadSummary: config.captureProviderPayload
-					? payloadSummaryText
-					: undefined,
-			});
+			if (config.rawTraceProviderRequestMode !== "off") {
+				const providerRequestBase = {
+					type: "provider_request",
+					turnIndex: turnState.index,
+					model: reqModel,
+					messageCount: Array.isArray(payloadMessages)
+						? payloadMessages.length
+						: undefined,
+					estimatedBytes: estimateJsonBytes(payloadMessages),
+					payloadCaptured: config.captureProviderPayload,
+					payloadSummary: config.captureProviderPayload
+						? payloadSummaryText
+						: undefined,
+				};
+				writeRawTrace(
+					config,
+					config.rawTraceProviderRequestMode === "full"
+						? {
+								...providerRequestBase,
+								captureMode: "full",
+								messages: payloadMessages,
+							}
+						: {
+								...providerRequestBase,
+								captureMode: "summary",
+								messagesSummary: summarizeProviderRequestMessages(
+									config,
+									payloadMessages,
+								),
+								fullMessagesOmitted: Array.isArray(payloadMessages),
+							},
+				);
+			}
 			const payloadSize = payloadSummaryText.length;
 			if (!turnState.requests) turnState.requests = [];
 			turnState.requests.push({

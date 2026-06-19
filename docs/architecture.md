@@ -19,7 +19,7 @@ Trace (name: "pi-agent")
 - **Trace**: Represents one full user interaction. It carries global metadata like `cwd`, `model`, `provider`, `release`, and `environment`.
 - **agent.prompt**: A span that wraps the entire multi-turn loop for a single prompt.
 - **agent.turn**: A span for each reasoning turn. A single prompt may have many turns if the agent is calling tools.
-- **llm-response**: A Langfuse Generation object. It captures the exact prompt sent to the LLM, the streaming response (text + thinking), and the final token usage/cost.
+- **llm-response**: A Langfuse Generation object. It captures a bounded summary of the prompt sent to the LLM, the streaming response (text + thinking), and the final token usage/cost.
 - **tool:<name>**: A span representing a tool execution (e.g., `bash`, `read_file`). It captures input arguments and the (truncated) result.
 
 ## Data Flow
@@ -44,4 +44,5 @@ The extension uses an in-memory `promptState` to track active observations. Beca
 To avoid sending massive payloads to Langfuse:
 - User prompts and assistant responses are truncated based on `trace-input-max-chars`.
 - Tool arguments and results are truncated based on `tool-args-max-chars` and `tool-output-max-chars`.
+- Raw `provider_request` records store bounded summaries by default. Set `rawTraceProviderRequestMode: "full"` or `PI_LANGFUSE_RAW_PROVIDER_REQUEST=full` only for controlled runs that need the exact provider message array.
 - Sensitive environment variables are **not** captured by default.

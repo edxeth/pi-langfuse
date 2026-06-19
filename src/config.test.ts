@@ -23,6 +23,7 @@ describe("resolveConfig", () => {
 		delete process.env.PI_LANGFUSE_REDACTION;
 		delete process.env.PI_LANGFUSE_UNREDACTED;
 		delete process.env.PI_LANGFUSE_REDACTION_SECRETS;
+		delete process.env.PI_LANGFUSE_RAW_PROVIDER_REQUEST;
 		delete process.env.PI_CODING_AGENT_DIR;
 	});
 	it("should use default settings when no input is provided", () => {
@@ -99,5 +100,15 @@ describe("resolveConfig", () => {
 		expect(resolveConfig({}).rawTraceDir).toBe(
 			"/tmp/pi-agent-test/langfuse/raw-traces",
 		);
+	});
+
+	it("lets env opt into full raw provider requests for one process", () => {
+		vi.mocked(fs.existsSync).mockReturnValue(true);
+		vi.mocked(fs.readFileSync).mockReturnValue(
+			JSON.stringify({ rawTraceProviderRequestMode: "summary" }),
+		);
+		process.env.PI_LANGFUSE_RAW_PROVIDER_REQUEST = "full";
+
+		expect(resolveConfig({}).rawTraceProviderRequestMode).toBe("full");
 	});
 });

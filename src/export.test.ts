@@ -33,6 +33,7 @@ const baseConfig: Config = {
 	redactionAdditionalSecrets: ["custom-super-secret-987654321"],
 	rawTraceEnabled: false,
 	rawTraceDir: "/tmp/raw",
+	rawTraceProviderRequestMode: "summary",
 	localAutostart: false,
 	localAutostartDir: "/tmp/langfuse",
 	localAutostartHealthUrl: "http://localhost:3100/api/public/health",

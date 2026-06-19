@@ -25,8 +25,63 @@ describe("index (extension entry)", () => {
 		delete process.env.PI_LANGFUSE_RAW_TRACE_DIR;
 		delete process.env.PI_LANGFUSE_REDACTION_SECRETS;
 		delete process.env.PI_LANGFUSE_SKIP_UNPERSISTED;
+		delete process.env.PI_LANGFUSE_RAW_PROVIDER_REQUEST;
 		delete process.env.PI_CODING_AGENT_DIR;
 	});
+
+	async function captureRawProviderRequestRecords(options: {
+		mode?: "full" | "off";
+		messages: Array<{ role: string; content: string }>;
+	}) {
+		const rawTraceDir = mkdtempSync(join(tmpdir(), "pi-langfuse-index-test-"));
+		const sessionFile = "/tmp/pi-agent/sessions/--work--/session.jsonl";
+		process.env.PI_CODING_AGENT_DIR = mkdtempSync(
+			join(tmpdir(), "pi-langfuse-agent-test-"),
+		);
+		process.env.PI_LANGFUSE_RAW_TRACE = "1";
+		process.env.PI_LANGFUSE_RAW_TRACE_DIR = rawTraceDir;
+		process.env.PI_LANGFUSE_SKIP_UNPERSISTED = "0";
+		if (options.mode) {
+			process.env.PI_LANGFUSE_RAW_PROVIDER_REQUEST = options.mode;
+		}
+
+		mockPi.events.emit.mockImplementation((event, probe) => {
+			if (event === "extension:settings:get") {
+				probe.values = {
+					enabled: false,
+					"redaction-enabled": true,
+				};
+			}
+		});
+
+		await registerExtension(mockPi as unknown as ExtensionArg);
+		const getHandler = (eventName: string) => {
+			const call = mockPi.on.mock.calls.find((item) => item[0] === eventName);
+			if (!call) throw new Error(`${eventName} handler not registered`);
+			return call[1] as EventHandler;
+		};
+
+		await getHandler("before_agent_start")(
+			{
+				prompt: "Patch it",
+				systemPrompt: "You are Pi",
+				systemPromptOptions: { cwd: "/tmp/work" },
+			},
+			{
+				model: { id: "test-model", provider: "test-provider" },
+				sessionManager: { getSessionFile: () => sessionFile },
+			},
+		);
+		await getHandler("turn_start")({ turnIndex: 0 });
+		await getHandler("before_provider_request")({
+			payload: { model: "test-model", messages: options.messages },
+		});
+
+		return readFileSync(join(rawTraceDir, "--work--", "session.jsonl"), "utf-8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+	}
 
 	it("should update state on session_start", async () => {
 		await registerExtension(mockPi as unknown as ExtensionArg);
@@ -153,6 +208,67 @@ describe("index (extension entry)", () => {
 		expect(content).not.toContain("custom-super-secret-987654321");
 		expect(content).toContain("[REDACTED:langfuse-secret-key:");
 		expect(content).toContain("[REDACTED:configured-secret:");
+	});
+
+	it("writes provider_request summaries by default in raw traces", async () => {
+		const messages = [
+			{ role: "system", content: "You are Pi" },
+			{ role: "user", content: "Patch it" },
+			{
+				role: "tool_result",
+				content: "very large output that should not be copied in full",
+			},
+		];
+		const records = await captureRawProviderRequestRecords({ messages });
+		const providerRequest = records.find(
+			(record) => record.type === "provider_request",
+		);
+
+		expect(providerRequest).toMatchObject({
+			type: "provider_request",
+			captureMode: "summary",
+			messageCount: 3,
+			fullMessagesOmitted: true,
+		});
+		expect(providerRequest).not.toHaveProperty("messages");
+		expect(providerRequest?.messagesSummary).toEqual(messages);
+		expect(typeof providerRequest?.estimatedBytes).toBe("number");
+	});
+
+	it("keeps full provider_request messages when explicitly enabled", async () => {
+		const messages = [
+			{ role: "system", content: "You are Pi" },
+			{ role: "user", content: "Patch it" },
+			{ role: "tool_result", content: "exact tool output" },
+		];
+		const records = await captureRawProviderRequestRecords({
+			mode: "full",
+			messages,
+		});
+		const providerRequest = records.find(
+			(record) => record.type === "provider_request",
+		);
+
+		expect(providerRequest).toMatchObject({
+			type: "provider_request",
+			captureMode: "full",
+			messages,
+		});
+		expect(providerRequest).not.toHaveProperty("messagesSummary");
+	});
+
+	it("omits provider_request records when explicitly disabled", async () => {
+		const records = await captureRawProviderRequestRecords({
+			mode: "off",
+			messages: [{ role: "user", content: "Patch it" }],
+		});
+
+		expect(records.some((record) => record.type === "provider_request")).toBe(
+			false,
+		);
+		expect(records.some((record) => record.type === "agent_prompt_start")).toBe(
+			true,
+		);
 	});
 
 	it("should update model on model_select", async () => {

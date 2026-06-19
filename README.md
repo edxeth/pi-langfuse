@@ -97,6 +97,7 @@ You can also configure keys manually via env vars or settings. Configuration pre
 | **Additional Redaction Secrets** | `PI_LANGFUSE_REDACTION_SECRETS` | - | Comma-separated literal secrets to redact in addition to env/config secrets. |
 | **Raw Trace Export** | `PI_LANGFUSE_RAW_TRACE` | `false` | Redacted JSONL companion stream for training/distillation data. |
 | **Raw Trace Directory** | `PI_LANGFUSE_RAW_TRACE_DIR` | `$PI_CODING_AGENT_DIR/langfuse/raw-traces` | Root directory for raw trace companion files. |
+| **Raw Provider Request Mode** | `PI_LANGFUSE_RAW_PROVIDER_REQUEST` | `summary` | Controls `provider_request` raw records: `summary` stores bounded request shape, `full` stores the exact redacted message array, `off` skips the record. |
 
 ## Usage
 
@@ -189,7 +190,8 @@ Enable in config:
 ```json
 {
   "rawTraceEnabled": true,
-  "rawTraceDir": "$PI_CODING_AGENT_DIR/langfuse/raw-traces"
+  "rawTraceDir": "$PI_CODING_AGENT_DIR/langfuse/raw-traces",
+  "rawTraceProviderRequestMode": "summary"
 }
 ```
 
@@ -203,9 +205,9 @@ Fallback:     <agent-dir>/langfuse/raw-traces/--unknown--/<session>.jsonl
 
 Record types: `session_start`, `agent_prompt_start`, `provider_request`, `tool_call`, `tool_result_first_seen`, `tool_execution_end`, `assistant_output`, `session_compact`, `session_end`.
 
-The key record is `tool_result_first_seen`: it captures a redacted summary of tool output immediately (no truncation — only secrets are redacted), before later extensions can compress or rewrite it. Raw traces continue writing even if Langfuse tracing is disabled or the server is unavailable. Raw trace writes are buffered and flushed asynchronously (sub-millisecond delay) so they never block the TUI, and drained synchronously on session shutdown so no data is lost on clean exit.
+The key record is `tool_result_first_seen`: it captures a redacted summary of tool output immediately (no truncation — only secrets are redacted), before later extensions can compress or rewrite it. Raw traces continue writing even if Langfuse tracing is disabled or the server is unavailable. Raw trace writes are queued from event handlers and drained synchronously on session shutdown so no data is lost on clean exit. Very large records still require redaction, JSON serialization, and disk I/O, so use full provider-request capture only for controlled debug or data-capture runs.
 
-`provider_request` records include the full redacted message array sent to the LLM, and `session_end` marks a clean session shutdown.
+`provider_request` records store bounded summaries by default: model, message count, estimated bytes, and redacted message summaries. Set `rawTraceProviderRequestMode` or `PI_LANGFUSE_RAW_PROVIDER_REQUEST=full` to capture the exact full redacted message array sent to the LLM. Set it to `off` to skip `provider_request` records entirely. `PI_LANGFUSE_RAW_PROVIDER_REQUEST` is a per-process override, so `PI_LANGFUSE_RAW_PROVIDER_REQUEST=full pi` can run one controlled exact-capture session without permanently changing the config file. `session_end` marks a clean session shutdown.
 
 #### Session lifecycle
 

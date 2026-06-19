@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { Config } from "./config.js";
 import { getClient, shutdownClient } from "./langfuse-client.js";
 
 const mocks = vi.hoisted(() => {
@@ -19,7 +20,7 @@ vi.mock("langfuse", () => ({
 	Langfuse: vi.fn(() => mocks.client),
 }));
 
-const config = {
+const config: Config = {
 	enabled: true,
 	publicKey: "pk-lf-test",
 	secretKey: "sk-lf-test-secret-1234567890",
@@ -41,6 +42,7 @@ const config = {
 	redactionAdditionalSecrets: [],
 	rawTraceEnabled: false,
 	rawTraceDir: "/tmp/raw",
+	rawTraceProviderRequestMode: "summary",
 	localAutostart: false,
 	localAutostartDir: "/tmp/langfuse",
 	localAutostartHealthUrl: "http://localhost:3100/api/public/health",

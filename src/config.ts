@@ -3,6 +3,8 @@ import { join } from "node:path";
 import { defaultRawTraceDir } from "./raw-trace.js";
 import { DEFAULT_SETTINGS, type SettingsValues } from "./settings.js";
 
+export type RawTraceProviderRequestMode = "summary" | "full" | "off";
+
 export interface Config {
 	publicKey: string;
 	secretKey: string;
@@ -25,6 +27,7 @@ export interface Config {
 	redactionAdditionalSecrets: string[];
 	rawTraceEnabled: boolean;
 	rawTraceDir: string;
+	rawTraceProviderRequestMode: RawTraceProviderRequestMode;
 	localAutostart: boolean;
 	localAutostartDir: string;
 	localAutostartHealthUrl: string;
@@ -96,6 +99,21 @@ function parseBooleanEnv(value: string | undefined) {
 	if (value === undefined) return undefined;
 	if (["1", "true", "yes", "on"].includes(value.toLowerCase())) return true;
 	if (["0", "false", "no", "off"].includes(value.toLowerCase())) return false;
+	return undefined;
+}
+
+function parseProviderRequestMode(
+	value: unknown,
+): RawTraceProviderRequestMode | undefined {
+	if (typeof value !== "string") return undefined;
+	const normalized = value.trim().toLowerCase();
+	if (
+		normalized === "summary" ||
+		normalized === "full" ||
+		normalized === "off"
+	) {
+		return normalized;
+	}
 	return undefined;
 }
 
@@ -232,6 +250,10 @@ export function resolveConfig(settings: Partial<SettingsValues>): Config {
 				process.env.PI_LANGFUSE_RAW_TRACE_DIR ||
 				defaultRawTraceDir(),
 		),
+		rawTraceProviderRequestMode:
+			parseProviderRequestMode(process.env.PI_LANGFUSE_RAW_PROVIDER_REQUEST) ??
+			parseProviderRequestMode(fileConfig.rawTraceProviderRequestMode) ??
+			"summary",
 		localAutostart,
 		localAutostartDir: String(
 			fileConfig.localAutostartDir ??
