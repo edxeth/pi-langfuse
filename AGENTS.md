@@ -23,6 +23,7 @@ When modifying tracing logic, you MUST maintain the following hierarchy:
 - **Linting/Formatting**: We use **Biome**. Run `npm run check` or `npm run format`.
 - **Testing**: We use **Vitest**. Run `npm test`.
 - **E2E Integration**: Requires `RUN_LANGFUSE_E2E=1` and valid `LANGFUSE_*` credentials.
+- **Test cleanup**: When E2E tests or manual telemetry checks hit a persistent Langfuse project, use distinct test trace names/tags and delete those traces before handoff. Do not leave `e2e-pi-test`, empty-name/unknown, or other fixture traces in the user's local or cloud project.
 - **Releases**: Managed via `release-it`. Always use Conventional Commits (`feat:`, `fix:`, `chore:`, etc.) to ensure the automated changelog works correctly.
 
 ## Client Lifecycle
