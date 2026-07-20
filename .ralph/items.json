@@ -54,8 +54,8 @@
 				"Update CI to run clean install, non-mutating Biome check, typecheck, tests, build, and package dry-run on the supported Node runtime.",
 				"Verify a clean install from the lockfile and confirm no current command, config, raw-trace, export, or local setup test regresses."
 			],
-			"passes": false,
-			"regression_notes": ""
+			"passes": true,
+			"regression_notes": "Updated Node.js metadata and ES2023 compiler target, added a lockfile generated from an empty package-only checkout, and aligned CI with Node 22, npm ci, non-mutating Biome, typecheck, tests, build, and package dry-run. Targeted compatibility, clean npm ci, full gates, and package dry-run passed. Clean generation retains three nested @earendil peer entries without direct integrity fields because the published peer package has its own shrinkwrap metadata."
 		},
 		{
 			"category": "correctness",
