@@ -17,6 +17,9 @@ export interface SessionState<PromptState> {
 	promptState: PromptState | null;
 	compactCount: number;
 	lease: symbol;
+	shutdownPromise?: Promise<void>;
+	promptStartPromise?: Promise<void>;
+	promptStartSignature?: string;
 }
 
 type SessionKey = string | object;

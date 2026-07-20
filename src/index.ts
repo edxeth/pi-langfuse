@@ -135,7 +135,12 @@ export default async function (pi: ExtensionAPI) {
 		registerSettings(pi, getLiveSettingsView(settings));
 		const config = resolveConfig(settings);
 		for (const state of sessionOwner.values()) {
-			await agentLifecycle.finalizePrompt(state, config);
+			await agentLifecycle.finalizePrompt(
+				state,
+				config,
+				false,
+				"config refresh",
+			);
 		}
 		await flushClient();
 		if (!hasActiveSessionLeases()) await shutdownClient();
@@ -215,6 +220,7 @@ export default async function (pi: ExtensionAPI) {
 		standardUsageFromUsage,
 		usageDetailsFromUsage,
 		costDetailsFromUsage,
+		abandonTurnGenerations: generationLifecycle.abandonTurn,
 	});
 
 	pi.events.on("pi-extension-settings:ready", () => {
@@ -278,7 +284,12 @@ export default async function (pi: ExtensionAPI) {
 		lastUiContext = ctx;
 		updateLangfuseStatusLine(ctx, resolveConfig(settings));
 		const config = resolveConfig(settings);
-		await agentLifecycle.finalizePrompt(state, config);
+		await agentLifecycle.finalizePrompt(
+			state,
+			config,
+			false,
+			"session replacement",
+		);
 
 		state.sessionFile = ctx.sessionManager.getSessionFile() || "";
 		const data = event as typeof event & {
@@ -306,7 +317,7 @@ export default async function (pi: ExtensionAPI) {
 		state.model = event.model?.id || "";
 		state.provider = event.model?.provider || "";
 		const prompt = state.promptState;
-		if (prompt) {
+		if (prompt && !prompt.finalizing) {
 			const config = resolveConfig(settings);
 			prompt.trace?.update({
 				metadata: {
@@ -346,7 +357,7 @@ export default async function (pi: ExtensionAPI) {
 
 	pi.on("session_compact", async (_event, ctx) => {
 		const state = getTypedSessionState(ctx);
-		if (!state) return;
+		if (!state || state.promptState?.finalizing) return;
 		state.compactCount += 1;
 		writeRawTrace(resolveConfig(settings), state, {
 			type: "session_compact",
@@ -369,14 +380,25 @@ export default async function (pi: ExtensionAPI) {
 			}
 			return;
 		}
-		const config = resolveConfig(settings);
-		writeRawTrace(config, state, {
-			type: "session_end",
-			reason: "shutdown",
-		});
-		drainRawTraceQueue();
-		await agentLifecycle.finalizePrompt(state, config, true);
-		sessionOwner.deleteState(state);
-		if (!hasActiveSessionLeases()) await shutdownClient();
+		if (!state.shutdownPromise) {
+			state.shutdownPromise = (async () => {
+				const config = resolveConfig(settings);
+				writeRawTrace(config, state, {
+					type: "session_end",
+					reason: "shutdown",
+				});
+				const finalization = agentLifecycle.finalizePrompt(
+					state,
+					config,
+					true,
+					"session shutdown",
+				);
+				drainRawTraceQueue();
+				await finalization;
+				sessionOwner.deleteState(state);
+				if (!hasActiveSessionLeases()) await shutdownClient();
+			})();
+		}
+		await state.shutdownPromise;
 	});
 }

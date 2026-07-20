@@ -5,11 +5,12 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { Config, canTrace } from "./config.js";
 import type { getClient, LangfuseGeneration } from "./langfuse-client.js";
-import type {
-	GenerationState,
-	PiUsage,
-	PromptState,
-	TurnState,
+import {
+	type GenerationState,
+	getLifecycleFailure,
+	type PiUsage,
+	type PromptState,
+	type TurnState,
 } from "./lifecycle-types.js";
 import type { redactionMetadata } from "./redaction.js";
 import type { SessionContextLike, SessionState } from "./session-state.js";
@@ -168,6 +169,7 @@ function createGenerationState(
 	turn: TurnState,
 	requestKey: string,
 	requestModel?: string,
+	requestFingerprint?: string,
 ): GenerationState {
 	const state: GenerationState = {
 		requestKey,
@@ -177,6 +179,7 @@ function createGenerationState(
 		streamingThinking: "",
 		metadata: { requestKey },
 		requestModel,
+		requestFingerprint,
 	};
 	turn.generations.set(requestKey, state);
 	turn.generationOrder.push(requestKey);
@@ -189,6 +192,7 @@ function getOrCreateGenerationState(
 	options: {
 		create: boolean;
 		newRequest: boolean;
+		requestFingerprint?: string;
 	},
 ): GenerationState | undefined {
 	const explicitRequestKey = getExplicitRequestKey(event);
@@ -199,20 +203,38 @@ function getOrCreateGenerationState(
 	}
 
 	if (options.newRequest) {
+		const latest = findLatestGeneration(turn, (state) => !state.ended);
+		if (
+			latest &&
+			options.requestFingerprint &&
+			latest.requestFingerprint === options.requestFingerprint
+		)
+			return latest;
 		if (!options.create) return undefined;
 		const requestKey = `turn:${turn.index}:request:${turn.nextGenerationIndex}`;
 		turn.nextGenerationIndex += 1;
-		return createGenerationState(turn, requestKey);
+		return createGenerationState(
+			turn,
+			requestKey,
+			undefined,
+			options.requestFingerprint,
+		);
 	}
 
 	const pending = findLatestGeneration(
 		turn,
-		(state) => !state.ended && !state.generation,
+		(state) => !state.ended && !state.generation && !state.finishPromise,
 	);
 	if (pending) return pending;
 
-	const open = findLatestGeneration(turn, (state) => !state.ended);
+	const open = findLatestGeneration(
+		turn,
+		(state) => !state.ended && !state.finishPromise,
+	);
 	if (open) return open;
+
+	const completed = findLatestGeneration(turn, (state) => state.ended);
+	if (completed) return completed;
 
 	if (!options.create) return undefined;
 	const requestKey = `turn:${turn.index}:request:${turn.nextGenerationIndex}`;
@@ -246,7 +268,7 @@ export function createGenerationLifecycleHandlers(
 	const getSessionPrompt = (ctx: ExtensionContext, event: unknown) => {
 		const state = deps.getSessionState(ctx);
 		const prompt = state?.promptState;
-		if (!state || !prompt) return undefined;
+		if (!state || !prompt || prompt.finalizing) return undefined;
 		const turn = getTurn(prompt, eventRecord(event));
 		if (!turn) return undefined;
 		return { state, prompt, turn };
@@ -259,7 +281,12 @@ export function createGenerationLifecycleHandlers(
 		generationState: GenerationState,
 		config: Config,
 	) => {
-		if (generationState.generation || generationState.ended) return;
+		if (
+			generationState.generation ||
+			generationState.ended ||
+			prompt.finalizing
+		)
+			return;
 		if (!generationState.startPromise) {
 			generationState.startPromise = (async () => {
 				try {
@@ -312,7 +339,7 @@ export function createGenerationLifecycleHandlers(
 		generationState.generation?.update?.(body);
 	};
 
-	const finishGeneration = async (
+	const finishGeneration = (
 		state: SessionState<PromptState>,
 		prompt: PromptState,
 		turn: TurnState,
@@ -321,49 +348,53 @@ export function createGenerationLifecycleHandlers(
 		body: Parameters<LangfuseGeneration["end"]>[0],
 		usage?: PiUsage,
 	) => {
-		if (generationState.ended) return;
-		await ensureGeneration(state, prompt, turn, generationState, config);
-		if (generationState.ended || !generationState.generation) return;
+		if (generationState.finishPromise) return generationState.finishPromise;
+		if (generationState.ended) return Promise.resolve();
+		generationState.finishPromise = (async () => {
+			await ensureGeneration(state, prompt, turn, generationState, config);
+			if (generationState.ended || !generationState.generation) return;
 
-		generationState.ended = true;
-		try {
-			generationState.generation.end(body);
-			if (usage && state.promptState === prompt) {
-				const lf = await deps.getClient(config);
-				if (usage.input) {
-					lf.score({
-						name: "input_tokens",
-						value: usage.input,
-						traceId: prompt.trace?.id,
-						observationId: generationState.generation.id,
-					});
+			generationState.ended = true;
+			try {
+				generationState.generation.end(body);
+				if (usage && state.promptState === prompt) {
+					const lf = await deps.getClient(config);
+					if (usage.input) {
+						lf.score({
+							name: "input_tokens",
+							value: usage.input,
+							traceId: prompt.trace?.id,
+							observationId: generationState.generation.id,
+						});
+					}
+					if (usage.output) {
+						lf.score({
+							name: "output_tokens",
+							value: usage.output,
+							traceId: prompt.trace?.id,
+							observationId: generationState.generation.id,
+						});
+					}
+					if (typeof usage.cost?.total === "number") {
+						lf.score({
+							name: "total_cost",
+							value: usage.cost.total,
+							traceId: prompt.trace?.id,
+							observationId: generationState.generation.id,
+						});
+					}
 				}
-				if (usage.output) {
-					lf.score({
-						name: "output_tokens",
-						value: usage.output,
-						traceId: prompt.trace?.id,
-						observationId: generationState.generation.id,
-					});
-				}
-				if (typeof usage.cost?.total === "number") {
-					lf.score({
-						name: "total_cost",
-						value: usage.cost.total,
-						traceId: prompt.trace?.id,
-						observationId: generationState.generation.id,
-					});
-				}
+			} catch (error) {
+				console.warn("📊 Langfuse: Failed to end generation", error);
 			}
-		} catch (error) {
-			console.warn("📊 Langfuse: Failed to end generation", error);
-		}
+		})();
+		return generationState.finishPromise;
 	};
 
 	const context = async (event: ContextEvent, ctx: ExtensionContext) => {
 		const state = deps.getSessionState(ctx);
 		const prompt = state?.promptState;
-		if (!state || !prompt) return;
+		if (!state || !prompt || prompt.finalizing) return;
 		const config = deps.getConfig();
 		const messages = event.messages as Array<{
 			role: string;
@@ -383,7 +414,7 @@ export function createGenerationLifecycleHandlers(
 	) => {
 		const state = deps.getSessionState(ctx);
 		const prompt = state?.promptState;
-		if (!state || !prompt) return;
+		if (!state || !prompt || prompt.finalizing) return;
 		const config = deps.getConfig();
 		const record = eventRecord(event);
 		const turn = getTurn(prompt, record);
@@ -460,6 +491,7 @@ export function createGenerationLifecycleHandlers(
 			const generationState = getOrCreateGenerationState(turn, record, {
 				create: true,
 				newRequest: true,
+				requestFingerprint: payloadSummaryText,
 			});
 			if (generationState) {
 				generationState.inputSnapshot = snapshotInput(prompt, config);
@@ -484,7 +516,12 @@ export function createGenerationLifecycleHandlers(
 			create: true,
 			newRequest: false,
 		});
-		if (!generationState) return;
+		if (
+			!generationState ||
+			generationState.ended ||
+			generationState.finishPromise
+		)
+			return;
 		generationState.inputSnapshot ??= snapshotInput(prompt, config);
 		generationState.metadata = providerResponseMetadata(
 			record,
@@ -514,8 +551,15 @@ export function createGenerationLifecycleHandlers(
 				newRequest: false,
 			},
 		);
-		if (!generationState || generationState.ended) return;
+		if (
+			!generationState ||
+			generationState.ended ||
+			generationState.finishPromise ||
+			generationState.messageStarted
+		)
+			return;
 		generationState.inputSnapshot ??= snapshotInput(prompt, config);
+		generationState.messageStarted = true;
 		generationState.streamingText = "";
 		generationState.streamingThinking = "";
 		await ensureGeneration(state, prompt, turn, generationState, config);
@@ -540,7 +584,12 @@ export function createGenerationLifecycleHandlers(
 				newRequest: false,
 			},
 		);
-		if (!generationState || generationState.ended) return;
+		if (
+			!generationState ||
+			generationState.ended ||
+			generationState.finishPromise
+		)
+			return;
 		generationState.inputSnapshot ??= snapshotInput(prompt, config);
 		const assistantEvent = asRecord(event.assistantMessageEvent);
 		if (!assistantEvent) return;
@@ -585,6 +634,13 @@ export function createGenerationLifecycleHandlers(
 		const resolved = getSessionPrompt(ctx, event);
 		if (!resolved) return;
 		const { state, prompt, turn } = resolved;
+		if (turn.messageEnded) return;
+		turn.messageEnded = true;
+		const failure = getLifecycleFailure(message);
+		if (failure) {
+			turn.failure = failure;
+			prompt.failure ??= failure;
+		}
 		const config = deps.getConfig();
 		const content = message.content as
 			| Array<{ type: string; text?: string }>
@@ -657,20 +713,20 @@ export function createGenerationLifecycleHandlers(
 					provider: state.provider,
 					turnIndex: turn.index,
 					thinking: generationState.streamingThinking || undefined,
+					stopReason: failure?.stopReason,
+					errorMessage: failure?.errorMessage,
 				},
-				isError:
-					message.stopReason === "error" ||
-					message.stopReason === "aborted" ||
-					message.isError === true,
+				isError: Boolean(failure) || message.isError === true,
 				statusMessage:
-					message.stopReason === "error" || message.isError === true
+					failure?.errorMessage ||
+					(failure?.stopReason === "error" || message.isError === true
 						? typeof generationState.metadata.providerResponseStatus ===
 							"number"
 							? `provider response failed (${generationState.metadata.providerResponseStatus})`
 							: "provider response failed"
-						: message.stopReason === "aborted"
+						: failure?.stopReason === "aborted"
 							? "provider response aborted"
-							: undefined,
+							: undefined),
 			},
 			usage,
 		);
@@ -680,21 +736,32 @@ export function createGenerationLifecycleHandlers(
 		for (const requestKey of turn.generationOrder) {
 			const generationState = turn.generations.get(requestKey);
 			if (!generationState || generationState.ended) continue;
-			if (generationState.startPromise) {
-				await generationState.startPromise;
+			if (generationState.finishPromise) {
+				await generationState.finishPromise;
+				continue;
 			}
-			if (!generationState.generation) continue;
-			generationState.ended = true;
-			generationState.generation.end({
-				isError: true,
-				statusMessage: "generation abandoned during prompt finalization",
-				metadata: {
-					...generationState.metadata,
-					abandoned: true,
-					turnIndex: turn.index,
-					durationMs: Date.now() - generationState.startedAt,
-				},
-			});
+			generationState.finishPromise = (async () => {
+				generationState.ended = true;
+				if (generationState.startPromise) {
+					await generationState.startPromise;
+				}
+				if (!generationState.generation) return;
+				try {
+					generationState.generation.end({
+						isError: true,
+						statusMessage: "generation abandoned during prompt finalization",
+						metadata: {
+							...generationState.metadata,
+							abandoned: true,
+							turnIndex: turn.index,
+							durationMs: Date.now() - generationState.startedAt,
+						},
+					});
+				} catch (error) {
+					console.warn("📊 Langfuse: Failed to abandon generation", error);
+				}
+			})();
+			await generationState.finishPromise;
 		}
 	};
 

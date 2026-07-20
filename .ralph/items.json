@@ -114,8 +114,8 @@
 				"Assert repeated completion is a no-op, abandoned observations receive a precise status, and maps and session state are empty after cleanup.",
 				"Verify finalization preserves the existing Langfuse client persistence rule and does not shut down the shared runtime after each prompt."
 			],
-			"passes": false,
-			"regression_notes": ""
+			"passes": true,
+			"regression_notes": "Added registered-handler regressions for duplicate prompt, agent, turn, generation, and tool starts and ends; end-before-start; parent-child generation cleanup; result-only tools; host-shaped agent failure status; session replacement and fork; compaction; config refresh; late-event cleanup; idempotent shutdown; and shared-client persistence. Targeted and full verification passed; credentialed E2E remains skipped."
 		},
 		{
 			"category": "privacy",

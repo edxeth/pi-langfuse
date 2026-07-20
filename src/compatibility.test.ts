@@ -89,6 +89,7 @@ const telemetry = vi.hoisted(() => {
 				}),
 				end: vi.fn((end: Record<string, unknown>) => {
 					record.end = end;
+					record.endCalls = Number(record.endCalls ?? 0) + 1;
 				}),
 			};
 		}),
@@ -2037,6 +2038,589 @@ describe("executable compatibility contract", () => {
 				.filter((record) => record.type === "tool_execution_end")
 				.map((record) => record.toolCallId),
 		).toEqual(expect.arrayContaining(["tool-a", "tool-b"]));
+	});
+
+	it("closes child generations before turn cleanup and treats result-only tools as complete", async () => {
+		const agentDir = tempRoot("pi-langfuse-lifecycle-children-agent-");
+		const rawTraceDir = join(agentDir, "raw-traces");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "children-public",
+			"secret-key": "children-secret",
+			"base-url": "http://children-host",
+			"raw-trace-enabled": true,
+			"raw-trace-dir": rawTraceDir,
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+		const handler = (name: string) => eventHandler(pi, name);
+		const contextA = {
+			model: { id: "model-a", provider: "provider-a" },
+			sessionManager: {
+				getSessionFile: () =>
+					"/tmp/pi-agent/sessions/--children-a--/children-a.jsonl",
+			},
+		};
+		await handler("session_start")({ reason: "startup" }, contextA);
+		await handler("before_agent_start")(
+			{
+				prompt: "unfinished generation",
+				systemPrompt: "system",
+				systemPromptOptions: { cwd: "/tmp/children-a" },
+			},
+			contextA,
+		);
+		await handler("agent_start")({}, contextA);
+		await handler("turn_start")({ turnIndex: 0 }, contextA);
+		await handler("before_provider_request")(
+			{ payload: { model: "model-a" } },
+			contextA,
+		);
+		await handler("message_start")(
+			{ message: { role: "assistant" } },
+			contextA,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			contextA,
+		);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "late" }],
+				},
+			},
+			contextA,
+		);
+		await handler("agent_end")({ messages: [] }, contextA);
+
+		const traceA = latestRecord(telemetry.state.traces, "pi-agent");
+		const generationA = latestRecord(
+			telemetry.state.observations.filter(
+				(record) => record.traceId === traceA.id,
+			),
+			"llm-response",
+		);
+		expect(generationA.endCalls).toBe(1);
+		expect(generationA.end).toMatchObject({
+			isError: true,
+			statusMessage: "generation abandoned during prompt finalization",
+		});
+		expect(traceA.lastUpdate).toMatchObject({
+			metadata: {
+				completed: false,
+				abandoned: true,
+				abandonmentReason: "turn ended before generation completion",
+			},
+		});
+		const promptA = latestRecord(
+			telemetry.state.observations.filter(
+				(record) => record.traceId === traceA.id,
+			),
+			"agent.prompt",
+		);
+		expect(promptA.end).toMatchObject({
+			metadata: {
+				completed: false,
+				abandoned: true,
+				abandonmentReason: "turn ended before generation completion",
+			},
+		});
+		await handler("session_shutdown")({ reason: "resume" }, contextA);
+
+		const contextB = {
+			model: { id: "model-b", provider: "provider-b" },
+			sessionManager: {
+				getSessionFile: () =>
+					"/tmp/pi-agent/sessions/--children-b--/children-b.jsonl",
+			},
+		};
+		await handler("session_start")(
+			{
+				reason: "resume",
+				previousSessionFile: contextA.sessionManager.getSessionFile(),
+			},
+			contextB,
+		);
+		await handler("before_agent_start")(
+			{
+				prompt: "result-only tool",
+				systemPrompt: "system",
+				systemPromptOptions: { cwd: "/tmp/children-b" },
+			},
+			contextB,
+		);
+		await handler("agent_start")({}, contextB);
+		await handler("turn_start")({ turnIndex: 0 }, contextB);
+		await handler("tool_result")(
+			{
+				toolCallId: "result-only",
+				toolName: "bash",
+				input: { command: "echo done" },
+				content: [{ type: "text", text: "done" }],
+				isError: false,
+			},
+			contextB,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			contextB,
+		);
+		await handler("agent_end")({ messages: [] }, contextB);
+
+		const traceB = telemetry.state.traces.find(
+			(record) => record.sessionId === "children-b",
+		);
+		if (!traceB) throw new Error("result-only tool trace was not created");
+		const observationsB = telemetry.state.observations.filter(
+			(record) => record.traceId === traceB.id,
+		);
+		expect(latestRecord(observationsB, "agent.prompt").end).toMatchObject({
+			metadata: { completed: true },
+		});
+		expect(latestRecord(observationsB, "tool:bash").end).toMatchObject({
+			isError: false,
+			output: "done",
+		});
+		expect(
+			(latestRecord(observationsB, "tool:bash").end as Record<string, unknown>)
+				.metadata,
+		).not.toHaveProperty("abandoned");
+		await handler("session_shutdown")({ reason: "quit" }, contextB);
+	});
+
+	it("deduplicates prompt starts and records host-shaped agent failures", async () => {
+		const agentDir = tempRoot("pi-langfuse-lifecycle-failure-agent-");
+		const rawTraceDir = join(agentDir, "raw-traces");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "failure-public",
+			"secret-key": "failure-secret",
+			"base-url": "http://failure-host",
+			"raw-trace-enabled": true,
+			"raw-trace-dir": rawTraceDir,
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+		const handler = (name: string) => eventHandler(pi, name);
+		const sessionFile =
+			"/tmp/pi-agent/sessions/--failure--/failure-session.jsonl";
+		const context = {
+			model: { id: "failure-model", provider: "failure-provider" },
+			sessionManager: { getSessionFile: () => sessionFile },
+		};
+		const promptEvent = {
+			prompt: "failure prompt",
+			systemPrompt: "failure system",
+			systemPromptOptions: { cwd: "/tmp/failure" },
+		};
+		await handler("session_start")({ reason: "startup" }, context);
+		await Promise.all([
+			handler("before_agent_start")(promptEvent, context),
+			handler("before_agent_start")(promptEvent, context),
+		]);
+		await handler("before_agent_start")(promptEvent, context);
+		await handler("agent_start")({}, context);
+		await handler("turn_start")({ turnIndex: 0 }, context);
+		await handler("before_provider_request")(
+			{ payload: { model: "failure-model" } },
+			context,
+		);
+		const failureMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "failed" }],
+			model: "failure-model",
+			usage: { input: 1, output: 0, totalTokens: 1 },
+			stopReason: "error",
+			errorMessage: "upstream failed",
+		};
+		await handler("message_end")({ message: failureMessage }, context);
+		await handler("turn_end")(
+			{ turnIndex: 0, message: failureMessage, toolResults: [] },
+			context,
+		);
+		await handler("agent_end")({ messages: [failureMessage] }, context);
+
+		expect(telemetry.state.traces).toHaveLength(1);
+		const trace = telemetry.state.traces[0];
+		if (!trace) throw new Error("failure trace was not created");
+		const observations = telemetry.state.observations.filter(
+			(record) => record.traceId === trace.id,
+		);
+		expect(observations.map((record) => record.name)).toEqual([
+			"agent.prompt",
+			"agent.turn",
+			"llm-response",
+		]);
+		expect(latestRecord(observations, "llm-response").end).toMatchObject({
+			isError: true,
+			statusMessage: "upstream failed",
+			metadata: { stopReason: "error", errorMessage: "upstream failed" },
+		});
+		expect(latestRecord(observations, "agent.turn").end).toMatchObject({
+			isError: true,
+			statusMessage: "upstream failed",
+			metadata: { stopReason: "error", errorMessage: "upstream failed" },
+		});
+		expect(latestRecord(observations, "agent.prompt").end).toMatchObject({
+			isError: true,
+			statusMessage: "agent error: upstream failed",
+			metadata: {
+				completed: false,
+				failed: true,
+				stopReason: "error",
+				errorMessage: "upstream failed",
+			},
+		});
+		expect(trace.lastUpdate).toMatchObject({
+			metadata: {
+				completed: false,
+				failed: true,
+				stopReason: "error",
+				errorMessage: "upstream failed",
+			},
+		});
+		drainRawTraceQueue();
+		const records = readFileSync(
+			join(rawTraceDir, "--failure--", "failure-session.jsonl"),
+			"utf-8",
+		)
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+		expect(
+			records.filter((record) => record.type === "agent_prompt_start"),
+		).toHaveLength(1);
+		await handler("session_shutdown")({ reason: "quit" }, context);
+	});
+
+	it("finalizes partial runs once across duplicate lifecycle and session replacement events", async () => {
+		const agentDir = tempRoot("pi-langfuse-lifecycle-agent-");
+		const rawTraceDir = join(agentDir, "raw-traces");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const settingsValues = {
+			enabled: true,
+			"public-key": "lifecycle-public",
+			"secret-key": "lifecycle-secret",
+			"base-url": "http://lifecycle-host",
+			"raw-trace-enabled": true,
+			"raw-trace-dir": rawTraceDir,
+		};
+		const pi = createTestPi(settingsValues);
+		await registerExtension(pi as unknown as ExtensionAPI);
+		const handler = (name: string) => eventHandler(pi, name);
+		const fileA = "/tmp/pi-agent/sessions/--lifecycle-a--/lifecycle-a.jsonl";
+		const contextA = {
+			model: { id: "model-a", provider: "provider-a" },
+			sessionManager: {
+				getSessionFile: () => fileA,
+				getSessionId: () => "manager-a",
+			},
+		};
+
+		await handler("session_start")({ reason: "startup" }, contextA);
+		await handler("before_agent_start")(
+			{
+				prompt: "partial prompt",
+				systemPrompt: "partial system",
+				systemPromptOptions: { cwd: "/tmp/lifecycle-a" },
+			},
+			contextA,
+		);
+		await Promise.all([
+			handler("agent_start")({}, contextA),
+			handler("agent_start")({}, contextA),
+		]);
+		await Promise.all([
+			handler("turn_start")({ turnIndex: 0 }, contextA),
+			handler("turn_start")({ turnIndex: 0 }, contextA),
+		]);
+		await handler("turn_end")(
+			{
+				turnIndex: 1,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			contextA,
+		);
+		await handler("turn_start")({ turnIndex: 1 }, contextA);
+		await handler("before_provider_request")(
+			{
+				payload: {
+					model: "model-a",
+					messages: [{ role: "user", content: "partial prompt" }],
+				},
+			},
+			contextA,
+		);
+		await Promise.all([
+			handler("message_start")({ message: { role: "assistant" } }, contextA),
+			handler("message_start")({ message: { role: "assistant" } }, contextA),
+		]);
+		await handler("tool_execution_start")(
+			{
+				toolCallId: "partial-tool",
+				toolName: "bash",
+				args: { command: "echo partial" },
+			},
+			contextA,
+		);
+		await handler("tool_execution_start")(
+			{
+				toolCallId: "partial-tool",
+				toolName: "bash",
+				args: { command: "echo partial" },
+			},
+			contextA,
+		);
+		await handler("tool_execution_start")(
+			{
+				toolCallId: "completed-tool",
+				toolName: "write",
+				args: { path: "/tmp/completed" },
+			},
+			contextA,
+		);
+		await handler("tool_execution_end")(
+			{
+				toolCallId: "completed-tool",
+				toolName: "write",
+				result: { content: [{ type: "text", text: "done" }] },
+				isError: false,
+			},
+			contextA,
+		);
+		await handler("tool_execution_end")(
+			{
+				toolCallId: "completed-tool",
+				toolName: "write",
+				result: { content: [{ type: "text", text: "duplicate" }] },
+				isError: true,
+			},
+			contextA,
+		);
+		await handler("session_compact")({}, contextA);
+
+		await Promise.all([
+			handler("agent_end")({ messages: [] }, contextA),
+			handler("agent_end")({ messages: [] }, contextA),
+		]);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			contextA,
+		);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "late" }],
+				},
+			},
+			contextA,
+		);
+
+		const traceA = latestRecord(telemetry.state.traces, "pi-agent");
+		const observationsA = telemetry.state.observations.filter(
+			(record) => record.traceId === traceA.id,
+		);
+		expect(observationsA.map((record) => record.name)).toEqual([
+			"agent.prompt",
+			"agent.turn",
+			"llm-response",
+			"tool:bash",
+			"tool:write",
+		]);
+		expect(observationsA).toHaveLength(5);
+		for (const observation of observationsA) {
+			expect(observation.endCalls).toBe(1);
+		}
+		expect(latestRecord(observationsA, "agent.prompt").end).toMatchObject({
+			isError: true,
+			statusMessage: "prompt abandoned during agent finalization",
+			metadata: { abandoned: true, compactCount: 1 },
+		});
+		expect(latestRecord(observationsA, "agent.turn").end).toMatchObject({
+			isError: true,
+			statusMessage: "turn ended during cleanup",
+			metadata: { abandoned: true },
+		});
+		expect(latestRecord(observationsA, "llm-response").end).toMatchObject({
+			isError: true,
+			statusMessage: "generation abandoned during prompt finalization",
+			metadata: { abandoned: true },
+		});
+		expect(latestRecord(observationsA, "tool:bash").end).toMatchObject({
+			isError: true,
+			statusMessage: "tool ended without completion event",
+			metadata: { abandoned: true },
+		});
+		expect(latestRecord(observationsA, "tool:write").end).toMatchObject({
+			isError: false,
+			output: "done",
+		});
+		expect(traceA.lastUpdate).toMatchObject({
+			metadata: {
+				completed: false,
+				abandoned: true,
+				compactCount: 1,
+				toolCalls: 2,
+			},
+		});
+
+		await Promise.all([
+			handler("session_shutdown")({ reason: "resume" }, contextA),
+			handler("session_shutdown")({ reason: "resume" }, contextA),
+		]);
+		drainRawTraceQueue();
+		const rawA = readFileSync(
+			join(rawTraceDir, "--lifecycle-a--", "lifecycle-a.jsonl"),
+			"utf-8",
+		)
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+		expect(rawA.filter((record) => record.type === "session_end")).toHaveLength(
+			1,
+		);
+		const observationCountAfterA = telemetry.state.observations.length;
+		await handler("tool_execution_end")(
+			{
+				toolCallId: "partial-tool",
+				toolName: "bash",
+				result: { content: [{ type: "text", text: "late" }] },
+				isError: false,
+			},
+			contextA,
+		);
+		await handler("turn_start")({ turnIndex: 0 }, contextA);
+		expect(telemetry.state.observations).toHaveLength(observationCountAfterA);
+
+		const fileB = "/tmp/pi-agent/sessions/--lifecycle-b--/lifecycle-b.jsonl";
+		const contextB = {
+			model: { id: "model-b", provider: "provider-b" },
+			sessionManager: {
+				getSessionFile: () => fileB,
+				getSessionId: () => "manager-b",
+			},
+		};
+		await handler("session_start")(
+			{ reason: "resume", previousSessionFile: fileA },
+			contextB,
+		);
+		await handler("before_agent_start")(
+			{
+				prompt: "refresh prompt",
+				systemPrompt: "refresh system",
+				systemPromptOptions: { cwd: "/tmp/lifecycle-b" },
+			},
+			contextB,
+		);
+		await handler("agent_start")({}, contextB);
+		await handler("turn_start")({ turnIndex: 0 }, contextB);
+		const refreshRegistrationCount = settingsRegistrations(pi).length;
+		await settingsListener(pi, "pi-extension-settings:pi-langfuse:changed")();
+		await waitForSettingsRegistration(pi, refreshRegistrationCount);
+		await handler("agent_end")({ messages: [] }, contextB);
+		await handler("session_shutdown")({ reason: "fork" }, contextB);
+
+		const fileC = "/tmp/pi-agent/sessions/--lifecycle-c--/lifecycle-c.jsonl";
+		const contextC = {
+			model: { id: "model-c", provider: "provider-c" },
+			sessionManager: {
+				getSessionFile: () => fileC,
+				getSessionId: () => "manager-c",
+			},
+		};
+		await handler("session_start")(
+			{ reason: "fork", previousSessionFile: fileB },
+			contextC,
+		);
+		await handler("before_agent_start")(
+			{
+				prompt: "complete prompt",
+				systemPrompt: "complete system",
+				systemPromptOptions: { cwd: "/tmp/lifecycle-c" },
+			},
+			contextC,
+		);
+		await handler("agent_start")({}, contextC);
+		await handler("turn_start")({ turnIndex: 0 }, contextC);
+		await handler("before_provider_request")(
+			{ payload: { model: "model-c" } },
+			contextC,
+		);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "complete" }],
+					usage: { input: 1, output: 2, totalTokens: 3 },
+				},
+			},
+			contextC,
+		);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "duplicate" }],
+					usage: { input: 4, output: 5, totalTokens: 9 },
+				},
+			},
+			contextC,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			contextC,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			contextC,
+		);
+		await handler("agent_end")({ messages: [] }, contextC);
+
+		const traceC = telemetry.state.traces.find(
+			(record) => record.sessionId === "lifecycle-c",
+		);
+		if (!traceC) throw new Error("forked session trace was not created");
+		const observationsC = telemetry.state.observations.filter(
+			(record) => record.traceId === traceC.id,
+		);
+		expect(observationsC.map((record) => record.name)).toEqual([
+			"agent.prompt",
+			"agent.turn",
+			"llm-response",
+		]);
+		expect(latestRecord(observationsC, "llm-response").endCalls).toBe(1);
+		expect(latestRecord(observationsC, "llm-response").end).toMatchObject({
+			output: "complete",
+			usage: { input: 1, output: 2, total: 3 },
+		});
+		expect(latestRecord(observationsC, "agent.prompt").end).toMatchObject({
+			metadata: { completed: true, turns: 1 },
+		});
+		await handler("session_shutdown")({ reason: "quit" }, contextC);
 	});
 
 	it("keeps the compiled package entrypoint loadable", async () => {

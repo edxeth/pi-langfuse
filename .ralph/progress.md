@@ -238,3 +238,46 @@ Verification gates:
 Item-specific evidence: The registered extension harness exercised `tool_call`-first and `tool_execution_start`-first calls, duplicate start ownership, concurrent tools, out-of-order completion, progress updates, image content, final errors, a result-only call, a missing completion, session shutdown cleanup, trace and turn parentage, one end call per span, and unchanged raw tool record types and fields. The build and package dry-run compiled and included the new handler while retaining `dist/index.js`. No dependency audit was required by this item. The credentialed external E2E remained skipped because credentials were unavailable; local telemetry tests used the documented in-memory transport substitute without paid services.
 
 Remaining risks: Completed tool entries remain in `activeTools` until prompt cleanup, and external Langfuse ingestion remains unverified. Broader duplicate and out-of-order lifecycle events, privacy budgets, Langfuse v5 and OpenTelemetry transport, fallback ingestion, additive telemetry, operator commands, and release documentation remain outside this item.
+
+## Handoff 2026-07-20
+
+Selected item: Observation lifecycle transitions are idempotent and all partial or interrupted runs finish without duplicate or dangling observations.
+
+Starting Git HEAD: `0d42072e4b897d7ad0cd41c14fab464d4be601eb`.
+
+Decision rationale and assumptions: This was the first unfinished item after the completed tool lifecycle boundary and the plan prioritizes lifecycle invariants before transport and privacy work. Duplicate `before_agent_start` events use the active session file, prompt, system prompt, and working directory as their identity. A different prompt still replaces the active prompt. Pi agent failures use the host-shaped assistant `stopReason` values `error` and `aborted` plus `errorMessage`; the extension `agent_end` event has no error field. A `tool_result` without `tool_execution_end` remains a valid result-only completion under the existing tool contract. The registered compatibility harness uses an in-memory fake only for the unavailable Langfuse transport. No credentials or remote repository were needed.
+
+Changed files:
+- `src/agent-lifecycle.ts`: added prompt-start identity, idempotent prompt finalization, failure status propagation, and cleanup guards.
+- `src/turn-lifecycle.ts`: closes unfinished child generations before ending a turn and records turn failure status.
+- `src/generation-lifecycle.ts`: makes generation completion idempotent and records host-shaped assistant failures.
+- `src/tool-lifecycle.ts`: shares the result-aware completion predicate with prompt cleanup.
+- `src/lifecycle-types.ts`: adds lifecycle failure, completion, ownership, and cleanup state.
+- `src/session-state.ts`: adds idempotent prompt-start and shutdown promises.
+- `src/index.ts`: wires turn child cleanup and blocks late compaction and shutdown duplication.
+- `src/compatibility.test.ts`: adds registered-path regressions for child closure, result-only tools, prompt-start duplication, failure propagation, duplicate lifecycle events, session replacement and fork, config refresh, compaction, late events, and shutdown.
+- `.ralph/items.json`: marked this item passing and recorded its regression coverage.
+- `.ralph/progress.md`: recorded this handoff.
+
+Targeted results:
+- Baseline `npm test -- --run src/compatibility.test.ts`: failed 1 of 10 tests because the new lifecycle regression exposed duplicate prompt and turn observations.
+- Final targeted `npm test -- --run src/compatibility.test.ts src/index.test.ts`: passed 20 tests in 2 files after implementation and review fixes.
+- `npm run typecheck -- --pretty false`: passed.
+- `npx biome check --write src/agent-lifecycle.ts src/turn-lifecycle.ts src/generation-lifecycle.ts src/tool-lifecycle.ts src/lifecycle-types.ts src/session-state.ts src/index.ts src/compatibility.test.ts`: passed with no remaining fixes.
+- `git diff --check 0d42072e4b897d7ad0cd41c14fab464d4be601eb`: passed.
+
+GLM review findings and disposition: GLM approved the lifecycle design and reported no material correctness blocker. Its two P2 findings were supported. I removed the redundant `prompt.activeTools.clear()` because `abandonTools` owns that cleanup, and replaced the unreachable `eventData.error` check with host-shaped assistant failure detection. No findings were rejected as inapplicable. No second review was launched.
+
+GPT Sol review findings and disposition: GPT Sol reported four supported P1 findings. I now close unfinished generations before removing their parent turn, treat result-only tools as completed for prompt status, propagate assistant `error` and `aborted` failures to generation, turn, prompt, and trace status, and deduplicate sequential and concurrent prompt starts. The registered regressions cover each finding. No findings were rejected as inapplicable. No second review was launched.
+
+Verification gates:
+- `node -e "const major = Number(process.versions.node.split('.')[0]); if (major < 22) { console.error('Node.js 22+ required'); process.exit(1); }"`: passed on Node.js 26.
+- `npx biome check .`: passed for 34 files.
+- `npm run typecheck`: passed.
+- `npm test`: passed with 61 tests and 1 credential-gated E2E test skipped.
+- `npm run build`: passed.
+- `npm pack --dry-run`: passed and listed 70 files, including `dist/index.js`, lifecycle modules, declarations, and maps.
+
+Item-specific evidence: The registered extension path exercised duplicate and concurrent prompt, agent, turn, generation, and tool events; end-before-start; unfinished generation closure; result-only and interrupted tools; host-shaped agent failure; session resume and fork; compaction; settings refresh; late events after cleanup; raw traces; trace hierarchy; one end call per observation; shared-client persistence; and compiled entrypoint loading. The package dry-run retained `dist/index.js` and included the lifecycle modules. The credentialed E2E remained skipped because credentials were unavailable. No dependency audit was required by this item.
+
+Remaining risks: Credentialed external ingestion remains unverified. Langfuse v5 and OpenTelemetry transport, privacy budgets, fallback ingestion, additive telemetry, operator commands, release documentation, and broader cross-turn ordering remain for later items.

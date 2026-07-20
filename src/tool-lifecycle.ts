@@ -5,7 +5,11 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { Config, canTrace } from "./config.js";
 import type { getClient, LangfuseSpan } from "./langfuse-client.js";
-import type { PromptState, ToolState } from "./lifecycle-types.js";
+import {
+	hasToolCompletion,
+	type PromptState,
+	type ToolState,
+} from "./lifecycle-types.js";
 import type { SessionContextLike, SessionState } from "./session-state.js";
 import type {
 	redactToolContent,
@@ -137,7 +141,7 @@ export function createToolLifecycleHandlers(
 	const getSessionPrompt = (ctx: ExtensionContext) => {
 		const state = deps.getSessionState(ctx);
 		const prompt = state?.promptState;
-		if (!state || !prompt) return undefined;
+		if (!state || !prompt || prompt.finalizing) return undefined;
 		return { state, prompt };
 	};
 
@@ -441,7 +445,7 @@ export function createToolLifecycleHandlers(
 			}
 			if (tool.completionSeen) continue;
 			const config = deps.getConfig();
-			const isResultOnly = tool.resultSeen === true;
+			const isResultOnly = hasToolCompletion(tool);
 			const isError = isResultOnly
 				? (tool.isError ?? false)
 				: (tool.isError ?? true);
