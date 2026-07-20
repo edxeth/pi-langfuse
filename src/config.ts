@@ -1,5 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import {
+	type CapturePolicy,
+	DEFAULT_CAPTURE_POLICY,
+	normalizeCapturePolicy,
+} from "./payload-policy.js";
 import { defaultRawTraceDir } from "./raw-trace.js";
 import { DEFAULT_SETTINGS, type SettingsValues } from "./settings.js";
 
@@ -23,6 +28,20 @@ export interface Config {
 	skipUnpersistedSessions: boolean;
 	captureProviderPayload: boolean;
 	providerPayloadMaxChars: number;
+	capturePolicy?: CapturePolicy;
+	capturePrompt?: boolean;
+	captureSystemPrompt?: boolean;
+	captureProviderInput?: boolean;
+	captureAssistantOutput?: boolean;
+	captureToolInput?: boolean;
+	captureToolOutput?: boolean;
+	captureMetadata?: boolean;
+	payloadMaxStringChars?: number;
+	payloadMaxToolChars?: number;
+	payloadMaxDepth?: number;
+	payloadMaxArrayItems?: number;
+	payloadMaxObjectKeys?: number;
+	payloadMaxNodes?: number;
 	redactionEnabled: boolean;
 	redactionAdditionalSecrets: string[];
 	rawTraceEnabled: boolean;
@@ -115,6 +134,84 @@ function parseProviderRequestMode(
 		return normalized;
 	}
 	return undefined;
+}
+
+function parseOptionalBoolean(value: unknown) {
+	if (typeof value === "boolean") return value;
+	if (typeof value !== "string") return undefined;
+	const normalized = value.trim().toLowerCase();
+	if (normalized === "inherit") return undefined;
+	if (normalized === "on") return true;
+	if (normalized === "off") return false;
+	return parseBooleanEnv(normalized);
+}
+
+function parsePayloadLimit(value: unknown, max: number): number | undefined {
+	if (
+		value === Infinity ||
+		(typeof value === "string" && value.trim().toLowerCase() === "unlimited")
+	) {
+		return Infinity;
+	}
+	const numeric =
+		typeof value === "number"
+			? value
+			: typeof value === "string" && value.trim()
+				? Number(value)
+				: Number.NaN;
+	if (!Number.isFinite(numeric) || numeric < 0) return undefined;
+	return Math.min(max, Math.max(0, Math.round(numeric)));
+}
+
+function resolveOptionalBoolean(
+	settingValue: unknown,
+	fileValue: unknown,
+	envValue: string | undefined,
+) {
+	return (
+		parseOptionalBoolean(settingValue) ??
+		parseOptionalBoolean(fileValue) ??
+		parseBooleanEnv(envValue)
+	);
+}
+
+function resolvePayloadLimit(
+	settingValue: unknown,
+	fileValue: unknown,
+	envValue: string | undefined,
+	max: number,
+) {
+	let sawInvalid = false;
+	for (const candidate of [settingValue, fileValue, envValue]) {
+		if (
+			candidate === undefined ||
+			(typeof candidate === "string" && candidate.trim().length === 0)
+		)
+			continue;
+		const parsed = parsePayloadLimit(candidate, max);
+		if (parsed !== undefined) return parsed;
+		sawInvalid = true;
+	}
+	return sawInvalid ? 0 : Infinity;
+}
+
+function resolveCapturePolicy(
+	settingValue: unknown,
+	fileValue: unknown,
+	envValue: string | undefined,
+) {
+	let sawInvalid = false;
+	for (const candidate of [settingValue, fileValue, envValue]) {
+		if (
+			candidate === undefined ||
+			(typeof candidate === "string" && candidate.trim().length === 0)
+		)
+			continue;
+		const parsed = normalizeCapturePolicy(candidate);
+		if (parsed) return parsed;
+		sawInvalid = true;
+	}
+	return sawInvalid ? "metadata-only" : DEFAULT_CAPTURE_POLICY;
 }
 
 export function resolveConfig(settings: Partial<SettingsValues>): Config {
@@ -231,6 +328,82 @@ export function resolveConfig(settings: Partial<SettingsValues>): Config {
 				process.env.PI_LANGFUSE_PROVIDER_PAYLOAD_MAX_CHARS,
 			50_000,
 			1_000,
+			1_000_000,
+		),
+		capturePolicy: resolveCapturePolicy(
+			settings["capture-policy"],
+			fileConfig.capturePolicy,
+			process.env.PI_LANGFUSE_CAPTURE_POLICY,
+		),
+		capturePrompt: resolveOptionalBoolean(
+			settings["capture-prompt"],
+			fileConfig.capturePrompt,
+			process.env.PI_LANGFUSE_CAPTURE_PROMPT,
+		),
+		captureSystemPrompt: resolveOptionalBoolean(
+			settings["capture-system-prompt"],
+			fileConfig.captureSystemPrompt,
+			process.env.PI_LANGFUSE_CAPTURE_SYSTEM_PROMPT,
+		),
+		captureProviderInput: resolveOptionalBoolean(
+			settings["capture-provider-input"],
+			fileConfig.captureProviderInput,
+			process.env.PI_LANGFUSE_CAPTURE_PROVIDER_INPUT,
+		),
+		captureAssistantOutput: resolveOptionalBoolean(
+			settings["capture-assistant-output"],
+			fileConfig.captureAssistantOutput,
+			process.env.PI_LANGFUSE_CAPTURE_ASSISTANT_OUTPUT,
+		),
+		captureToolInput: resolveOptionalBoolean(
+			settings["capture-tool-input"],
+			fileConfig.captureToolInput,
+			process.env.PI_LANGFUSE_CAPTURE_TOOL_INPUT,
+		),
+		captureToolOutput: resolveOptionalBoolean(
+			settings["capture-tool-output"],
+			fileConfig.captureToolOutput,
+			process.env.PI_LANGFUSE_CAPTURE_TOOL_OUTPUT,
+		),
+		captureMetadata: resolveOptionalBoolean(
+			settings["capture-metadata"],
+			fileConfig.captureMetadata,
+			process.env.PI_LANGFUSE_CAPTURE_METADATA,
+		),
+		payloadMaxStringChars: resolvePayloadLimit(
+			settings["payload-max-string-chars"],
+			fileConfig.payloadMaxStringChars,
+			process.env.PI_LANGFUSE_PAYLOAD_MAX_STRING_CHARS,
+			1_000_000,
+		),
+		payloadMaxToolChars: resolvePayloadLimit(
+			settings["payload-max-tool-chars"],
+			fileConfig.payloadMaxToolChars,
+			process.env.PI_LANGFUSE_PAYLOAD_MAX_TOOL_CHARS,
+			1_000_000,
+		),
+		payloadMaxDepth: resolvePayloadLimit(
+			settings["payload-max-depth"],
+			fileConfig.payloadMaxDepth,
+			process.env.PI_LANGFUSE_PAYLOAD_MAX_DEPTH,
+			1_000,
+		),
+		payloadMaxArrayItems: resolvePayloadLimit(
+			settings["payload-max-array-items"],
+			fileConfig.payloadMaxArrayItems,
+			process.env.PI_LANGFUSE_PAYLOAD_MAX_ARRAY_ITEMS,
+			10_000,
+		),
+		payloadMaxObjectKeys: resolvePayloadLimit(
+			settings["payload-max-object-keys"],
+			fileConfig.payloadMaxObjectKeys,
+			process.env.PI_LANGFUSE_PAYLOAD_MAX_OBJECT_KEYS,
+			10_000,
+		),
+		payloadMaxNodes: resolvePayloadLimit(
+			settings["payload-max-nodes"],
+			fileConfig.payloadMaxNodes,
+			process.env.PI_LANGFUSE_PAYLOAD_MAX_NODES,
 			1_000_000,
 		),
 		redactionEnabled,

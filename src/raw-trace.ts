@@ -1,9 +1,12 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { type RedactionConfig, sanitizeForTelemetry } from "./redaction.js";
+import {
+	type PayloadPolicyConfig,
+	shapeRawTraceRecord,
+} from "./payload-policy.js";
 
-interface RawTraceConfig extends RedactionConfig {
+interface RawTraceConfig extends PayloadPolicyConfig {
 	rawTraceEnabled: boolean;
 	rawTraceDir: string;
 }
@@ -46,7 +49,7 @@ function flushQueue() {
 		if (!item) break;
 		const { path, config, record } = item;
 		try {
-			const sanitizedRecord = sanitizeForTelemetry(config, record);
+			const sanitizedRecord = shapeRawTraceRecord(config, record);
 			appendFileSync(
 				path,
 				`${JSON.stringify(sanitizedRecord, jsonReplacer)}\n`,

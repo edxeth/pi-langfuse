@@ -24,12 +24,29 @@ describe("resolveConfig", () => {
 		delete process.env.PI_LANGFUSE_UNREDACTED;
 		delete process.env.PI_LANGFUSE_REDACTION_SECRETS;
 		delete process.env.PI_LANGFUSE_RAW_PROVIDER_REQUEST;
+		delete process.env.PI_LANGFUSE_CAPTURE_POLICY;
+		delete process.env.PI_LANGFUSE_CAPTURE_PROMPT;
+		delete process.env.PI_LANGFUSE_CAPTURE_SYSTEM_PROMPT;
+		delete process.env.PI_LANGFUSE_CAPTURE_PROVIDER_INPUT;
+		delete process.env.PI_LANGFUSE_CAPTURE_ASSISTANT_OUTPUT;
+		delete process.env.PI_LANGFUSE_CAPTURE_TOOL_INPUT;
+		delete process.env.PI_LANGFUSE_CAPTURE_TOOL_OUTPUT;
+		delete process.env.PI_LANGFUSE_CAPTURE_METADATA;
+		delete process.env.PI_LANGFUSE_PAYLOAD_MAX_STRING_CHARS;
+		delete process.env.PI_LANGFUSE_PAYLOAD_MAX_TOOL_CHARS;
+		delete process.env.PI_LANGFUSE_PAYLOAD_MAX_DEPTH;
+		delete process.env.PI_LANGFUSE_PAYLOAD_MAX_ARRAY_ITEMS;
+		delete process.env.PI_LANGFUSE_PAYLOAD_MAX_OBJECT_KEYS;
+		delete process.env.PI_LANGFUSE_PAYLOAD_MAX_NODES;
 		delete process.env.PI_CODING_AGENT_DIR;
 	});
 	it("should use default settings when no input is provided", () => {
 		const config = resolveConfig({});
 		expect(config.enabled).toBe(DEFAULT_SETTINGS.enabled);
 		expect(config.host).toBe(DEFAULT_SETTINGS["base-url"]);
+		expect(config.capturePolicy).toBe("full-debug");
+		expect(config.payloadMaxStringChars).toBe(Infinity);
+		expect(config.payloadMaxNodes).toBe(Infinity);
 	});
 
 	it("should override defaults with settings", () => {
@@ -110,5 +127,45 @@ describe("resolveConfig", () => {
 		process.env.PI_LANGFUSE_RAW_PROVIDER_REQUEST = "full";
 
 		expect(resolveConfig({}).rawTraceProviderRequestMode).toBe("full");
+	});
+
+	it("resolves capture policies, overrides, and bounded payload budgets by precedence", () => {
+		vi.mocked(fs.existsSync).mockReturnValue(true);
+		vi.mocked(fs.readFileSync).mockReturnValue(
+			JSON.stringify({
+				capturePolicy: "conversations",
+				capturePrompt: false,
+				payloadMaxStringChars: 20,
+				payloadMaxNodes: 30,
+			}),
+		);
+		process.env.PI_LANGFUSE_CAPTURE_POLICY = "prompts-only";
+		process.env.PI_LANGFUSE_CAPTURE_PROMPT = "true";
+		process.env.PI_LANGFUSE_PAYLOAD_MAX_STRING_CHARS = "unlimited";
+		process.env.PI_LANGFUSE_PAYLOAD_MAX_NODES = "40";
+
+		const config = resolveConfig({
+			"capture-policy": "metadata-only",
+			"capture-prompt": false,
+			"payload-max-string-chars": 12,
+		});
+
+		expect(config.capturePolicy).toBe("metadata-only");
+		expect(config.capturePrompt).toBe(false);
+		expect(config.payloadMaxStringChars).toBe(12);
+		expect(config.payloadMaxNodes).toBe(30);
+
+		vi.mocked(fs.existsSync).mockReturnValue(false);
+		const envConfig = resolveConfig({});
+		expect(envConfig.capturePolicy).toBe("prompts-only");
+		expect(envConfig.capturePrompt).toBe(true);
+		expect(envConfig.payloadMaxStringChars).toBe(Infinity);
+		expect(envConfig.payloadMaxNodes).toBe(40);
+
+		process.env.PI_LANGFUSE_CAPTURE_POLICY = "typo";
+		process.env.PI_LANGFUSE_PAYLOAD_MAX_NODES = "typo";
+		const malformedConfig = resolveConfig({});
+		expect(malformedConfig.capturePolicy).toBe("metadata-only");
+		expect(malformedConfig.payloadMaxNodes).toBe(0);
 	});
 });

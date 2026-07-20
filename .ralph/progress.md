@@ -281,3 +281,48 @@ Verification gates:
 Item-specific evidence: The registered extension path exercised duplicate and concurrent prompt, agent, turn, generation, and tool events; end-before-start; unfinished generation closure; result-only and interrupted tools; host-shaped agent failure; session resume and fork; compaction; settings refresh; late events after cleanup; raw traces; trace hierarchy; one end call per observation; shared-client persistence; and compiled entrypoint loading. The package dry-run retained `dist/index.js` and included the lifecycle modules. The credentialed E2E remained skipped because credentials were unavailable. No dependency audit was required by this item.
 
 Remaining risks: Credentialed external ingestion remains unverified. Langfuse v5 and OpenTelemetry transport, privacy budgets, fallback ingestion, additive telemetry, operator commands, release documentation, and broader cross-turn ordering remain for later items.
+
+## Handoff 2026-07-20
+
+Selected item: Capture presets and configurable payload budgets are added without weakening current redaction or changing default capture behavior.
+
+Starting Git HEAD: `2be13a877bc0183468bcb893df0dd6822d387fb9`.
+
+Decision rationale and assumptions: This was the first unfinished item after the completed lifecycle boundaries, and the plan places privacy policy before vendor transport migration. The compatibility default remains `full-debug` with unlimited new budgets, so existing telemetry and raw-trace content stays unchanged apart from the existing redaction pass. New settings use `inherit`, `on`, and `off` for tri-state overrides. Invalid capture policies fall back to `metadata-only`; invalid numeric budgets fall back to zero rather than disabling a privacy limit. Exports keep their previous unbounded shape and force redaction independently of live capture settings. The registered harness uses an in-memory fake only for the unavailable Langfuse transport. No credentials or remote repository were needed.
+
+Changed files:
+- `src/payload-policy.ts`: added capture presets, role-aware provider-message shaping, key-aware redaction, recursive limits, identity preservation, and redaction-only export shaping.
+- `src/payload-policy.test.ts`: added preset, mixed-message, redaction, circular, deep, wide, budget, identity, malformed-boundary, and export regressions.
+- `src/redaction.ts`: added bounded recursive sanitization while preserving key-based redaction and normal structured-value hashes.
+- `src/config.ts`: added policy, override, budget, precedence, explicit unlimited, and malformed-value resolution.
+- `src/config.test.ts`: covered defaults, source precedence, explicit unlimited, and safe malformed-value fallback.
+- `src/settings.ts`: registered privacy settings with inherit/on/off and unlimited text contracts.
+- `src/index.ts`: exposed resolved privacy settings to the existing settings bridge.
+- `src/langfuse-client.ts`: routed traces, spans, generations, scores, and updates through the privacy boundary while preserving score semantics.
+- `src/raw-trace.ts`: shaped queued raw records before JSONL writes.
+- `src/export.ts`: preserved unbounded export content while forcing redaction.
+- `src/compatibility.test.ts`: added registered-handler coverage for privacy policy, payload budgets, settings defaults, raw traces, and Langfuse payloads.
+- `.ralph/items.json`: marked this item passing and recorded its regression coverage.
+- `.ralph/progress.md`: recorded this handoff.
+
+Targeted results:
+- `npm test -- --run src/payload-policy.test.ts src/redaction.test.ts src/compatibility.test.ts src/config.test.ts src/raw-trace.test.ts src/export.test.ts src/langfuse-client.test.ts src/settings.test.ts`: passed 57 tests in 8 files.
+- `npm run typecheck -- --pretty false`: passed.
+- `npx biome check src/payload-policy.ts src/payload-policy.test.ts src/redaction.ts src/config.ts src/config.test.ts src/settings.ts src/index.ts src/raw-trace.ts src/langfuse-client.ts src/export.ts src/compatibility.test.ts`: passed with no fixes.
+- `git diff --check HEAD`: passed.
+
+GLM review findings and disposition: The review found a supported key-based redaction gap in metadata shaping. Key-aware shaping now preserves `isSensitiveKey` and binary-key handling. The review found that live limits had changed export behavior; exports now use the prior unbounded shape with redaction forced on. The review found constant hashes for structured sensitive values under bounded shaping; small serializable values retain JSON-derived hashes, while oversized or unserializable values use a safe marker. No GLM finding was rejected as inapplicable. No second review was launched.
+
+GPT Sol review findings and disposition: The review found that nested provider messages bypassed role-specific flags. Provider inputs now classify system, user, assistant, and tool roles recursively, and the mixed-history regression covers the result. The review found order-dependent root and metadata budgets, unbounded structural error strings, and zero-node field loss. One shared shaping walk now applies content-key and node budgets, bounds error messages, and preserves mandatory identity and parent fields regardless of insertion order. Scores remain structural and are not dropped by payload budgets. The review found settings defaults that rendered inherited overrides as disabled; the settings contract now uses inherit/on/off. The review found malformed policies and budgets failing open; invalid values now use restrictive fallbacks and only the explicit `unlimited` sentinel produces Infinity. All GPT Sol findings were supported and fixed. No findings were rejected as inapplicable. No second review was launched.
+
+Verification gates:
+- `node -e "const major = Number(process.versions.node.split('.')[0]); if (major < 22) { console.error('Node.js 22+ required'); process.exit(1); }"`: passed on Node.js 26.
+- `npx biome check .`: passed for 36 files.
+- `npm run typecheck`: passed.
+- `npm test`: passed with 68 tests and 1 credential-gated E2E test skipped.
+- `npm run build`: passed.
+- `npm pack --dry-run`: passed and listed 74 files, including `dist/index.js`, `dist/payload-policy.js`, declarations, maps, and `package.json`.
+
+Item-specific evidence: The registered extension path exercised metadata-only capture across prompt, system prompt, provider input, assistant output, tool input, tool output, metadata, raw JSONL, and Langfuse observations. The architectural payload-policy tests covered all four presets, mixed provider roles, configured and environment-secret redaction through the existing redaction suite, PII, credentials, data URLs, blobs, absolute-path export stripping, circular values, 2,000-level trees, 2,000-key objects, finite limits, explicit unlimited limits, malformed values, identity fields, and export redaction. The compiled build and package dry-run retained `dist/index.js` and included the new policy module. The credentialed E2E remained skipped because credentials were unavailable; local registered-path coverage used no paid service. No dependency audit was required by this item.
+
+Remaining risks: Credentialed external ingestion remains unverified. Later items still own Langfuse v5 and OpenTelemetry transport, fallback ingestion, additive telemetry, operator commands, release documentation, and production dependency audit evidence.

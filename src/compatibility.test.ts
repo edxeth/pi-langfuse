@@ -327,6 +327,11 @@ describe("executable compatibility contract", () => {
 		expect(registration.nodes["public-key"]?.default).toBe("settings-public");
 		expect(registration.nodes["redaction-enabled"]?.default).toBe(true);
 		expect(registration.nodes["raw-trace-enabled"]?.default).toBe(true);
+		expect(registration.nodes["capture-policy"]?.default).toBe("full-debug");
+		expect(registration.nodes["payload-max-string-chars"]?.default).toBe(
+			"unlimited",
+		);
+		expect(registration.nodes["capture-prompt"]?.default).toBe("inherit");
 		expect(registration.documentation).toContain("settings panel");
 
 		await settingsListener(pi, "pi-extension-settings:ready")();
@@ -2621,6 +2626,166 @@ describe("executable compatibility contract", () => {
 			metadata: { completed: true, turns: 1 },
 		});
 		await handler("session_shutdown")({ reason: "quit" }, contextC);
+	});
+
+	it("applies capture policy and payload budgets through registered handlers", async () => {
+		const agentDir = tempRoot("pi-langfuse-privacy-agent-");
+		const rawTraceDir = join(agentDir, "raw-traces");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "privacy-public",
+			"secret-key": "privacy-secret-1234567890",
+			"base-url": "http://privacy-host",
+			"capture-policy": "metadata-only",
+			"raw-trace-enabled": true,
+			"raw-trace-dir": rawTraceDir,
+			"payload-max-string-chars": 8,
+			"payload-max-tool-chars": 8,
+			"payload-max-depth": 2,
+			"payload-max-array-items": 1,
+			"payload-max-object-keys": 10,
+			"payload-max-nodes": 20,
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+
+		const sessionFile =
+			"/tmp/pi-agent/sessions/--privacy--/privacy-session.jsonl";
+		const context = {
+			model: { id: "privacy-model", provider: "privacy-provider" },
+			sessionManager: { getSessionFile: () => sessionFile },
+		};
+		const handler = (name: string) => eventHandler(pi, name);
+
+		await handler("session_start")({ reason: "startup" }, context);
+		await handler("before_agent_start")(
+			{
+				prompt: "prompt privacy-secret-1234567890 with a long suffix",
+				systemPrompt: "system privacy-secret-1234567890",
+				systemPromptOptions: { cwd: "/tmp/privacy-project-with-a-long-name" },
+			},
+			context,
+		);
+		await handler("agent_start")({}, context);
+		await handler("turn_start")({ turnIndex: 0 }, context);
+		await handler("context")(
+			{
+				messages: [
+					{ role: "system", content: "system privacy-secret-1234567890" },
+					{ role: "user", content: "provider input" },
+				],
+			},
+			context,
+		);
+		await handler("tool_execution_start")(
+			{
+				toolCallId: "privacy-tool",
+				toolName: "bash",
+				args: { command: "echo privacy-secret-1234567890" },
+			},
+			context,
+		);
+		await handler("before_provider_request")(
+			{
+				payload: {
+					model: "privacy-model",
+					messages: [{ role: "user", content: "provider input" }],
+				},
+			},
+			context,
+		);
+		await handler("message_start")({ message: { role: "assistant" } }, context);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [
+						{
+							type: "text",
+							text: "assistant output privacy-secret-1234567890",
+						},
+					],
+					usage: { input: 1, output: 1, totalTokens: 2 },
+				},
+			},
+			context,
+		);
+		await handler("tool_result")(
+			{
+				toolCallId: "privacy-tool",
+				toolName: "bash",
+				input: { command: "echo privacy-secret-1234567890" },
+				content: [
+					{ type: "text", text: "tool output privacy-secret-1234567890" },
+				],
+				isError: false,
+			},
+			context,
+		);
+		await handler("tool_execution_end")(
+			{
+				toolCallId: "privacy-tool",
+				toolName: "bash",
+				result: {
+					content: [
+						{ type: "text", text: "tool output privacy-secret-1234567890" },
+					],
+				},
+				isError: false,
+			},
+			context,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			context,
+		);
+		await handler("agent_end")({ messages: [] }, context);
+		await handler("session_shutdown")({}, context);
+		drainRawTraceQueue();
+
+		const trace = latestRecord(telemetry.state.traces, "pi-agent");
+		const observations = telemetry.state.observations.filter(
+			(record) => record.traceId === trace.id,
+		);
+		const prompt = latestRecord(observations, "agent.prompt");
+		const generation = latestRecord(observations, "llm-response");
+		const tool = latestRecord(observations, "tool:bash");
+		expect(trace).not.toHaveProperty("input");
+		expect(trace.metadata).not.toHaveProperty("systemPrompt");
+		expect(prompt).not.toHaveProperty("input");
+		expect(prompt.end).not.toHaveProperty("output");
+		expect(generation).not.toHaveProperty("input");
+		expect(generation.end).not.toHaveProperty("output");
+		expect(tool).not.toHaveProperty("input");
+		expect(tool.end).not.toHaveProperty("output");
+		const traceMetadata = trace.metadata as Record<string, unknown> | undefined;
+		expect(String(traceMetadata?.cwd).length).toBeLessThanOrEqual(8);
+
+		const raw = readFileSync(
+			join(rawTraceDir, "--privacy--", "privacy-session.jsonl"),
+			"utf-8",
+		)
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+		const rawJson = JSON.stringify(raw);
+		expect(rawJson).not.toContain("privacy-secret-1234567890");
+		expect(rawRecord(raw, "agent_prompt_start")).not.toHaveProperty("prompt");
+		expect(rawRecord(raw, "agent_prompt_start")).not.toHaveProperty(
+			"systemPrompt",
+		);
+		expect(rawRecord(raw, "provider_request")).not.toHaveProperty(
+			"messagesSummary",
+		);
+		expect(rawRecord(raw, "tool_execution_start")).not.toHaveProperty("args");
+		expect(rawRecord(raw, "assistant_output")).not.toHaveProperty("text");
+		expect(rawRecord(raw, "tool_execution_end")).not.toHaveProperty(
+			"resultSummary",
+		);
 	});
 
 	it("keeps the compiled package entrypoint loadable", async () => {

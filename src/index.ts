@@ -62,6 +62,14 @@ interface LangfuseUiContext {
 	sessionManager?: { getSessionFile?: () => string | undefined };
 }
 
+function displayPayloadLimit(value: number | undefined) {
+	return value === Infinity ? "unlimited" : value;
+}
+
+function displayCaptureOverride(value: boolean | undefined) {
+	return value === undefined ? "inherit" : value ? "on" : "off";
+}
+
 function getLiveSettingsView(
 	settings: Partial<SettingsValues>,
 ): SettingsValues {
@@ -81,6 +89,26 @@ function getLiveSettingsView(
 		"tool-output-max-chars": config.toolOutputMaxChars,
 		"capture-tool-progress": config.captureToolProgress,
 		"capture-message-updates": config.captureMessageUpdates,
+		"capture-policy": config.capturePolicy,
+		"capture-prompt": displayCaptureOverride(config.capturePrompt),
+		"capture-system-prompt": displayCaptureOverride(config.captureSystemPrompt),
+		"capture-provider-input": displayCaptureOverride(
+			config.captureProviderInput,
+		),
+		"capture-assistant-output": displayCaptureOverride(
+			config.captureAssistantOutput,
+		),
+		"capture-tool-input": displayCaptureOverride(config.captureToolInput),
+		"capture-tool-output": displayCaptureOverride(config.captureToolOutput),
+		"capture-metadata": displayCaptureOverride(config.captureMetadata),
+		"payload-max-string-chars": displayPayloadLimit(
+			config.payloadMaxStringChars,
+		),
+		"payload-max-tool-chars": displayPayloadLimit(config.payloadMaxToolChars),
+		"payload-max-depth": displayPayloadLimit(config.payloadMaxDepth),
+		"payload-max-array-items": displayPayloadLimit(config.payloadMaxArrayItems),
+		"payload-max-object-keys": displayPayloadLimit(config.payloadMaxObjectKeys),
+		"payload-max-nodes": displayPayloadLimit(config.payloadMaxNodes),
 		"redaction-enabled": config.redactionEnabled,
 		"raw-trace-enabled": config.rawTraceEnabled,
 		"raw-trace-dir": config.rawTraceDir,

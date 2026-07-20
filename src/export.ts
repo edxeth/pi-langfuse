@@ -9,10 +9,10 @@ import {
 } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import type { Config } from "./config.js";
+import { shapeExportValue } from "./payload-policy.js";
 import {
 	type RedactionFinding,
 	redactString,
-	sanitizeForTelemetry,
 	scanForSecrets,
 } from "./redaction.js";
 
@@ -152,7 +152,7 @@ function sanitizeJsonl(config: Config, content: string) {
 		if (!line.trim()) return line;
 		try {
 			const parsed = JSON.parse(line) as unknown;
-			return JSON.stringify(sanitizeForTelemetry(config, parsed));
+			return JSON.stringify(shapeExportValue(config, parsed));
 		} catch {
 			return redactString(config, line);
 		}

@@ -126,8 +126,8 @@
 				"Apply one policy and shaping boundary consistently to prompt, system prompt, provider input, assistant output, tool I/O, metadata, raw traces, and Langfuse payloads.",
 				"Run a privacy matrix covering configured secrets, environment secrets, PII patterns, credentials, data URLs, large blobs, absolute paths, circular objects, deep trees, wide collections, and export always-on redaction."
 			],
-			"passes": false,
-			"regression_notes": ""
+			"passes": true,
+			"regression_notes": "Added registered-path privacy coverage and a shared payload-policy boundary for four presets, tri-state overrides, redaction-first recursive limits, mixed provider roles, raw traces, Langfuse payloads, and unbounded always-redacted exports. Fixed both adversarial review rounds' supported findings; full verification and package dry-run passed."
 		},
 		{
 			"category": "integration",

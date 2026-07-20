@@ -1,5 +1,10 @@
 import { Langfuse } from "langfuse";
 import type { Config } from "./config.js";
+import {
+	type PayloadPolicyConfig,
+	shapeLangfuseObservationBody,
+	shapeLangfuseTraceBody,
+} from "./payload-policy.js";
 import { sanitizeForTelemetry } from "./redaction.js";
 
 type LangfuseMetadata = Record<string, unknown>;
@@ -141,27 +146,45 @@ function neutralizeLangfuseMediaPrefix<T>(
 	return output as T;
 }
 
-function sanitizeBody<T>(config: Config, body: T): T {
-	return neutralizeLangfuseMediaPrefix(sanitizeForTelemetry(config, body));
+function shapeBody<T>(
+	config: PayloadPolicyConfig,
+	body: T,
+	shape: (
+		config: PayloadPolicyConfig,
+		body: Record<string, unknown>,
+	) => Record<string, unknown>,
+): T {
+	if (!body || typeof body !== "object") return body;
+	return neutralizeLangfuseMediaPrefix(
+		shape(config, body as Record<string, unknown>),
+	) as T;
 }
 
 function wrapTrace(config: Config, trace: LangfuseTrace): LangfuseTrace {
 	return {
 		id: trace.id,
 		update(body) {
-			trace.update(sanitizeBody(config, body));
+			trace.update(shapeBody(config, body, shapeLangfuseTraceBody));
 		},
 	};
 }
 
-function wrapSpan(config: Config, span: LangfuseSpan): LangfuseSpan {
+function wrapSpan(
+	config: Config,
+	span: LangfuseSpan,
+	name: string,
+): LangfuseSpan {
+	const shape = (
+		policyConfig: PayloadPolicyConfig,
+		body: Record<string, unknown>,
+	) => shapeLangfuseObservationBody(policyConfig, name, body);
 	return {
 		id: span.id,
 		update(body) {
-			span.update?.(sanitizeBody(config, body));
+			span.update?.(shapeBody(config, body, shape));
 		},
 		end(body) {
-			span.end(sanitizeBody(config, body));
+			span.end(shapeBody(config, body, shape));
 		},
 	};
 }
@@ -169,14 +192,19 @@ function wrapSpan(config: Config, span: LangfuseSpan): LangfuseSpan {
 function wrapGeneration(
 	config: Config,
 	generation: LangfuseGeneration,
+	name: string,
 ): LangfuseGeneration {
+	const shape = (
+		policyConfig: PayloadPolicyConfig,
+		body: Record<string, unknown>,
+	) => shapeLangfuseObservationBody(policyConfig, name, body);
 	return {
 		id: generation.id,
 		update(body) {
-			generation.update?.(sanitizeBody(config, body));
+			generation.update?.(shapeBody(config, body, shape));
 		},
 		end(body) {
-			generation.end(sanitizeBody(config, body));
+			generation.end(shapeBody(config, body, shape));
 		},
 	};
 }
@@ -184,19 +212,29 @@ function wrapGeneration(
 function wrapClient(config: Config, rawClient: LangfuseClient): LangfuseClient {
 	return {
 		trace(body) {
-			return wrapTrace(config, rawClient.trace(sanitizeBody(config, body)));
+			return wrapTrace(
+				config,
+				rawClient.trace(shapeBody(config, body, shapeLangfuseTraceBody)),
+			);
 		},
 		span(body) {
-			return wrapSpan(config, rawClient.span(sanitizeBody(config, body)));
+			const shapedBody = shapeBody(config, body, (policyConfig, value) =>
+				shapeLangfuseObservationBody(policyConfig, body.name, value),
+			);
+			return wrapSpan(config, rawClient.span(shapedBody), body.name);
 		},
 		generation(body) {
+			const shapedBody = shapeBody(config, body, (policyConfig, value) =>
+				shapeLangfuseObservationBody(policyConfig, body.name, value),
+			);
 			return wrapGeneration(
 				config,
-				rawClient.generation(sanitizeBody(config, body)),
+				rawClient.generation(shapedBody),
+				body.name,
 			);
 		},
 		score(body) {
-			rawClient.score(sanitizeBody(config, body));
+			rawClient.score(sanitizeForTelemetry(config, body));
 		},
 		flushAsync: rawClient.flushAsync?.bind(rawClient),
 		shutdownAsync: rawClient.shutdownAsync.bind(rawClient),

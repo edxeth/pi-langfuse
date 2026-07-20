@@ -182,7 +182,7 @@ export function isSensitiveKey(key: string) {
 	);
 }
 
-function isBinaryKey(key: string) {
+export function isBinaryKey(key: string) {
 	return BINARY_KEY_PATTERN.test(normalizeKey(key));
 }
 
@@ -260,16 +260,44 @@ export function redactString(
 	return output;
 }
 
-function redactSensitiveField(value: unknown, key: string) {
+const MAX_STRUCTURED_REDACTION_CHARS = 100_000;
+
+function redactFieldValue(value: unknown, bounded: boolean) {
+	if (typeof value === "string") return value;
 	if (value === null || value === undefined) return value;
-	const serialized = typeof value === "string" ? value : JSON.stringify(value);
-	return placeholder(key, serialized);
+	try {
+		const serialized = JSON.stringify(value);
+		if (
+			serialized !== undefined &&
+			(!bounded || serialized.length <= MAX_STRUCTURED_REDACTION_CHARS)
+		)
+			return serialized;
+	} catch {
+		// Circular and unserializable structured values use a constant safe marker.
+	}
+	return "[structured-value]";
 }
 
-function redactBinaryField(value: unknown, key: string) {
-	if (value === null || value === undefined) return value;
-	const serialized = typeof value === "string" ? value : JSON.stringify(value);
-	return blobPlaceholder(key, serialized);
+function redactSensitiveField(value: unknown, key: string, bounded = false) {
+	const serialized = redactFieldValue(value, bounded);
+	return serialized === null || serialized === undefined
+		? serialized
+		: placeholder(key, serialized);
+}
+
+function redactBinaryField(value: unknown, key: string, bounded = false) {
+	const serialized = redactFieldValue(value, bounded);
+	return serialized === null || serialized === undefined
+		? serialized
+		: blobPlaceholder(key, serialized);
+}
+
+export interface TelemetrySanitizeLimits {
+	maxStringChars?: number;
+	maxDepth?: number;
+	maxArrayItems?: number;
+	maxObjectKeys?: number;
+	maxNodes?: number;
 }
 
 export function sanitizeForTelemetry<T>(
@@ -277,39 +305,81 @@ export function sanitizeForTelemetry<T>(
 	value: T,
 	env: NodeJS.ProcessEnv = process.env,
 	seen = new WeakSet<object>(),
+	limits?: TelemetrySanitizeLimits,
 ): T {
-	if (!config.redactionEnabled) return value;
-	if (typeof value === "string") return redactString(config, value, env) as T;
-	if (typeof value === "bigint") return value.toString() as T;
-	if (typeof value === "function") {
-		return `[function ${(value as { name?: string }).name || "anonymous"}]` as T;
-	}
-	if (!value || typeof value !== "object") return value;
-	if (value instanceof Error) {
-		return {
-			name: redactString(config, value.name, env),
-			message: redactString(config, value.message, env),
-			stack: value.stack ? redactString(config, value.stack, env) : undefined,
-		} as T;
-	}
-	if (seen.has(value)) return "[Circular]" as T;
-	seen.add(value);
+	if (!config.redactionEnabled && !limits) return value;
+	const nodes = { count: 0 };
 
-	if (Array.isArray(value)) {
-		return value.map((item) =>
-			sanitizeForTelemetry(config, item, env, seen),
-		) as T;
-	}
+	const sanitize = (current: unknown, depth: number): unknown => {
+		if (limits && nodes.count >= (limits.maxNodes ?? Infinity))
+			return undefined;
+		nodes.count += 1;
 
-	const output: Record<string, unknown> = {};
-	for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-		output[key] = isSensitiveKey(key)
-			? redactSensitiveField(item, key)
-			: isBinaryKey(key)
-				? redactBinaryField(item, key)
-				: sanitizeForTelemetry(config, item, env, seen);
-	}
-	return output as T;
+		if (typeof current === "string") {
+			const redacted = config.redactionEnabled
+				? redactString(config, current, env)
+				: current;
+			const maxChars = limits?.maxStringChars ?? Infinity;
+			return Number.isFinite(maxChars) && redacted.length > maxChars
+				? redacted.slice(0, maxChars)
+				: redacted;
+		}
+		if (typeof current === "bigint") {
+			return config.redactionEnabled ? current.toString() : current;
+		}
+		if (typeof current === "function") {
+			return config.redactionEnabled
+				? `[function ${(current as { name?: string }).name || "anonymous"}]`
+				: current;
+		}
+		if (!current || typeof current !== "object") return current;
+		if (depth >= (limits?.maxDepth ?? Infinity)) return "[TRUNCATED:depth]";
+		if (current instanceof Error) {
+			return {
+				name: sanitize(current.name, depth + 1),
+				message: sanitize(current.message, depth + 1),
+				stack: current.stack ? sanitize(current.stack, depth + 1) : undefined,
+			};
+		}
+		if (seen.has(current)) return "[Circular]";
+		seen.add(current);
+
+		if (Array.isArray(current)) {
+			const output: unknown[] = [];
+			const itemLimit = Math.min(
+				current.length,
+				limits?.maxArrayItems ?? Infinity,
+			);
+			for (let index = 0; index < itemLimit; index += 1) {
+				const item = sanitize(current[index], depth + 1);
+				if (item !== undefined) output.push(item);
+			}
+			return output;
+		}
+
+		const output: Record<string, unknown> = {};
+		const entries = Object.entries(current as Record<string, unknown>);
+		const keyLimit = Math.min(
+			entries.length,
+			limits?.maxObjectKeys ?? Infinity,
+		);
+		for (let index = 0; index < keyLimit; index += 1) {
+			if (limits && nodes.count >= (limits.maxNodes ?? Infinity)) break;
+			const entry = entries[index];
+			if (!entry) continue;
+			const [key, item] = entry;
+			const sanitized =
+				config.redactionEnabled && isSensitiveKey(key)
+					? redactSensitiveField(item, key, Boolean(limits))
+					: config.redactionEnabled && isBinaryKey(key)
+						? redactBinaryField(item, key, Boolean(limits))
+						: sanitize(item, depth + 1);
+			if (sanitized !== undefined) output[key] = sanitized;
+		}
+		return output;
+	};
+
+	return sanitize(value, 0) as T;
 }
 
 export interface RedactionFinding {
