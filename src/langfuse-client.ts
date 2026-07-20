@@ -275,6 +275,17 @@ function traceAttributes(body: TraceUpdateBody | undefined) {
 	return observationAttributes(body);
 }
 
+function traceIOAttributes(body: TraceUpdateBody | undefined): {
+	input?: unknown;
+	output?: unknown;
+} {
+	if (!body) return {};
+	return {
+		input: body.input,
+		output: body.output,
+	};
+}
+
 function mergeTraceBody(
 	base: TraceUpdateBody,
 	next: TraceUpdateBody,
@@ -369,6 +380,13 @@ function createTrace(
 		),
 	);
 	const vendorRoot = root as unknown as VendorObservation;
+	const initialTraceIO = traceIOAttributes(shaped);
+	if (
+		initialTraceIO.input !== undefined ||
+		initialTraceIO.output !== undefined
+	) {
+		vendorRoot.setTraceIO(initialTraceIO);
+	}
 	const runtimeTrace: RuntimeTrace = {
 		root: vendorRoot,
 		initialBody: shaped,
@@ -397,13 +415,25 @@ function createTrace(
 								...runtimeTrace.lastUpdate,
 								...traceAttributes(runtimeTrace.lastUpdate),
 							});
+							const traceIO = traceIOAttributes(runtimeTrace.lastUpdate);
+							if (traceIO.input !== undefined || traceIO.output !== undefined) {
+								vendorRoot.setTraceIO(traceIO);
+							}
 						},
 					);
 				});
 			},
 			setTraceIO(io) {
+				const shapedIO = shapeBody(config, io, shapeLangfuseTraceBody) as {
+					input?: unknown;
+					output?: unknown;
+				};
+				runtimeTrace.lastUpdate = mergeTraceBody(
+					runtimeTrace.lastUpdate,
+					shapedIO,
+				);
 				runWithVendorContext(vendorRoot, () => {
-					vendorRoot.setTraceIO(io);
+					vendorRoot.setTraceIO(shapedIO);
 				});
 			},
 			end(endBody) {
@@ -446,6 +476,7 @@ function wrapObservation<T extends LangfuseSpan | LangfuseGeneration>(
 			? {
 					...rootTrace.lastUpdate,
 					...shaped,
+					name: rootTrace.initialBody.name,
 					metadata: {
 						...rootTrace.lastUpdate.metadata,
 						...shaped.metadata,

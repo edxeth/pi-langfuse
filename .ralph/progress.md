@@ -374,3 +374,51 @@ Verification gates:
 Item-specific evidence: The registered extension path and local real-export harness preserved the `pi-agent`/`agent.prompt`/`agent.turn`/`llm-response`/`tool:<name>` hierarchy, asynchronous context parenting, trace I/O, usage and scores, redaction, raw records, shared runtime persistence, safe replacement, and cleanup. No external credential blocker existed; only the credential-gated E2E remained skipped. No dependency audit was required by this item.
 
 Remaining risks: Credentialed external ingestion remains unverified, and REST fallback, additive telemetry, operator commands, and release documentation remain owned by later items. The ignored Ralph planning files were not staged.
+
+## Iteration start 2026-07-20
+
+Selected item: The active Langfuse v5 and OpenTelemetry path emits the existing local trace schema and telemetry semantics.
+
+Starting Git HEAD: `c4fcf3467a95dd91364e3a012a96c6e406c738bc`.
+
+Assumption: The registered extension harness is the compatibility boundary. I will extend that public-path coverage for multiple turns, concurrent tools, telemetry metadata, scores, raw traces, and redaction, then change runtime code only where the observed v5 path fails those assertions. The local HTTP export test remains the external-transport substitute; no credentials or remote reference are needed.
+
+## Handoff 2026-07-20
+
+Selected item: The active Langfuse v5 and OpenTelemetry path emits the existing local trace schema and telemetry semantics.
+
+Starting Git HEAD: `c4fcf3467a95dd91364e3a012a96c6e406c738bc`.
+
+Decision rationale and assumptions: This item followed the completed v5 runtime facade in the plan's dependency order. The v5 root observation remains the aliased `agent.prompt` observation, while `setTraceIO` carries trace-level input and output. The ephemeral HTTP server replaces only external ingestion. The registered extension, v5 OTel exporter, lifecycle handlers, payload shaping, scoring, raw traces, and shutdown path remain real. The integration fixture isolates and restores all configuration environment variables, disables autostart, enables full-debug capture, keeps redaction on, and uses unlimited test budgets.
+
+Changed files:
+- `src/langfuse-client.ts`: sends shaped trace input and output through the v5 observation's trace-I/O attributes at creation, update, and explicit trace-I/O calls. Preserves the original `pi-agent` trace name when the root observation is exposed as `agent.prompt`.
+- `src/extension-runtime.integration.test.ts`: drives the registered extension through two turns, streaming updates, concurrent tools, usage and cost, tags, release, environment, session identity, scores, raw traces, redaction, and real local OTLP export. It asserts exact trace attributes, turn-specific parent IDs, generation fields, score linkage, raw-record correlation, and environment isolation.
+- `.ralph/items.json`: marked only this selected item passing and recorded its regression evidence.
+- `.ralph/progress.md`: recorded the iteration start and this handoff.
+
+Targeted results:
+- Baseline `npm test -- --run src/compatibility.test.ts src/langfuse-client.integration.test.ts`: 14 tests in 2 files passed.
+- The new integration test first failed on missing `langfuse.trace.input`, exposing the missing trace-I/O propagation.
+- `npm test -- --run src/extension-runtime.integration.test.ts`: passed after the runtime fix and after review repairs.
+- `npm test -- --run src/extension-runtime.integration.test.ts src/langfuse-client.integration.test.ts src/langfuse-client.test.ts src/compatibility.test.ts`: 21 tests in 4 files passed after review repairs.
+- `PI_LANGFUSE_CAPTURE_POLICY=metadata-only PI_LANGFUSE_AUTOSTART=1 PI_LANGFUSE_PAYLOAD_MAX_NODES=1 PI_LANGFUSE_UNREDACTED=1 npm test -- --run src/extension-runtime.integration.test.ts`: passed, proving the fixture does not inherit those live settings.
+- `npx biome check src/langfuse-client.ts src/extension-runtime.integration.test.ts`: passed.
+- `npm run typecheck -- --pretty false`: passed.
+- `git diff --check c4fcf3467a95dd91364e3a012a96c6e406c738bc`: passed.
+
+GLM review findings and disposition: GLM reported no material findings and approved the change. Its non-material note about reading only the first OTLP body was addressed while repairing the supported test assertions by aggregating spans across all OTLP payloads.
+
+GPT Sol review findings and disposition: The supported environment-hermeticity finding was fixed by snapshotting and restoring configuration variables, pinning capture, redaction, payload, raw-provider, session, and autostart settings, and using the local raw-trace directory. The supported assertion-precision finding was fixed by enabling streaming capture and asserting exact trace name, input and output, session and user IDs, tags, release, environment, turn-specific parents, generation usage and cost, score values and observation IDs, and raw trace correlation. No findings were rejected as inapplicable. No second review was launched.
+
+Verification gates:
+- `node -e "const major = Number(process.versions.node.split('.')[0]); if (major < 22) { console.error('Node.js 22+ required'); process.exit(1); }"`: passed on Node.js 26.
+- `npx biome check .`: passed with two existing informational messages about the schema version and deprecated recommended field.
+- `npm run typecheck`: passed.
+- `npm test`: passed with 75 tests and 1 credential-gated E2E test skipped across 12 passing test files and 1 skipped file.
+- `npm run build`: passed.
+- `npm pack --dry-run`: passed and listed `dist/index.js` plus the compiled facade and lifecycle modules in a 74-file package.
+
+Item-specific evidence: The real registered extension path exported an ephemeral local OTLP trace with one `pi-agent` trace, one `agent.prompt` root, two `agent.turn` spans, two `llm-response` generations, and two concurrent tool spans. The test verified parent IDs, shared trace ID, trace-level redacted input and final output, streaming partial metadata, usage and cost fields, score linkage, tags, release, environment, session and user IDs, raw JSONL records, and secret absence. No dependency audit was named by this item. The credentialed E2E remains skipped because credentials were unavailable; the local HTTP substitute covers the real v5 export path without paid services.
+
+Remaining risks: Credentialed Langfuse ingestion remains unverified. REST fallback, additive telemetry, operator commands, release documentation, and production dependency audit evidence remain for later items. The pre-existing untracked Ralph loop, plan, and prompt files were not staged.

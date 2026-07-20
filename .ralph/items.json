@@ -150,8 +150,8 @@
 				"Exercise multiple turns, concurrent tools, usage and cost, streaming output, tags, release, environment, session IDs, scores, raw traces, and redaction through the public extension path.",
 				"Assert the emitted observation tree and trace I/O match the executable compatibility contract."
 			],
-			"passes": false,
-			"regression_notes": ""
+			"passes": true,
+			"regression_notes": "Added a real registered-extension integration against an ephemeral local HTTP endpoint. It verifies pi-agent trace naming, agent.prompt/agent.turn/llm-response/tool hierarchy and parent IDs, trace input/output, two turns, streaming updates, concurrent tools, release/environment/session/tags, usage/cost, score linkage, raw traces, and redaction. GLM found no material issues. GPT Sol's supported hermetic-environment and assertion-precision findings were fixed by isolating/restoring config env, pinning capture/autostart settings, aggregating OTLP batches, and asserting exact attributes and scores. Targeted and full gates passed; credentialed E2E remains skipped."
 		},
 		{
 			"category": "reliability",
