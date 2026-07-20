@@ -11,7 +11,12 @@ import {
 } from "./config.js";
 import { exportRedactedData } from "./export.js";
 import { createGenerationLifecycleHandlers } from "./generation-lifecycle.js";
-import { flushClient, getClient, shutdownClient } from "./langfuse-client.js";
+import {
+	flushClient,
+	getRuntime,
+	reconfigureRuntime,
+	shutdownClient,
+} from "./langfuse-client.js";
 import type { PromptState } from "./lifecycle-types.js";
 import { ensureLocalLangfuseStarted } from "./local-autostart.js";
 import { runLangfuseInit } from "./local-init.js";
@@ -171,6 +176,7 @@ export default async function (pi: ExtensionAPI) {
 			);
 		}
 		await flushClient();
+		await reconfigureRuntime();
 		if (!hasActiveSessionLeases()) await shutdownClient();
 		announceConfigState(settings);
 		updateLangfuseStatusLine(lastUiContext, config);
@@ -188,7 +194,7 @@ export default async function (pi: ExtensionAPI) {
 		getConfig: () => resolveConfig(settings),
 		getSessionState,
 		canTrace,
-		getClient,
+		getRuntime,
 		telemetryText,
 		redactionMetadata,
 		extractTextFromContent,
@@ -207,7 +213,7 @@ export default async function (pi: ExtensionAPI) {
 		getConfig: () => resolveConfig(settings),
 		getSessionState,
 		canTrace,
-		getClient,
+		getRuntime,
 		redactToolContent,
 		summarizeToolArgs,
 		summarizeToolResult,
@@ -223,7 +229,7 @@ export default async function (pi: ExtensionAPI) {
 		getSessionState,
 		canTrace,
 		ensureLocalLangfuseStarted,
-		getClient,
+		getRuntime,
 		flushClient,
 		writeRawTrace,
 		buildTraceTags,
@@ -241,7 +247,7 @@ export default async function (pi: ExtensionAPI) {
 		getConfig: () => resolveConfig(settings),
 		getSessionState,
 		canTrace,
-		getClient,
+		getRuntime,
 		telemetryText,
 		redactionMetadata,
 		extractTextFromContent,

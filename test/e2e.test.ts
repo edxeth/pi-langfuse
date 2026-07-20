@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { resolveConfig } from "../src/config.js";
 import {
 	flushClient,
-	getClient,
+	getRuntime,
 	shutdownClient,
 } from "../src/langfuse-client.js";
 
@@ -27,14 +27,14 @@ const skipE2E =
 
 describe.runIf(!skipE2E)("Langfuse E2E Integration", () => {
 	const config = resolveConfig({});
-	const testId = `e2e-test-${randomUUID()}`;
+	const testId = randomUUID().replaceAll("-", "");
 
 	beforeEach(async () => {
 		await shutdownClient();
 	});
 
 	it("should successfully ingest and retrieve a hierarchical trace", async () => {
-		const lf = await getClient(config);
+		const lf = await getRuntime(config);
 
 		// 1. Create a complex hierarchy
 		const trace = lf.trace({

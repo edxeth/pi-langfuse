@@ -326,3 +326,51 @@ Verification gates:
 Item-specific evidence: The registered extension path exercised metadata-only capture across prompt, system prompt, provider input, assistant output, tool input, tool output, metadata, raw JSONL, and Langfuse observations. The architectural payload-policy tests covered all four presets, mixed provider roles, configured and environment-secret redaction through the existing redaction suite, PII, credentials, data URLs, blobs, absolute-path export stripping, circular values, 2,000-level trees, 2,000-key objects, finite limits, explicit unlimited limits, malformed values, identity fields, and export redaction. The compiled build and package dry-run retained `dist/index.js` and included the new policy module. The credentialed E2E remained skipped because credentials were unavailable; local registered-path coverage used no paid service. No dependency audit was required by this item.
 
 Remaining risks: Credentialed external ingestion remains unverified. Later items still own Langfuse v5 and OpenTelemetry transport, fallback ingestion, additive telemetry, operator commands, release documentation, and production dependency audit evidence.
+
+## Iteration start 2026-07-20
+
+Selected item: A typed Langfuse v5 and OpenTelemetry runtime facade replaces direct legacy SDK coupling while preserving the local client lifecycle contract.
+
+Starting Git HEAD: `29df0e349d05822886aab0acf270c3db33be6c1a`.
+
+Assumption: Use the pinned reference dependency family, with the current npm-resolved patch versions, and keep the existing local observation-shaped interface as the handler boundary. The v5 OTel runtime will own vendor setup and expose only local trace, span, generation, score, context, flush, and shutdown types. Existing test fakes will replace only the external transport; registered Pi handlers and payload shaping remain real.
+
+## Handoff 2026-07-20
+
+Selected item: A typed Langfuse v5 and OpenTelemetry runtime facade replaces direct legacy SDK coupling while preserving the local client lifecycle contract.
+
+Starting Git HEAD: `29df0e349d05822886aab0acf270c3db33be6c1a`.
+
+Decision rationale and assumptions: Replaced the legacy Langfuse v3 client at the local runtime boundary with Langfuse v5 `LangfuseClient`, `LangfuseSpanProcessor`, OpenTelemetry context APIs, and a typed facade. Lifecycle modules depend only on local facade types. The real v5/OTel path is tested against an ephemeral local HTTP endpoint; registered compatibility fakes replace only external ingestion. Custom trace IDs are accepted when they are valid 32-character hexadecimal IDs, and otherwise the runtime generates a stable OTel ID.
+
+Changed files:
+- `package.json`, `package-lock.json`: replace the legacy `langfuse` dependency with the Langfuse v5 and OpenTelemetry dependency family.
+- `src/langfuse-client.ts`: add the typed runtime facade, OTel context manager/provider, stable root observations, trace-ID generator, selective propagation, metadata merging, scoring, flush/shutdown, serialized runtime transitions, deferred replacement, and observation-map cleanup.
+- `src/agent-lifecycle.ts`: create the `agent.prompt` root through the facade and apply final trace updates and trace I/O before ending the aliased root observation.
+- `src/generation-lifecycle.ts`, `src/tool-lifecycle.ts`, `src/turn-lifecycle.ts`, `src/index.ts`: route lifecycle operations through `getRuntime`, preserve context and ownership behavior, and rebuild the runtime after safe configuration refreshes.
+- `src/langfuse-client.test.ts`: add metadata, custom-ID, runtime-replacement, idempotency, context, and registry-cleanup regressions.
+- `src/langfuse-client.integration.test.ts`: add the ephemeral local HTTP integration that exercises real v5/OTel export, valid trace IDs, asynchronous context, sequential metadata, final output, and the `agent.prompt` observation.
+- `src/compatibility.test.ts`, `test/e2e.test.ts`: update compatibility transport expectations and use valid custom trace-ID values for v5 OTel.
+- `.ralph/items.json`, `.ralph/progress.md`: record this item and handoff.
+
+Targeted results:
+- `npm test -- --run src/langfuse-client.test.ts src/langfuse-client.integration.test.ts src/compatibility.test.ts src/index.test.ts` passed 28 tests in 4 files.
+- The local integration test passed against an ephemeral HTTP server and asserted the real exported payload contains the final output, `agent.prompt`, and both sequential metadata fields.
+- The registered compatibility harness passed all 13 tests, including session ownership, hierarchy, raw traces, redaction, configuration refresh, and shared-client persistence.
+- `git diff --check HEAD` passed.
+
+GLM adversarial review findings and disposition: All four supported findings were fixed. Sequential trace metadata now deep-merges instead of overwriting; propagation receives only defined fields; roots are eager and cannot be silently dropped; and the regression suite now covers the previously untested deferred/metadata path through the real local export. No GLM finding was left unresolved.
+
+GPT Sol adversarial review findings and disposition: All four supported findings were fixed. Final trace updates and `setTraceIO` now occur before the aliased `agent.prompt` root ends; eager roots plus the OTel ID generator preserve stable identity and valid caller IDs; runtime replacement is serialized, defers while active observations exist, and is explicitly reconfigured after safe refresh; ended observations are removed from persistent maps. No GPT Sol finding was left unresolved. No second review round was launched.
+
+Verification gates:
+- `node -e "const major = Number(process.versions.node.split('.')[0]); if (major < 22) { console.error('Node.js 22+ required'); process.exit(1); }"` passed.
+- `npx biome check .` passed with only the repository's existing schema-version and deprecated-configuration informational messages.
+- `npm run typecheck` passed.
+- `npm test` passed with 74 tests and 1 credential-gated E2E test skipped.
+- `npm run build` passed.
+- `npm pack --dry-run` passed and listed the compiled `dist/index.js`, facade declarations/maps, and package metadata.
+
+Item-specific evidence: The registered extension path and local real-export harness preserved the `pi-agent`/`agent.prompt`/`agent.turn`/`llm-response`/`tool:<name>` hierarchy, asynchronous context parenting, trace I/O, usage and scores, redaction, raw records, shared runtime persistence, safe replacement, and cleanup. No external credential blocker existed; only the credential-gated E2E remained skipped. No dependency audit was required by this item.
+
+Remaining risks: Credentialed external ingestion remains unverified, and REST fallback, additive telemetry, operator commands, and release documentation remain owned by later items. The ignored Ralph planning files were not staged.

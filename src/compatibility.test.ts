@@ -14,6 +14,7 @@ import { pathToFileURL } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import registerExtension from "./index.js";
+import { shutdownClient } from "./langfuse-client.js";
 import { drainRawTraceQueue } from "./raw-trace.js";
 
 interface FakeRecord {
@@ -42,6 +43,8 @@ const telemetry = vi.hoisted(() => {
 		shutdowns: 0,
 	};
 	let nextId = 0;
+	let activeSpan: { id: string; traceId: string } | undefined;
+	let processorOptions: Record<string, unknown> = {};
 
 	function createRecord(
 		kind: FakeRecord["kind"],
@@ -54,60 +57,213 @@ const telemetry = vi.hoisted(() => {
 		};
 	}
 
+	function traceForId(traceId: string | undefined) {
+		return state.traces.find((record) => record.id === traceId);
+	}
+
+	function createObservation(
+		name: string,
+		body: Record<string, unknown>,
+		parent?: { id: string; traceId: string },
+		trace?: FakeRecord,
+	) {
+		const owningTrace = trace ?? traceForId(parent?.traceId);
+		if (!owningTrace) throw new Error("fake observation has no trace");
+		const record = createRecord("observation", {
+			...body,
+			name,
+			traceId: owningTrace.id,
+			parentObservationId: parent?.id,
+		});
+		state.observations.push(record);
+		if (!parent) {
+			if (body.input !== undefined) owningTrace.input = body.input;
+			if (body.output !== undefined) owningTrace.output = body.output;
+		}
+		const raw = {
+			id: record.id,
+			traceId: owningTrace.id,
+			otelSpan: { id: record.id, traceId: owningTrace.id },
+			update: vi.fn((update: Record<string, unknown>) => {
+				const normalized: Record<string, unknown> = {
+					...update,
+					...(update.level === "ERROR" ? { isError: true } : {}),
+					...(update.usageDetails ? { usage: update.usageDetails } : {}),
+				};
+				record.updateCalls = [
+					...((record.updateCalls as
+						| Array<Record<string, unknown>>
+						| undefined) ?? []),
+					normalized,
+				];
+				record.pendingEnd = normalized;
+				if (
+					!record.name?.toString().startsWith("tool:") ||
+					(update.metadata &&
+						(update.metadata as Record<string, unknown>).partial)
+				) {
+					record.lastUpdate = normalized;
+				}
+				if (!parent) {
+					owningTrace.lastUpdate = {
+						...((owningTrace.lastUpdate as
+							| Record<string, unknown>
+							| undefined) ?? {}),
+						...normalized,
+						metadata: {
+							...((owningTrace.metadata as
+								| Record<string, unknown>
+								| undefined) ?? {}),
+							...((normalized.metadata as
+								| Record<string, unknown>
+								| undefined) ?? {}),
+						},
+					};
+					if (normalized.metadata) {
+						owningTrace.metadata = {
+							...((owningTrace.metadata as
+								| Record<string, unknown>
+								| undefined) ?? {}),
+							...normalized.metadata,
+						};
+					}
+				}
+			}),
+			end: vi.fn(() => {
+				const pendingEnd =
+					(record.pendingEnd as Record<string, unknown> | undefined) ??
+					(record.lastUpdate as Record<string, unknown> | undefined) ??
+					{};
+				record.end = {
+					...pendingEnd,
+					...(record.name?.toString().startsWith("tool:") &&
+					pendingEnd.isError === undefined
+						? { isError: false }
+						: {}),
+				};
+				record.endCalls = Number(record.endCalls ?? 0) + 1;
+			}),
+			setTraceIO: vi.fn((io: { input?: unknown; output?: unknown }) => {
+				if (io.input !== undefined) owningTrace.input = io.input;
+				if (io.output !== undefined) owningTrace.output = io.output;
+			}),
+			startObservation: vi.fn(
+				(
+					childName: string,
+					childBody: Record<string, unknown>,
+					_childOptions?: Record<string, unknown>,
+				) => createObservation(childName, childBody, raw, owningTrace),
+			),
+		};
+		return raw;
+	}
+
 	const client = {
-		trace: vi.fn((body: Record<string, unknown>) => {
-			const record = createRecord("trace", body);
-			state.traces.push(record);
-			return {
-				id: record.id,
-				update: vi.fn((update: Record<string, unknown>) => {
-					record.lastUpdate = update;
-				}),
-			};
-		}),
-		span: vi.fn((body: Record<string, unknown>) => {
-			const record = createRecord("observation", body);
-			state.observations.push(record);
-			return {
-				id: record.id,
-				update: vi.fn((update: Record<string, unknown>) => {
-					record.lastUpdate = update;
-				}),
-				end: vi.fn((end: Record<string, unknown>) => {
-					record.end = end;
-					record.endCalls = Number(record.endCalls ?? 0) + 1;
-				}),
-			};
-		}),
-		generation: vi.fn((body: Record<string, unknown>) => {
-			const record = createRecord("observation", body);
-			state.observations.push(record);
-			return {
-				id: record.id,
-				update: vi.fn((update: Record<string, unknown>) => {
-					record.lastUpdate = update;
-				}),
-				end: vi.fn((end: Record<string, unknown>) => {
-					record.end = end;
-					record.endCalls = Number(record.endCalls ?? 0) + 1;
-				}),
-			};
-		}),
-		score: vi.fn((body: Record<string, unknown>) => {
-			state.scores.push(body);
-		}),
-		flushAsync: vi.fn(async () => {
-			state.flushes += 1;
-		}),
-		shutdownAsync: vi.fn(async () => {
+		score: {
+			create: vi.fn((body: Record<string, unknown>) => {
+				state.scores.push(body);
+			}),
+			flush: vi.fn(async () => undefined),
+			shutdown: vi.fn(async () => {
+				state.shutdowns += 1;
+			}),
+		},
+		flush: vi.fn(async () => undefined),
+		shutdown: vi.fn(async () => {
 			state.shutdowns += 1;
 		}),
+	};
+	const LangfuseClient = vi.fn(() => client);
+	const LangfuseSpanProcessor = vi.fn((options: Record<string, unknown>) => {
+		processorOptions = options;
+		return {
+			forceFlush: vi.fn(async () => {
+				state.flushes += 1;
+			}),
+			shutdown: vi.fn(async () => undefined),
+		};
+	});
+	const BasicTracerProvider = vi.fn(
+		(options: { spanProcessors?: unknown[] }) => ({
+			spanProcessors: options.spanProcessors,
+			forceFlush: vi.fn(async () => {
+				state.flushes += 1;
+			}),
+			shutdown: vi.fn(async () => undefined),
+		}),
+	);
+	const AsyncHooksContextManager = vi.fn(() => ({
+		enable: vi.fn(function (this: unknown) {
+			return this;
+		}),
+		disable: vi.fn(),
+	}));
+	const context = {
+		active: vi.fn(() => (activeSpan ? { span: activeSpan } : {})),
+		setGlobalContextManager: vi.fn(() => true),
+		with: vi.fn(
+			(next: { span?: { id: string; traceId: string } }, fn: () => unknown) => {
+				const previous = activeSpan;
+				activeSpan = next.span;
+				try {
+					return fn();
+				} finally {
+					activeSpan = previous;
+				}
+			},
+		),
+	};
+	const trace = {
+		setSpan: vi.fn(
+			(_current: unknown, span: { id: string; traceId: string }) => ({
+				span,
+			}),
+		),
+	};
+	const tracing = {
+		propagateAttributes: vi.fn(
+			(attributes: Record<string, unknown>, fn: () => unknown) => {
+				const existingTrace = traceForId(activeSpan?.traceId);
+				const owningTrace =
+					existingTrace ??
+					createRecord("trace", {
+						name: attributes.traceName,
+						sessionId: attributes.sessionId,
+						userId: attributes.userId,
+						tags: attributes.tags,
+						release: attributes.release ?? processorOptions.release,
+						version: attributes.version,
+						environment: attributes.environment ?? processorOptions.environment,
+						metadata: attributes.metadata,
+					});
+				if (!existingTrace) state.traces.push(owningTrace);
+				return fn();
+			},
+		),
+		startObservation: vi.fn(
+			(
+				name: string,
+				body: Record<string, unknown>,
+				_options?: Record<string, unknown>,
+			) => {
+				const owningTrace =
+					traceForId(activeSpan?.traceId) ?? state.traces.at(-1);
+				return createObservation(name, body, undefined, owningTrace);
+			},
+		),
+		setLangfuseTracerProvider: vi.fn(),
 	};
 
 	return {
 		client,
 		state,
-		Langfuse: vi.fn(() => client),
+		LangfuseClient,
+		LangfuseSpanProcessor,
+		BasicTracerProvider,
+		AsyncHooksContextManager,
+		context,
+		trace,
+		tracing,
 		reset() {
 			state.traces.length = 0;
 			state.observations.length = 0;
@@ -115,18 +271,36 @@ const telemetry = vi.hoisted(() => {
 			state.flushes = 0;
 			state.shutdowns = 0;
 			nextId = 0;
-			telemetry.Langfuse.mockClear();
-			client.trace.mockClear();
-			client.span.mockClear();
-			client.generation.mockClear();
-			client.score.mockClear();
-			client.flushAsync.mockClear();
-			client.shutdownAsync.mockClear();
+			activeSpan = undefined;
+			processorOptions = {};
+			LangfuseClient.mockClear();
+			LangfuseSpanProcessor.mockClear();
+			BasicTracerProvider.mockClear();
+			AsyncHooksContextManager.mockClear();
+			tracing.propagateAttributes.mockClear();
+			tracing.startObservation.mockClear();
+			tracing.setLangfuseTracerProvider.mockClear();
 		},
 	};
 });
 
-vi.mock("langfuse", () => ({ Langfuse: telemetry.Langfuse }));
+vi.mock("@langfuse/client", () => ({
+	LangfuseClient: telemetry.LangfuseClient,
+}));
+vi.mock("@langfuse/otel", () => ({
+	LangfuseSpanProcessor: telemetry.LangfuseSpanProcessor,
+}));
+vi.mock("@langfuse/tracing", () => telemetry.tracing);
+vi.mock("@opentelemetry/api", () => ({
+	context: telemetry.context,
+	trace: telemetry.trace,
+}));
+vi.mock("@opentelemetry/context-async-hooks", () => ({
+	AsyncHooksContextManager: telemetry.AsyncHooksContextManager,
+}));
+vi.mock("@opentelemetry/sdk-trace-base", () => ({
+	BasicTracerProvider: telemetry.BasicTracerProvider,
+}));
 
 type EventHandler = (event?: unknown, ctx?: unknown) => Promise<void> | void;
 type CommandHandler = (args: string, ctx: unknown) => Promise<void> | void;
@@ -265,8 +439,9 @@ beforeEach(() => {
 	delete process.env.PI_CODING_AGENT_DIR;
 });
 
-afterEach(() => {
+afterEach(async () => {
 	drainRawTraceQueue();
+	await shutdownClient();
 	for (const root of createdRoots.splice(0)) {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -518,7 +693,7 @@ describe("executable compatibility contract", () => {
 
 		expect(telemetry.state.flushes).toBe(1);
 		expect(telemetry.state.shutdowns).toBe(0);
-		expect(telemetry.Langfuse).toHaveBeenCalledWith(
+		expect(telemetry.LangfuseClient).toHaveBeenCalledWith(
 			expect.objectContaining({
 				publicKey: "settings-public",
 				secretKey: "settings-secret",
@@ -1193,6 +1368,7 @@ describe("executable compatibility contract", () => {
 			},
 			contextA,
 		);
+		await eventHandler(piA, "agent_start")({}, contextA);
 
 		await registerExtension(piB as unknown as ExtensionAPI);
 		expect(telemetry.state.shutdowns).toBe(0);
@@ -1215,12 +1391,13 @@ describe("executable compatibility contract", () => {
 			},
 			contextB,
 		);
+		await eventHandler(piB, "agent_start")({}, contextB);
 		expect(telemetry.state.traces).toHaveLength(2);
 		await eventHandler(piB, "session_shutdown")({}, contextB);
 		expect(telemetry.state.shutdowns).toBe(1);
 	});
 
-	it("does not create an observation after its prompt ownership is replaced", async () => {
+	it("does not create a child observation after its prompt ownership is replaced", async () => {
 		const agentDir = tempRoot("pi-langfuse-observation-ownership-agent-");
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		const pi = createTestPi({
@@ -1258,7 +1435,12 @@ describe("executable compatibility contract", () => {
 			context,
 		);
 		await Promise.all([pendingAgentStart, replacement]);
-		expect(telemetry.state.observations).toHaveLength(0);
+		expect(telemetry.state.observations.map((record) => record.name)).toEqual([
+			"agent.prompt",
+			"agent.prompt",
+		]);
+		expect(telemetry.state.observations[0]?.endCalls).toBe(1);
+		expect(telemetry.state.observations[1]?.endCalls).toBeUndefined();
 		await eventHandler(pi, "session_shutdown")({}, context);
 	});
 

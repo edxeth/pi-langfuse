@@ -4,7 +4,7 @@ import type {
 	ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
 import type { Config, canTrace } from "./config.js";
-import type { getClient, LangfuseSpan } from "./langfuse-client.js";
+import type { getRuntime, LangfuseSpan } from "./langfuse-client.js";
 import {
 	hasToolCompletion,
 	type PromptState,
@@ -24,7 +24,7 @@ export interface ToolLifecycleDependencies {
 		ctx: SessionContextLike | undefined,
 	) => SessionState<PromptState> | undefined;
 	canTrace: typeof canTrace;
-	getClient: typeof getClient;
+	getRuntime: typeof getRuntime;
 	redactToolContent: typeof redactToolContent;
 	summarizeToolArgs: typeof summarizeToolArgs;
 	summarizeToolResult: typeof summarizeToolResult;
@@ -157,7 +157,7 @@ export function createToolLifecycleHandlers(
 		if (!tool.spanStartPromise) {
 			tool.spanStartPromise = (async () => {
 				try {
-					const lf = await deps.getClient(config);
+					const lf = await deps.getRuntime(config);
 					if (
 						state.promptState !== prompt ||
 						prompt.activeTools.get(toolCallId) !== tool ||

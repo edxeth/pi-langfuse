@@ -138,8 +138,8 @@
 				"Register and test asynchronous OTel context propagation and keep one shared runtime for all active sessions with explicit ownership and replacement rules.",
 				"Verify configuration changes rebuild the runtime cleanly while ordinary prompt completion leaves it alive."
 			],
-			"passes": false,
-			"regression_notes": ""
+			"passes": true,
+			"regression_notes": "Migrated to Langfuse v5 plus OpenTelemetry with a typed local facade, eager stable roots, valid caller trace IDs, selective propagation, metadata merging, final trace I/O ordering, serialized ownership-safe replacement, and observation cleanup. Added local real-export and registered-handler regressions; all runtime gates passed."
 		},
 		{
 			"category": "integration",

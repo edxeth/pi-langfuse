@@ -5,7 +5,7 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { Config, canTrace } from "./config.js";
-import type { flushClient, getClient } from "./langfuse-client.js";
+import type { flushClient, getRuntime } from "./langfuse-client.js";
 import {
 	getLifecycleFailure,
 	hasToolCompletion,
@@ -48,7 +48,7 @@ export interface AgentLifecycleDependencies {
 	) => SessionState<PromptState> | undefined;
 	canTrace: typeof canTrace;
 	ensureLocalLangfuseStarted: typeof ensureLocalLangfuseStarted;
-	getClient: typeof getClient;
+	getRuntime: typeof getRuntime;
 	flushClient: typeof flushClient;
 	writeRawTrace: typeof writeRawTrace;
 	buildTraceTags: typeof buildTraceTags;
@@ -136,32 +136,6 @@ export function createAgentLifecycleHandlers(
 				if (prompt.promptSpanStartPromise) {
 					await prompt.promptSpanStartPromise;
 				}
-				if (!prompt.promptSpanEnded) {
-					prompt.promptSpanEnded = true;
-					prompt.promptSpan?.end({
-						isError: incomplete || undefined,
-						statusMessage:
-							failureStatus ||
-							(abandoned
-								? `prompt abandoned during ${abandonmentReason}`
-								: undefined),
-						output: prompt.lastAssistantText || undefined,
-						metadata: {
-							completed: !incomplete,
-							abandoned: abandoned || undefined,
-							failed: Boolean(failure) || undefined,
-							stopReason: failure?.stopReason,
-							errorMessage: failure?.errorMessage,
-							abandonmentReason,
-							toolCalls: prompt.toolCalls,
-							toolErrors: prompt.toolErrors,
-							turns: prompt.turns,
-							durationMs: Date.now() - prompt.startedAt,
-							compactCount: state.compactCount,
-						},
-					});
-				}
-
 				prompt.trace?.update({
 					output: prompt.lastAssistantText || undefined,
 					userId: deps.getUserId(config),
@@ -205,6 +179,32 @@ export function createAgentLifecycleHandlers(
 						durationMs: Date.now() - prompt.startedAt,
 					},
 				});
+
+				if (!prompt.promptSpanEnded) {
+					prompt.promptSpanEnded = true;
+					prompt.promptSpan?.end({
+						isError: incomplete || undefined,
+						statusMessage:
+							failureStatus ||
+							(abandoned
+								? `prompt abandoned during ${abandonmentReason}`
+								: undefined),
+						output: prompt.lastAssistantText || undefined,
+						metadata: {
+							completed: !incomplete,
+							abandoned: abandoned || undefined,
+							failed: Boolean(failure) || undefined,
+							stopReason: failure?.stopReason,
+							errorMessage: failure?.errorMessage,
+							abandonmentReason,
+							toolCalls: prompt.toolCalls,
+							toolErrors: prompt.toolErrors,
+							turns: prompt.turns,
+							durationMs: Date.now() - prompt.startedAt,
+							compactCount: state.compactCount,
+						},
+					});
+				}
 
 				if (state.promptState === prompt) state.promptState = null;
 			})();
@@ -297,7 +297,7 @@ export function createAgentLifecycleHandlers(
 
 				await deps.ensureLocalLangfuseStarted(config);
 				if (state.promptState !== prompt) return;
-				const lf = await deps.getClient(config);
+				const lf = await deps.getRuntime(config);
 				if (state.promptState !== prompt) return;
 				const trace = lf.trace({
 					name: "pi-agent",
@@ -331,7 +331,13 @@ export function createAgentLifecycleHandlers(
 					},
 				});
 
-				if (state.promptState === prompt) prompt.trace = trace;
+				if (state.promptState === prompt) {
+					prompt.trace = trace;
+					prompt.promptSpan = lf.span({
+						name: "agent.prompt",
+						traceId: trace.id,
+					});
+				}
 			} catch (e) {
 				console.warn("📊 Langfuse: Failed to create trace", e);
 			}
@@ -365,7 +371,7 @@ export function createAgentLifecycleHandlers(
 		if (!prompt.promptSpanStartPromise) {
 			prompt.promptSpanStartPromise = (async () => {
 				try {
-					const lf = await deps.getClient(config);
+					const lf = await deps.getRuntime(config);
 					if (
 						state.promptState !== prompt ||
 						prompt.finalizing ||

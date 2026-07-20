@@ -4,7 +4,7 @@ import type {
 	TurnStartEvent,
 } from "@earendil-works/pi-coding-agent";
 import type { Config, canTrace } from "./config.js";
-import type { getClient } from "./langfuse-client.js";
+import type { getRuntime } from "./langfuse-client.js";
 import {
 	getLifecycleFailure,
 	type PiUsage,
@@ -27,7 +27,7 @@ export interface TurnLifecycleDependencies {
 		ctx: SessionContextLike | undefined,
 	) => SessionState<PromptState> | undefined;
 	canTrace: typeof canTrace;
-	getClient: typeof getClient;
+	getRuntime: typeof getRuntime;
 	telemetryText: typeof telemetryText;
 	redactionMetadata: typeof redactionMetadata;
 	extractTextFromContent: typeof extractTextFromContent;
@@ -71,7 +71,7 @@ export function createTurnLifecycleHandlers(
 		const trace = prompt.trace;
 		turnState.spanStartPromise = (async () => {
 			try {
-				const lf = await deps.getClient(config);
+				const lf = await deps.getRuntime(config);
 				if (
 					state.promptState !== prompt ||
 					prompt.finalizing ||

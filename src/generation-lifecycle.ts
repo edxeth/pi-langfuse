@@ -4,7 +4,7 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { Config, canTrace } from "./config.js";
-import type { getClient, LangfuseGeneration } from "./langfuse-client.js";
+import type { getRuntime, LangfuseGeneration } from "./langfuse-client.js";
 import {
 	type GenerationState,
 	getLifecycleFailure,
@@ -34,7 +34,7 @@ export interface GenerationLifecycleDependencies {
 		ctx: SessionContextLike | undefined,
 	) => SessionState<PromptState> | undefined;
 	canTrace: typeof canTrace;
-	getClient: typeof getClient;
+	getRuntime: typeof getRuntime;
 	telemetryText: typeof telemetryText;
 	redactionMetadata: typeof redactionMetadata;
 	extractTextFromContent: typeof extractTextFromContent;
@@ -290,7 +290,7 @@ export function createGenerationLifecycleHandlers(
 		if (!generationState.startPromise) {
 			generationState.startPromise = (async () => {
 				try {
-					const lf = await deps.getClient(config);
+					const lf = await deps.getRuntime(config);
 					if (
 						state.promptState !== prompt ||
 						prompt.activeTurns.get(turn.index) !== turn ||
@@ -358,7 +358,7 @@ export function createGenerationLifecycleHandlers(
 			try {
 				generationState.generation.end(body);
 				if (usage && state.promptState === prompt) {
-					const lf = await deps.getClient(config);
+					const lf = await deps.getRuntime(config);
 					if (usage.input) {
 						lf.score({
 							name: "input_tokens",
