@@ -61,6 +61,7 @@ export interface PromptState {
 	finalizationFlushPromise?: Promise<void>;
 	lastMessages?: Array<{ role: string; content: unknown }>;
 	lastContextMessages?: Array<{ role: string; content: unknown }>;
+	sourceMetadata?: Record<string, string>;
 }
 
 export interface TurnState {
@@ -95,6 +96,8 @@ export interface GenerationState {
 	inputSnapshot?: unknown;
 	requestModel?: string;
 	requestFingerprint?: string;
+	modelParameters?: Record<string, string | number>;
+	ttftRecorded?: boolean;
 }
 
 export interface ToolState {

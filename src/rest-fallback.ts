@@ -28,6 +28,7 @@ export type RestFallbackObservationBody = {
 	usageDetails?: Record<string, number>;
 	costDetails?: Record<string, number>;
 	statusMessage?: string;
+	completionStartTime?: Date;
 };
 
 export type RestFallbackObservationType = "SPAN" | "GENERATION";
@@ -50,6 +51,7 @@ export interface RestFallbackObservation {
 	costDetails?: Record<string, number>;
 	level?: RestFallbackObservationLevel;
 	statusMessage?: string;
+	completionStartTime?: string;
 }
 
 export interface RestFallbackTrace {
@@ -164,6 +166,9 @@ function applyObservationBody(
 	}
 	if (body.statusMessage !== undefined) {
 		observation.statusMessage = body.statusMessage;
+	}
+	if (body.completionStartTime instanceof Date) {
+		observation.completionStartTime = body.completionStartTime.toISOString();
 	}
 }
 
@@ -297,6 +302,9 @@ function fallbackObservationEvent(
 		level: observation.level,
 		statusMessage: observation.statusMessage,
 	};
+	if (observation.completionStartTime) {
+		body.completionStartTime = observation.completionStartTime;
+	}
 	if (observation.endTime) body.endTime = observation.endTime;
 	if (observation.type === "GENERATION") {
 		body.model = observation.model;

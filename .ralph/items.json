@@ -174,8 +174,8 @@
 				"Add trace-level tool_call_count, turn_count, total_tool_errors, tool_success_rate, and session_had_errors scores plus tool_is_error observation scores.",
 				"Verify credentialed remotes, absolute paths, unknown override keys, non-Git folders, zeroed provider cost data, missing metadata, and score failures remain contained and do not break the run."
 			],
-			"passes": false,
-			"regression_notes": ""
+			"passes": true,
+			"regression_notes": "Added safe Git source metadata with credential-free remotes, non-Git markers, whitelisted cross-platform-safe overrides, allowlisted provider/model telemetry, streamed TTFT, zero-cost omission, tool and prompt health scores, and non-fatal score failures. Registered compatibility and source metadata regressions cover redaction-disabled unknown provider fields, interrupted prompts, credentialed/local paths, zero costs, and score failures. Targeted tests passed with 19 tests; all verification gates passed with 86 tests and 1 credential-gated E2E skipped. GLM approved after dead-code/import fixes; GPT Sol's supported provider-metadata allowlist, canonical interruption health score, and UNC/device path findings were fixed; no second review was launched."
 		},
 		{
 			"category": "functional",

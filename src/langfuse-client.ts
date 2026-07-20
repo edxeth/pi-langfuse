@@ -60,6 +60,7 @@ type ObservationBody = {
 	statusMessage?: string;
 	version?: string;
 	modelParameters?: Record<string, string | number>;
+	completionStartTime?: Date;
 };
 
 export interface LangfuseTrace {
@@ -128,6 +129,7 @@ export interface LangfuseRuntime {
 		observationId?: string;
 		sessionId?: string;
 		comment?: string;
+		dataType?: "NUMERIC" | "BOOLEAN";
 	}): void;
 	withContext<T>(
 		observation: LangfuseSpan | LangfuseGeneration,
@@ -236,6 +238,7 @@ function neutralizeLangfuseMediaPrefix<T>(
 		) as T;
 	}
 	if (!value || typeof value !== "object") return value;
+	if (value instanceof Date) return value;
 	if (seen.has(value)) return "[Circular]" as T;
 	seen.add(value);
 
@@ -295,6 +298,7 @@ function observationAttributes(body: ObservationBody | undefined) {
 		"modelParameters",
 		"usageDetails",
 		"costDetails",
+		"completionStartTime",
 	]) {
 		const value = body[key as keyof ObservationBody];
 		if (value !== undefined) attributes[key] = value;
@@ -680,7 +684,11 @@ function wrapRuntime(rt: RuntimeState, config: Config): LangfuseRuntime {
 			);
 		},
 		score(body) {
-			rt.scoreClient.score.create(sanitizeForTelemetry(config, body));
+			try {
+				rt.scoreClient.score.create(sanitizeForTelemetry(config, body));
+			} catch (error) {
+				console.warn("📊 Langfuse: Failed to send score", error);
+			}
 		},
 		withContext(observation, fn) {
 			const raw = rt.observations.get(observation.id);

@@ -15,6 +15,7 @@ import {
 import type { ensureLocalLangfuseStarted } from "./local-autostart.js";
 import type { redactionMetadata } from "./redaction.js";
 import type { SessionContextLike, SessionState } from "./session-state.js";
+import type { collectSourceMetadata } from "./source-metadata.js";
 import type {
 	buildTraceTags,
 	extractTextFromContent,
@@ -57,6 +58,7 @@ export interface AgentLifecycleDependencies {
 	getRuntimeName: typeof getRuntimeName;
 	getSessionRoot: typeof getSessionRoot;
 	redactionMetadata: typeof redactionMetadata;
+	collectSourceMetadata: typeof collectSourceMetadata;
 	truncate: typeof truncate;
 	extractTextFromContent: typeof extractTextFromContent;
 	abandonTurnGenerations: (turn: TurnState) => Promise<void>;
@@ -81,6 +83,42 @@ export interface AgentLifecycleHandlers {
 export function createAgentLifecycleHandlers(
 	deps: AgentLifecycleDependencies,
 ): AgentLifecycleHandlers {
+	const recordPromptScores = async (
+		state: SessionState<PromptState>,
+		prompt: PromptState,
+		config: Config,
+		incomplete: boolean,
+	) => {
+		if (!deps.canTrace(config) || !prompt.trace) return;
+		const toolSuccessRate =
+			prompt.toolCalls > 0
+				? Math.max(0, (prompt.toolCalls - prompt.toolErrors) / prompt.toolCalls)
+				: 1;
+		const sessionHadErrors = prompt.toolErrors > 0 || incomplete;
+		try {
+			const lf = await deps.getRuntime(config);
+			for (const score of [
+				{ name: "tool_call_count", value: prompt.toolCalls },
+				{ name: "turn_count", value: prompt.turns },
+				{ name: "total_tool_errors", value: prompt.toolErrors },
+				{ name: "tool_success_rate", value: toolSuccessRate },
+				{
+					name: "session_had_errors",
+					value: sessionHadErrors ? 1 : 0,
+					dataType: "BOOLEAN" as const,
+				},
+			]) {
+				lf.score({
+					...score,
+					traceId: prompt.trace.id,
+					sessionId: state.sessionId || undefined,
+				});
+			}
+		} catch (error) {
+			console.warn("📊 Langfuse: Failed to send prompt health scores", error);
+		}
+	};
+
 	const finalizePrompt = async (
 		state: SessionState<PromptState>,
 		config: Config | undefined,
@@ -145,6 +183,7 @@ export function createAgentLifecycleHandlers(
 					environment: config?.environment || undefined,
 					metadata: {
 						redaction: config ? deps.redactionMetadata(config) : undefined,
+						...prompt.sourceMetadata,
 						cwd: prompt.cwd,
 						systemPrompt: config
 							? deps.telemetryText(
@@ -179,6 +218,8 @@ export function createAgentLifecycleHandlers(
 						durationMs: Date.now() - prompt.startedAt,
 					},
 				});
+
+				if (config) await recordPromptScores(state, prompt, config, incomplete);
 
 				if (!prompt.promptSpanEnded) {
 					prompt.promptSpanEnded = true;
@@ -263,6 +304,7 @@ export function createAgentLifecycleHandlers(
 				state.provider = ctx.model.provider || "";
 			}
 
+			const sourceMetadata = deps.collectSourceMetadata(cwd);
 			const prompt: PromptState = {
 				userPrompt: event.prompt,
 				systemPrompt: event.systemPrompt || "",
@@ -277,6 +319,7 @@ export function createAgentLifecycleHandlers(
 				cacheWrite: 0,
 				lastAssistantText: "",
 				startSignature: signature,
+				sourceMetadata,
 				activeTurns: new Map(),
 				activeTools: new Map(),
 				completedTurnIndexes: new Set(),
@@ -290,6 +333,7 @@ export function createAgentLifecycleHandlers(
 				systemPrompt: event.systemPrompt || "",
 				sessionReason: state.sessionReason,
 				previousSessionFile: state.previousSessionFile || undefined,
+				sourceMetadata,
 			});
 
 			try {
@@ -313,6 +357,7 @@ export function createAgentLifecycleHandlers(
 					environment: config.environment || undefined,
 					metadata: {
 						redaction: deps.redactionMetadata(config),
+						...sourceMetadata,
 						cwd,
 						systemPrompt: deps.telemetryText(
 							config,
@@ -389,6 +434,7 @@ export function createAgentLifecycleHandlers(
 						),
 						metadata: {
 							redaction: deps.redactionMetadata(config),
+							...prompt.sourceMetadata,
 							cwd: prompt.cwd,
 							model: state.model,
 							provider: state.provider,

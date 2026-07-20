@@ -232,7 +232,12 @@ export function costDetailsFromUsage(usage?: PiUsage) {
 	if (typeof cost.input === "number") details.input = cost.input;
 	if (typeof cost.output === "number") details.output = cost.output;
 	if (typeof cost.total === "number") details.total = cost.total;
-	return Object.keys(details).length > 0 ? details : undefined;
+	if (
+		Object.keys(details).length === 0 ||
+		Object.values(details).every((value) => value === 0)
+	)
+		return undefined;
+	return details;
 }
 
 export function getUserId(config?: Config) {

@@ -13,6 +13,7 @@ import {
 	type TurnState,
 } from "./lifecycle-types.js";
 import type { redactionMetadata } from "./redaction.js";
+import { isSensitiveKey } from "./redaction.js";
 import type { SessionContextLike, SessionState } from "./session-state.js";
 import type {
 	costDetailsFromUsage,
@@ -122,6 +123,80 @@ function getTurnIndex(event: EventRecord): number | undefined {
 function getRequestModel(payload: unknown): string | undefined {
 	const data = asRecord(payload);
 	return getNonEmptyString(data?.model);
+}
+
+const MODEL_PARAMETER_KEYS = [
+	"temperature",
+	"top_p",
+	"topP",
+	"max_tokens",
+	"maxTokens",
+	"max_completion_tokens",
+	"presence_penalty",
+	"frequency_penalty",
+	"reasoning_effort",
+] as const;
+
+function extractModelParameters(payload: unknown) {
+	const data = asRecord(payload);
+	if (!data) return undefined;
+	const parameters: Record<string, string | number> = {};
+	for (const key of MODEL_PARAMETER_KEYS) {
+		const value = data[key];
+		if (typeof value === "string" || typeof value === "number") {
+			parameters[key] = value;
+		}
+	}
+	return Object.keys(parameters).length > 0 ? parameters : undefined;
+}
+
+const SAFE_PROVIDER_RESPONSE_HEADERS = new Set([
+	"content-type",
+	"content-length",
+	"date",
+	"retry-after",
+	"server",
+	"x-request-id",
+	"request-id",
+	"openai-processing-ms",
+	"anthropic-ratelimit-requests-remaining",
+	"anthropic-ratelimit-tokens-remaining",
+]);
+
+const SAFE_PROVIDER_METADATA_KEYS = new Set([
+	"finishReason",
+	"stopReason",
+	"requestId",
+	"responseId",
+	"model",
+	"provider",
+]);
+
+function safeProviderResponseHeaders(value: unknown) {
+	if (!value || typeof value !== "object" || Array.isArray(value))
+		return undefined;
+	const headers: Record<string, string> = {};
+	for (const [key, rawValue] of Object.entries(value)) {
+		const normalizedKey = key.toLowerCase();
+		if (!SAFE_PROVIDER_RESPONSE_HEADERS.has(normalizedKey)) continue;
+		if (typeof rawValue !== "string" && typeof rawValue !== "number") continue;
+		const text = String(rawValue);
+		if (text.length <= 200) headers[normalizedKey] = text;
+	}
+	return Object.keys(headers).length > 0 ? headers : undefined;
+}
+
+function safeProviderMetadata(value: unknown) {
+	if (!value || typeof value !== "object" || Array.isArray(value))
+		return undefined;
+	const metadata: Record<string, string | number> = {};
+	for (const [key, rawValue] of Object.entries(value)) {
+		if (!SAFE_PROVIDER_METADATA_KEYS.has(key) || isSensitiveKey(key)) continue;
+		if (typeof rawValue !== "string" && typeof rawValue !== "number") continue;
+		if (typeof rawValue === "string" && rawValue.length > 500) continue;
+		metadata[key] = rawValue;
+	}
+	return Object.keys(metadata).length > 0 ? metadata : undefined;
 }
 
 function getLatestTurn(prompt: PromptState): TurnState | undefined {
@@ -258,6 +333,18 @@ function providerResponseMetadata(
 		metadata.providerResponseStatuses = [...previousStatuses, status];
 		if (status >= 400) metadata.providerResponseError = true;
 	}
+	const headers = safeProviderResponseHeaders(
+		event.headers ?? event.responseHeaders,
+	);
+	if (headers) metadata.providerResponseHeaders = headers;
+	const providerMetadata = safeProviderMetadata(
+		event.providerMetadata ?? event.responseMetadata ?? event.metadata,
+	);
+	if (providerMetadata) metadata.providerResponseMetadata = providerMetadata;
+	const requestId = getNonEmptyString(
+		event.requestId ?? event.providerRequestId,
+	);
+	if (requestId) metadata.providerRequestId = requestId;
 	if (event.error || event.isError) metadata.providerResponseError = true;
 	return metadata;
 }
@@ -312,6 +399,7 @@ export function createGenerationLifecycleHandlers(
 								config.traceInputMaxChars,
 							),
 						model,
+						modelParameters: generationState.modelParameters,
 						metadata: {
 							...generationState.metadata,
 							redaction: deps.redactionMetadata(config),
@@ -496,6 +584,7 @@ export function createGenerationLifecycleHandlers(
 			if (generationState) {
 				generationState.inputSnapshot = snapshotInput(prompt, config);
 				generationState.requestModel = reqModel;
+				generationState.modelParameters = extractModelParameters(event.payload);
 			}
 		} catch {
 			// Provider payload shaping is diagnostic-only and must not interrupt the request.
@@ -598,8 +687,28 @@ export function createGenerationLifecycleHandlers(
 		} else if (assistantEvent.type === "thinking_delta") {
 			generationState.streamingThinking += String(assistantEvent.delta ?? "");
 		}
+		const firstToken =
+			assistantEvent.type === "text_delta" ||
+			assistantEvent.type === "thinking_delta";
+		const completionStartTime =
+			firstToken && !generationState.ttftRecorded ? new Date() : undefined;
+		if (completionStartTime) {
+			generationState.ttftRecorded = true;
+			generationState.metadata.timeToFirstTokenMs = Math.max(
+				0,
+				completionStartTime.getTime() - generationState.startedAt,
+			);
+		}
 
 		await ensureGeneration(state, prompt, turn, generationState, config);
+		if (completionStartTime && generationState.generation) {
+			updateGeneration(generationState, {
+				completionStartTime,
+				metadata: {
+					timeToFirstTokenMs: generationState.metadata.timeToFirstTokenMs,
+				},
+			});
+		}
 		if (config.captureMessageUpdates && generationState.generation) {
 			updateGeneration(generationState, {
 				output: deps.telemetryText(
@@ -702,6 +811,9 @@ export function createGenerationLifecycleHandlers(
 				usage: standardUsage,
 				usageDetails,
 				costDetails,
+				modelParameters:
+					extractModelParameters(eventRecord(event)) ||
+					generationState.modelParameters,
 				model:
 					getNonEmptyString(message.model) ||
 					state.model ||

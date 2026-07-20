@@ -466,3 +466,47 @@ Verification gates:
 Item-specific evidence: The local HTTP server replaced only the unavailable credentialed Langfuse endpoint. The real v5 client exported OTel data, received a bounded 404 visibility check, and sent the redacted trace, root span, turn, generation, and tool facts through the REST batch API. Unit tests stalled each shutdown dependency independently and verified prompt flush persistence. The oversized payload test verified multiple REST calls whose serialized requests stayed within 3.5 MB. No dependency audit was named by this item, so no audit command was required. Credentialed external ingestion remains unverified.
 
 Remaining risks: Later items still own additive model and health telemetry, operator commands, release documentation, production dependency audit evidence, and credentialed external-ingestion verification. The ignored Ralph loop, plan, and prompt files and generated `dist/` output were not staged.
+
+## Iteration start 2026-07-21
+
+Selected item: Safe source identity and additive generation and health telemetry are available without changing existing fields or exposing local secrets.
+
+Starting Git HEAD: `9bf5ab146f83d1996e9c37d6eeb2217ad002ee3d`.
+
+Assumption: Keep the existing trace names, observation names, and raw-record shapes. Add source metadata as redacted trace metadata, retain only whitelisted scalar provider fields, record time to first streamed update through the Langfuse completion-start field, and emit health scores at prompt finalization. The pinned reference repository at commit `131c1af13c24043890e820508ff1d7c1efc78ebe` supplies implementation evidence only; the local facade and compatibility contract remain authoritative.
+
+## Handoff 2026-07-21
+
+Selected item: Safe source identity and additive generation and health telemetry are available without changing existing fields or exposing local secrets.
+
+Decision rationale and assumptions: Source identity is collected once at prompt start and is limited to Git-derived identity, sanitized remote coordinates, safe branch/commit values, and whitelisted repository overrides. Provider request and response telemetry stays additive and scalar-bounded. Health scores are emitted before prompt observation closure and derive interruption state from the same canonical finalization result used for the root error status. Score delivery remains non-fatal.
+
+Changed files:
+- `src/source-metadata.ts` and `src/source-metadata.test.ts`: add credential-free Git identity collection, non-Git markers, whitelisted override validation, remote sanitization, and POSIX/Windows absolute-path regressions.
+- `src/agent-lifecycle.ts`, `src/lifecycle-types.ts`, and `src/index.ts`: attach source metadata and emit trace health scores using canonical finalization state.
+- `src/generation-lifecycle.ts`, `src/langfuse-client.ts`, `src/rest-fallback.ts`, and `src/payload-policy.ts`: add allowlisted provider metadata, model parameters, streamed TTFT/completion start time, score failure containment, and fallback serialization.
+- `src/tool-lifecycle.ts`, `src/telemetry-helpers.ts`, and `src/redaction.ts`: add tool error scoring, zero-cost omission, and timestamp-safe sanitization.
+- `src/compatibility.test.ts`: add registered-path coverage for source identity, provider telemetry, TTFT, zero cost, tool and prompt health scores, score failures, redaction-disabled unknown metadata, and interrupted prompts.
+- `.ralph/items.json` and `.ralph/progress.md`: record the passing item and iteration handoff.
+
+Targeted results:
+- `npm test -- --run src/source-metadata.test.ts src/compatibility.test.ts`: passed 19 tests in 2 files after the review repairs.
+- `npm run typecheck -- --pretty false`: passed.
+- `npx biome check src/agent-lifecycle.ts src/generation-lifecycle.ts src/source-metadata.ts src/source-metadata.test.ts src/compatibility.test.ts`: passed.
+- `git diff --check HEAD`: passed.
+
+GLM review findings and disposition: GLM approved the implementation. Its non-blocking dead ternary and import-order findings were fixed; no material GLM finding was rejected or left unresolved.
+
+GPT Sol review findings and disposition: The provider-metadata blacklist finding was supported and fixed with an explicit allowlist plus a redaction-disabled regression for unknown/path-bearing fields. The interrupted-prompt health-score finding was supported and fixed by passing canonical finalization incompleteness into score calculation, with a registered-handler regression. The UNC/device absolute-path finding was supported and fixed with `posix.isAbsolute` and `win32.isAbsolute`, with focused regressions. No findings were rejected or left unresolved. No second review was launched.
+
+Verification gates:
+- `node -e "const major = Number(process.versions.node.split('.')[0]); if (major < 22) { console.error('Node.js 22+ required'); process.exit(1); }"`: passed.
+- `npx biome check .`: passed with two existing informational configuration messages and no fixes.
+- `npm run typecheck`: passed.
+- `npm test`: passed with 86 tests and 1 credential-gated E2E test skipped; expected timeout, score-failure, and redaction-disabled warnings were contained.
+- `npm run build`: passed.
+- `npm pack --dry-run`: passed; the package contains the `dist/index.js` entrypoint and new `dist/source-metadata.js` module.
+
+Item-specific evidence: The registered compatibility harness drove real Pi handlers against a temporary Git repository with a credentialed remote, normal redaction disabled, unknown provider metadata containing a local path, a failed tool, a streamed assistant update, zero provider costs, and an injected score failure. The source-metadata tests covered non-Git directories, local remotes, credentialed HTTPS and SSH remotes, unknown override keys, POSIX paths, Windows drive paths, UNC paths, and device paths. The interrupted-generation regression verified `session_had_errors = 1` when the root prompt was finalized as abandoned.
+
+Remaining risks: Credentialed external ingestion remains unverified because the E2E test is intentionally skipped without Langfuse credentials. Later Ralph items still own operator commands, release documentation, dependency audit evidence, and credentialed external-ingestion verification. The ignored Ralph loop, plan, and prompt files and generated `dist/` output were not staged.

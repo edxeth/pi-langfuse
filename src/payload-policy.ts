@@ -140,6 +140,8 @@ const STRUCTURAL_KEYS = new Set([
 	"usage",
 	"usageDetails",
 	"costDetails",
+	"modelParameters",
+	"completionStartTime",
 	"messageCount",
 	"estimatedBytes",
 	"payloadCaptured",

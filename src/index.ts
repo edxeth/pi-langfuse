@@ -34,6 +34,7 @@ import {
 	type SettingsValues,
 	setSettingsValues,
 } from "./settings.js";
+import { collectSourceMetadata } from "./source-metadata.js";
 import {
 	buildTraceTags,
 	costDetailsFromUsage,
@@ -238,6 +239,7 @@ export default async function (pi: ExtensionAPI) {
 		getRuntimeName,
 		getSessionRoot,
 		redactionMetadata,
+		collectSourceMetadata,
 		truncate,
 		extractTextFromContent,
 		abandonTurnGenerations: generationLifecycle.abandonTurn,

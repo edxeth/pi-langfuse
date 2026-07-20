@@ -2305,6 +2305,16 @@ describe("executable compatibility contract", () => {
 				abandonmentReason: "turn ended before generation completion",
 			},
 		});
+		expect(
+			telemetry.state.scores.filter((score) => score.traceId === traceA.id),
+		).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					name: "session_had_errors",
+					value: 1,
+				}),
+			]),
+		);
 		const promptA = latestRecord(
 			telemetry.state.observations.filter(
 				(record) => record.traceId === traceA.id,
@@ -2968,6 +2978,277 @@ describe("executable compatibility contract", () => {
 		expect(rawRecord(raw, "tool_execution_end")).not.toHaveProperty(
 			"resultSummary",
 		);
+	});
+
+	it("captures safe source identity, generation telemetry, and health scores", async () => {
+		const agentDir = tempRoot("pi-langfuse-observability-agent-");
+		const rawTraceDir = join(agentDir, "raw-traces");
+		const sourceRepo = join(agentDir, "source-repo");
+		mkdirSync(sourceRepo, { recursive: true });
+		execFileSync("git", ["init"], { cwd: sourceRepo });
+		execFileSync("git", ["config", "user.email", "test@example.com"], {
+			cwd: sourceRepo,
+		});
+		execFileSync("git", ["config", "user.name", "Test User"], {
+			cwd: sourceRepo,
+		});
+		writeFileSync(join(sourceRepo, "README.md"), "observability\n");
+		execFileSync("git", ["add", "README.md"], { cwd: sourceRepo });
+		execFileSync("git", ["commit", "-m", "init"], { cwd: sourceRepo });
+		execFileSync(
+			"git",
+			[
+				"remote",
+				"add",
+				"origin",
+				"https://token:secret@github.com/example/observability.git",
+			],
+			{ cwd: sourceRepo },
+		);
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const settingsValues = {
+			enabled: true,
+			"public-key": "observability-public",
+			"secret-key": "observability-secret",
+			"base-url": "http://observability-host",
+			"raw-trace-enabled": true,
+			"raw-trace-dir": rawTraceDir,
+			"redaction-enabled": false,
+		};
+		const pi = createTestPi(settingsValues);
+		const sessionFile =
+			"/tmp/pi-agent/sessions/--observability--/observability-session.jsonl";
+		const context = {
+			model: { id: "observability-model", provider: "observability-provider" },
+			sessionManager: { getSessionFile: () => sessionFile },
+		};
+		await registerExtension(pi as unknown as ExtensionAPI);
+		await eventHandler(pi, "session_start")({}, context);
+		await eventHandler(pi, "model_select")(
+			{
+				model: {
+					id: "observability-model",
+					provider: "observability-provider",
+				},
+			},
+			context,
+		);
+		await eventHandler(pi, "before_agent_start")(
+			{
+				prompt: "observe this repository",
+				systemPrompt: "system prompt",
+				systemPromptOptions: { cwd: sourceRepo },
+			},
+			context,
+		);
+		await eventHandler(pi, "agent_start")({}, context);
+		await eventHandler(pi, "turn_start")({ turnIndex: 0 }, context);
+		await eventHandler(pi, "tool_execution_start")(
+			{
+				toolCallId: "tool-error",
+				toolName: "bash",
+				args: { command: "false" },
+			},
+			context,
+		);
+		await eventHandler(pi, "tool_execution_end")(
+			{
+				toolCallId: "tool-error",
+				toolName: "bash",
+				result: "failed",
+				isError: true,
+			},
+			context,
+		);
+		await eventHandler(pi, "before_provider_request")(
+			{
+				payload: {
+					model: "observability-model",
+					temperature: 0.2,
+					top_p: 0.9,
+					max_tokens: 1024,
+					reasoning_effort: "high",
+					stop: ["END"],
+					unsafe_override: "do-not-capture",
+				},
+			},
+			context,
+		);
+		await eventHandler(pi, "after_provider_response")(
+			{
+				status: 200,
+				headers: {
+					"content-type": "application/json",
+					"x-request-id": "provider-request-42",
+					authorization: "Bearer provider-secret",
+				},
+				providerMetadata: {
+					finishReason: "stop",
+					requestId: "provider-request-42",
+					apiKey: "provider-secret",
+					debugPath: sourceRepo,
+					accountAlias: "internal-customer",
+				},
+			},
+			context,
+		);
+		await eventHandler(pi, "message_start")(
+			{ message: { role: "assistant" } },
+			context,
+		);
+		await eventHandler(pi, "message_update")(
+			{
+				message: { role: "assistant" },
+				assistantMessageEvent: { type: "thinking_delta", delta: "think" },
+			},
+			context,
+		);
+		telemetry.client.score.create.mockImplementationOnce(() => {
+			throw new Error("score endpoint unavailable");
+		});
+		await eventHandler(pi, "message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					model: "observability-model-final",
+					usage: {
+						input: 2,
+						output: 1,
+						totalTokens: 3,
+						cost: { input: 0, output: 0, total: 0 },
+					},
+				},
+			},
+			context,
+		);
+		await eventHandler(pi, "turn_end")(
+			{
+				turnIndex: 0,
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					usage: { input: 2, output: 1, totalTokens: 3 },
+				},
+				toolResults: [],
+			},
+			context,
+		);
+		await eventHandler(pi, "agent_end")(
+			{
+				messages: [
+					{ role: "assistant", content: [{ type: "text", text: "done" }] },
+				],
+			},
+			context,
+		);
+
+		const trace = latestRecord(telemetry.state.traces, "pi-agent");
+		const generation = latestRecord(
+			telemetry.state.observations,
+			"llm-response",
+		);
+		const tool = latestRecord(telemetry.state.observations, "tool:bash");
+		const generationEnd = generation.end as Record<string, unknown>;
+		expect(trace.metadata).toMatchObject({
+			source_type: "git-repo",
+			git_remote_host: "github.com",
+			git_remote_path: "example/observability",
+			repo_identity: "example/observability",
+		});
+		expect(JSON.stringify(trace.metadata)).not.toContain("token:secret");
+		const sourceFields = Object.fromEntries(
+			Object.entries(trace.metadata as Record<string, unknown>).filter(
+				([key]) =>
+					[
+						"source_type",
+						"git_remote_host",
+						"git_remote_path",
+						"repo_identity",
+						"repo_owner",
+						"repo_name",
+						"repo_root_name",
+						"git_branch",
+						"git_commit",
+						"metadata_source",
+					].includes(key),
+			),
+		);
+		expect(JSON.stringify(sourceFields)).not.toContain(sourceRepo);
+		expect(generationEnd).toMatchObject({
+			model: "observability-model-final",
+			modelParameters: {
+				temperature: 0.2,
+				top_p: 0.9,
+				max_tokens: 1024,
+				reasoning_effort: "high",
+			},
+			metadata: expect.objectContaining({
+				providerResponseStatus: 200,
+				providerResponseHeaders: {
+					"content-type": "application/json",
+					"x-request-id": "provider-request-42",
+				},
+				providerResponseMetadata: {
+					finishReason: "stop",
+					requestId: "provider-request-42",
+				},
+			}),
+		});
+		expect(JSON.stringify(generationEnd)).not.toContain("provider-secret");
+		expect(JSON.stringify(generationEnd)).not.toContain(sourceRepo);
+		expect(JSON.stringify(generationEnd)).not.toContain("internal-customer");
+		expect(
+			(generationEnd.metadata as Record<string, unknown>)
+				.providerResponseMetadata,
+		).toEqual({
+			finishReason: "stop",
+			requestId: "provider-request-42",
+		});
+		expect(generationEnd).not.toHaveProperty("costDetails");
+		expect(generation.updateCalls).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ completionStartTime: expect.any(Date) }),
+			]),
+		);
+		expect(generationEnd.metadata).toEqual(
+			expect.objectContaining({ timeToFirstTokenMs: expect.any(Number) }),
+		);
+		expect(telemetry.state.scores).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					name: "tool_is_error",
+					value: 1,
+					observationId: tool.id,
+				}),
+				expect.objectContaining({
+					name: "tool_call_count",
+					value: 1,
+					traceId: trace.id,
+				}),
+				expect.objectContaining({
+					name: "turn_count",
+					value: 1,
+					traceId: trace.id,
+				}),
+				expect.objectContaining({
+					name: "total_tool_errors",
+					value: 1,
+					traceId: trace.id,
+				}),
+				expect.objectContaining({
+					name: "tool_success_rate",
+					value: 0,
+					traceId: trace.id,
+				}),
+				expect.objectContaining({
+					name: "session_had_errors",
+					value: 1,
+					traceId: trace.id,
+				}),
+			]),
+		);
+		await eventHandler(pi, "session_shutdown")({}, context);
 	});
 
 	it("keeps the compiled package entrypoint loadable", async () => {

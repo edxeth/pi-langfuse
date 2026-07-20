@@ -333,6 +333,7 @@ export function sanitizeForTelemetry<T>(
 				: current;
 		}
 		if (!current || typeof current !== "object") return current;
+		if (current instanceof Date) return current;
 		if (depth >= (limits?.maxDepth ?? Infinity)) return "[TRUNCATED:depth]";
 		if (current instanceof Error) {
 			return {
