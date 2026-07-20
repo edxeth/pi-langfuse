@@ -78,8 +78,8 @@
 				"Run the compatibility harness through the public extension registration path.",
 				"Assert the exact existing trace names, hierarchy, tags, trace input/output, aggregate usage, compact metadata, and cleanup behavior remain unchanged."
 			],
-			"passes": false,
-			"regression_notes": ""
+			"passes": true,
+			"regression_notes": "Extracted agent prompt and turn lifecycle handlers with explicit dependency injection while preserving public registration order and telemetry behavior. The registered compatibility harness, full gates, compiled build, and package dry-run passed after one supported review fix for Biome import organization."
 		},
 		{
 			"category": "maintainability",

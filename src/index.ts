@@ -1,8 +1,8 @@
-import { basename } from "node:path";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { createAgentLifecycleHandlers } from "./agent-lifecycle.js";
 import {
 	type Config,
 	canTrace,
@@ -10,22 +10,15 @@ import {
 	resolveConfig,
 } from "./config.js";
 import { exportRedactedData } from "./export.js";
-import {
-	flushClient,
-	getClient,
-	type LangfuseGeneration,
-	type LangfuseSpan,
-	type LangfuseTrace,
-	shutdownClient,
-} from "./langfuse-client.js";
+import { flushClient, getClient, shutdownClient } from "./langfuse-client.js";
+import type { PiUsage, PromptState, ToolState } from "./lifecycle-types.js";
 import { ensureLocalLangfuseStarted } from "./local-autostart.js";
 import { runLangfuseInit } from "./local-init.js";
 import { appendRawTrace, drainRawTraceQueue } from "./raw-trace.js";
-import { redactionMetadata, redactString } from "./redaction.js";
+import { redactionMetadata } from "./redaction.js";
 import {
 	hasActiveSessionLeases,
 	type SessionContextLike,
-	type SessionState,
 	SessionStateOwner,
 } from "./session-state.js";
 import {
@@ -35,62 +28,29 @@ import {
 	type SettingsValues,
 	setSettingsValues,
 } from "./settings.js";
-
-interface PiUsage {
-	input?: number;
-	output?: number;
-	cacheRead?: number;
-	cacheWrite?: number;
-	totalTokens?: number;
-	cost?: { input?: number; output?: number; total?: number };
-}
-
-interface PromptState {
-	trace?: LangfuseTrace;
-	promptSpan?: LangfuseSpan;
-	userPrompt: string;
-	systemPrompt: string;
-	cwd: string;
-	startedAt: number;
-	toolCalls: number;
-	toolErrors: number;
-	turns: number;
-	tokensIn: number;
-	tokensOut: number;
-	cacheRead: number;
-	cacheWrite: number;
-	lastAssistantText: string;
-	lastUsage?: PiUsage;
-	activeTurns: Map<number, TurnState>;
-	activeTools: Map<string, ToolState>;
-	lastMessages?: Array<{ role: string; content: unknown }>;
-	lastContextMessages?: Array<{ role: string; content: unknown }>;
-}
-
-interface TurnState {
-	index: number;
-	startedAt: number;
-	span?: LangfuseSpan;
-	generation?: LangfuseGeneration;
-	streamingText?: string;
-	streamingThinking?: string;
-	requests?: Array<{
-		timestamp: string;
-		payloadSize: number;
-		model: string;
-	}>;
-}
-
-interface ToolState {
-	toolName: string;
-	startedAt: number;
-	span?: LangfuseSpan;
-	argsSummary: string;
-	argsRaw?: unknown;
-	partialOutput?: string;
-	resultOutput?: string;
-	isError?: boolean;
-}
+import {
+	buildTraceTags,
+	costDetailsFromUsage,
+	currentTurnIndex,
+	estimateJsonBytes,
+	extractTextFromContent,
+	getRuntimeName,
+	getSessionRoot,
+	getUserId,
+	redactToolContent,
+	safeJson,
+	standardUsageFromUsage,
+	summarizeMessages,
+	summarizeProviderPayload,
+	summarizeProviderRequestMessages,
+	summarizeToolArgs,
+	summarizeToolResult,
+	telemetryText,
+	truncate,
+	usageDetailsFromUsage,
+	writeRawTrace,
+} from "./telemetry-helpers.js";
+import { createTurnLifecycleHandlers } from "./turn-lifecycle.js";
 
 const LANGFUSE_STATUS_KEY = "pi-langfuse:status";
 
@@ -164,401 +124,6 @@ function updateLangfuseStatusLine(
 	setStatus(LANGFUSE_STATUS_KEY, `Langfuse ${status.icon}`);
 }
 
-function truncate(text: string, max = 1200) {
-	return text.length > max ? `${text.slice(0, max)}…` : text;
-}
-
-function telemetryText(config: Config, text: string, max: number) {
-	const scanLimit = Math.max(max * 2, max + 500);
-	const bounded =
-		text.length > scanLimit
-			? `${text.slice(0, scanLimit)}…[truncated ${text.length - scanLimit} chars]`
-			: text;
-	return truncate(redactString(config, bounded), max);
-}
-
-function safeJson(config: Config, value: unknown, max = 1200) {
-	try {
-		return telemetryText(config, JSON.stringify(value, null, 2), max);
-	} catch {
-		return "[unserializable]";
-	}
-}
-
-function summarizeToolArgs(config: Config, toolName: string, args: unknown) {
-	if (!args || typeof args !== "object")
-		return safeJson(config, args, config.toolArgsMaxChars);
-	const data = args as Record<string, unknown>;
-	switch (toolName) {
-		case "bash":
-			return telemetryText(
-				config,
-				String(data.command ?? ""),
-				config.toolArgsMaxChars,
-			);
-		case "read":
-			return telemetryText(
-				config,
-				`${String(data.path ?? "")}#${String(data.offset ?? 1)}:${String(data.limit ?? "")}`,
-				config.toolArgsMaxChars,
-			);
-		case "write":
-		case "edit":
-			return telemetryText(
-				config,
-				String(data.path ?? ""),
-				config.toolArgsMaxChars,
-			);
-		case "web_search":
-			return telemetryText(
-				config,
-				String(
-					data.query ??
-						(Array.isArray(data.queries) ? data.queries.join(" | ") : ""),
-				),
-				config.toolArgsMaxChars,
-			);
-		default:
-			return safeJson(config, args, config.toolArgsMaxChars);
-	}
-}
-
-function extractTextFromContent(
-	content: Array<{ type: string; text?: string }> | undefined,
-) {
-	if (!content?.length) return "";
-	return content
-		.filter((item) => item.type === "text" && item.text)
-		.map((item) => item.text)
-		.join("\n");
-}
-
-function summarizeMessageContent(config: Config, content: unknown) {
-	if (typeof content === "string") {
-		return telemetryText(config, content, config.traceInputMaxChars);
-	}
-	if (Array.isArray(content)) {
-		const text = extractTextFromContent(
-			content.slice(0, 20) as Array<{ type: string; text?: string }>,
-		);
-		if (text) return telemetryText(config, text, config.traceInputMaxChars);
-		return `[${content.length} content item(s)]`;
-	}
-	if (content && typeof content === "object") {
-		const maybeContent = (content as { content?: unknown }).content;
-		if (Array.isArray(maybeContent))
-			return summarizeMessageContent(config, maybeContent);
-		return "[object content]";
-	}
-	return content == null ? "" : String(content);
-}
-
-function summarizeMessages(
-	config: Config,
-	messages: Array<{ role?: string; content?: unknown }>,
-) {
-	const limit = 40;
-	const selected = messages.slice(-limit).map((message) => ({
-		role: message.role || "unknown",
-		content: summarizeMessageContent(config, message.content),
-	}));
-	if (messages.length > limit) {
-		selected.unshift({
-			role: "system",
-			content: `[truncated ${messages.length - limit} earlier message(s)]`,
-		});
-	}
-	return selected;
-}
-
-function summarizeProviderPayload(
-	config: Config,
-	payload: unknown,
-	fallbackModel: string,
-) {
-	if (!payload || typeof payload !== "object") return { type: typeof payload };
-	const data = payload as Record<string, unknown>;
-	const messages = Array.isArray(data.messages)
-		? summarizeMessages(
-				config,
-				data.messages as Array<{ role?: string; content?: unknown }>,
-			)
-		: undefined;
-	return {
-		model: typeof data.model === "string" ? data.model : fallbackModel,
-		messageCount: Array.isArray(data.messages)
-			? data.messages.length
-			: undefined,
-		messages,
-		keys: Object.keys(data).slice(0, 50),
-	};
-}
-
-function estimateJsonBytes(value: unknown) {
-	try {
-		return Buffer.byteLength(JSON.stringify(value), "utf-8");
-	} catch {
-		return undefined;
-	}
-}
-
-function summarizeProviderRequestMessages(config: Config, messages: unknown) {
-	if (!Array.isArray(messages)) return undefined;
-	return summarizeMessages(
-		config,
-		messages as Array<{ role?: string; content?: unknown }>,
-	);
-}
-
-function redactToolContent(config: Config, result: unknown): string {
-	if (!result) return "";
-	if (typeof result === "string") return redactString(config, result);
-	if (typeof result === "object") {
-		const data = result as {
-			content?: Array<{ type: string; text?: string }>;
-		};
-		if (data.content) {
-			const textParts: string[] = [];
-			let imageCount = 0;
-			for (const item of data.content) {
-				if (item.type === "text" && item.text) {
-					textParts.push(item.text);
-				} else if (item.type === "image" || item.type === "image_url") {
-					imageCount++;
-				}
-			}
-			let result = textParts.join("\n");
-			if (imageCount > 0) {
-				result += `${result ? "\n" : ""}[${imageCount} image content block(s) from tool result]`;
-			}
-			if (result) return redactString(config, result);
-		}
-	}
-	try {
-		return redactString(config, JSON.stringify(result, null, 2));
-	} catch {
-		return "[unserializable]";
-	}
-}
-
-function summarizeToolResult(config: Config, result: unknown) {
-	if (!result) return "";
-	if (typeof result === "string")
-		return telemetryText(config, result, config.toolOutputMaxChars);
-	if (typeof result === "object") {
-		const data = result as { content?: Array<{ type: string; text?: string }> };
-		const text = extractTextFromContent(data.content);
-		if (text) return telemetryText(config, text, config.toolOutputMaxChars);
-	}
-	return safeJson(config, result, config.toolOutputMaxChars);
-}
-
-function usageDetailsFromUsage(usage?: PiUsage) {
-	if (!usage) return undefined;
-	const details: Record<string, number> = {};
-	if (usage.input) details.input = usage.input;
-	if (usage.output) details.output = usage.output;
-	if (usage.cacheRead) details.input_cached_read = usage.cacheRead;
-	if (usage.cacheWrite) details.input_cached_write = usage.cacheWrite;
-	if (usage.totalTokens) details.total = usage.totalTokens;
-	return Object.keys(details).length > 0 ? details : undefined;
-}
-
-function standardUsageFromUsage(usage?: PiUsage) {
-	if (!usage) return undefined;
-	const standard: Record<string, number> = {};
-	if (usage.input) standard.input = usage.input;
-	if (usage.output) standard.output = usage.output;
-	if (usage.totalTokens) {
-		standard.total = usage.totalTokens;
-	} else if (usage.input || usage.output) {
-		standard.total = (usage.input ?? 0) + (usage.output ?? 0);
-	}
-	return Object.keys(standard).length > 0 ? standard : undefined;
-}
-
-function costDetailsFromUsage(usage?: PiUsage) {
-	const cost = usage?.cost;
-	if (!cost) return undefined;
-	const details: Record<string, number> = {};
-	if (typeof cost.input === "number") details.input = cost.input;
-	if (typeof cost.output === "number") details.output = cost.output;
-	if (typeof cost.total === "number") details.total = cost.total;
-	return Object.keys(details).length > 0 ? details : undefined;
-}
-
-function getUserId(config?: Config) {
-	return config?.userId || undefined;
-}
-
-function getRuntimeName() {
-	return process.env.TIA_ACTIVE === "1" ? "tia" : "pi";
-}
-
-function getSessionRoot(sessionFile: string) {
-	const marker = "/sessions/";
-	const index = sessionFile.indexOf(marker);
-	return index >= 0
-		? sessionFile.slice(0, index + marker.length - 1)
-		: undefined;
-}
-
-function rawTraceBase(state: SessionState<PromptState>, turnIndex?: number) {
-	return {
-		timestamp: new Date().toISOString(),
-		sessionId: state.sessionId || undefined,
-		sessionFile: state.sessionFile || undefined,
-		turnIndex,
-		provider: state.provider || undefined,
-		model: state.model || undefined,
-		runtime: getRuntimeName(),
-	};
-}
-
-function currentTurnIndex(prompt: PromptState) {
-	const activeTurns = Array.from(prompt.activeTurns.values());
-	return activeTurns.length > 0
-		? activeTurns[activeTurns.length - 1]?.index
-		: undefined;
-}
-
-function writeRawTrace(
-	config: Config,
-	state: SessionState<PromptState>,
-	record: { type: string } & Record<string, unknown>,
-) {
-	appendRawTrace(config, state.sessionFile, {
-		...rawTraceBase(
-			state,
-			typeof record.turnIndex === "number" ? record.turnIndex : undefined,
-		),
-		redaction: redactionMetadata(config),
-		traceId: state.promptState?.trace?.id,
-		...record,
-	});
-}
-
-function buildTraceTags(
-	config: Config | undefined,
-	state: SessionState<PromptState>,
-	cwd: string,
-) {
-	const runtime = getRuntimeName();
-	const tags = [
-		"pi",
-		"pi-langfuse",
-		`runtime:${runtime}`,
-		...(config?.defaultTags ?? []),
-	];
-	const projectName = basename(cwd || process.cwd());
-	if (projectName) tags.push(`project:${projectName}`);
-	if (state.provider) tags.push(`provider:${state.provider}`);
-	if (state.model) tags.push(`model:${state.model}`);
-	if (state.sessionReason) tags.push(`session:${state.sessionReason}`);
-	return Array.from(new Set(tags)).slice(0, 20);
-}
-
-async function finalizePrompt(
-	state: SessionState<PromptState>,
-	config: Config | undefined,
-	flush = false,
-) {
-	const prompt = state.promptState;
-	if (!prompt) return;
-
-	for (const [, tool] of prompt.activeTools) {
-		tool.span?.end({
-			isError: tool.isError ?? true,
-			output: tool.resultOutput || tool.partialOutput,
-			statusMessage: tool.isError
-				? "tool error"
-				: "tool ended without completion event",
-			metadata: {
-				tool: tool.toolName,
-				argsSummary: tool.argsSummary,
-				durationMs: Date.now() - tool.startedAt,
-				abandoned: true,
-			},
-		});
-	}
-	prompt.activeTools.clear();
-
-	for (const [, turn] of prompt.activeTurns) {
-		if (turn.generation) {
-			turn.generation.end({
-				isError: true,
-				statusMessage: "generation abandoned during prompt finalization",
-				metadata: {
-					abandoned: true,
-					turnIndex: turn.index,
-					durationMs: Date.now() - turn.startedAt,
-				},
-			});
-		}
-		turn.span?.end({
-			metadata: {
-				turnIndex: turn.index,
-				durationMs: Date.now() - turn.startedAt,
-				abandoned: true,
-			},
-			statusMessage: "turn ended during cleanup",
-		});
-	}
-	prompt.activeTurns.clear();
-
-	prompt.promptSpan?.end({
-		output: prompt.lastAssistantText || undefined,
-		metadata: {
-			completed: true,
-			toolCalls: prompt.toolCalls,
-			toolErrors: prompt.toolErrors,
-			turns: prompt.turns,
-			durationMs: Date.now() - prompt.startedAt,
-			compactCount: state.compactCount,
-		},
-	});
-
-	prompt.trace?.update({
-		output: prompt.lastAssistantText || undefined,
-		userId: getUserId(config),
-		sessionId: state.sessionId || undefined,
-		tags: buildTraceTags(config, state, prompt.cwd),
-		release: config?.release || undefined,
-		environment: config?.environment || undefined,
-		metadata: {
-			redaction: config ? redactionMetadata(config) : undefined,
-			cwd: prompt.cwd,
-			systemPrompt: config
-				? telemetryText(config, prompt.systemPrompt, config.traceInputMaxChars)
-				: truncate(prompt.systemPrompt, 2000),
-			model: state.model,
-			provider: state.provider,
-			sessionReason: state.sessionReason,
-			runtime: getRuntimeName(),
-			sessionRoot: getSessionRoot(state.sessionFile),
-			sessionFile: state.sessionFile || undefined,
-			previousSessionFile: state.previousSessionFile || undefined,
-			tiaActive: process.env.TIA_ACTIVE === "1",
-			tiaCommand: process.env.TIA_COMMAND || undefined,
-			completed: true,
-			turns: prompt.turns,
-			toolCalls: prompt.toolCalls,
-			toolErrors: prompt.toolErrors,
-			tokensIn: prompt.tokensIn,
-			tokensOut: prompt.tokensOut,
-			cacheRead: prompt.cacheRead,
-			cacheWrite: prompt.cacheWrite,
-			compactCount: state.compactCount,
-			durationMs: Date.now() - prompt.startedAt,
-		},
-	});
-
-	if (flush) {
-		await flushClient();
-	}
-	if (state.promptState === prompt) state.promptState = null;
-}
-
 export default async function (pi: ExtensionAPI) {
 	let settings = getStoredSettingsValues(pi);
 	let lastUiContext: LangfuseUiContext | undefined;
@@ -569,7 +134,7 @@ export default async function (pi: ExtensionAPI) {
 		registerSettings(pi, getLiveSettingsView(settings));
 		const config = resolveConfig(settings);
 		for (const state of sessionOwner.values()) {
-			await finalizePrompt(state, config);
+			await agentLifecycle.finalizePrompt(state, config);
 		}
 		await flushClient();
 		if (!hasActiveSessionLeases()) await shutdownClient();
@@ -584,6 +149,40 @@ export default async function (pi: ExtensionAPI) {
 
 	const getTypedSessionState = (ctx: ExtensionContext | undefined) =>
 		getSessionState(ctx);
+
+	const agentLifecycle = createAgentLifecycleHandlers({
+		getConfig: () => resolveConfig(settings),
+		updateStatus: (ctx, config) => {
+			lastUiContext = ctx;
+			updateLangfuseStatusLine(ctx, config);
+		},
+		getSessionState,
+		canTrace,
+		ensureLocalLangfuseStarted,
+		getClient,
+		flushClient,
+		writeRawTrace,
+		buildTraceTags,
+		telemetryText,
+		getUserId,
+		getRuntimeName,
+		getSessionRoot,
+		redactionMetadata,
+		truncate,
+		extractTextFromContent,
+	});
+	const turnLifecycle = createTurnLifecycleHandlers({
+		getConfig: () => resolveConfig(settings),
+		getSessionState,
+		canTrace,
+		getClient,
+		telemetryText,
+		redactionMetadata,
+		extractTextFromContent,
+		standardUsageFromUsage,
+		usageDetailsFromUsage,
+		costDetailsFromUsage,
+	});
 
 	pi.events.on("pi-extension-settings:ready", () => {
 		registerSettings(pi, getLiveSettingsView(settings));
@@ -646,7 +245,7 @@ export default async function (pi: ExtensionAPI) {
 		lastUiContext = ctx;
 		updateLangfuseStatusLine(ctx, resolveConfig(settings));
 		const config = resolveConfig(settings);
-		await finalizePrompt(state, config);
+		await agentLifecycle.finalizePrompt(state, config);
 
 		state.sessionFile = ctx.sessionManager.getSessionFile() || "";
 		const data = event as typeof event & {
@@ -686,162 +285,11 @@ export default async function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("before_agent_start", async (event, ctx) => {
-		const state = getSessionState(ctx, true);
-		if (!state) return;
-		lastUiContext = ctx;
-		const config = resolveConfig(settings);
-		updateLangfuseStatusLine(ctx, config);
-		const sessionFile = ctx.sessionManager.getSessionFile();
-		if (config.skipUnpersistedSessions && !sessionFile) return;
-		if (!canTrace(config) && !config.rawTraceEnabled) return;
-		state.sessionFile = sessionFile || "";
+	pi.on("before_agent_start", agentLifecycle.beforeAgentStart);
 
-		await finalizePrompt(state, config);
+	pi.on("agent_start", agentLifecycle.agentStart);
 
-		const eventData = event as typeof event & {
-			systemPromptOptions?: { cwd?: string };
-		};
-		const cwd = eventData.systemPromptOptions?.cwd || process.cwd();
-
-		if (!state.model && ctx.model) {
-			state.model = ctx.model.id || "";
-			state.provider = ctx.model.provider || "";
-		}
-
-		const prompt: PromptState = {
-			userPrompt: event.prompt,
-			systemPrompt: event.systemPrompt || "",
-			cwd,
-			startedAt: Date.now(),
-			toolCalls: 0,
-			toolErrors: 0,
-			turns: 0,
-			tokensIn: 0,
-			tokensOut: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			lastAssistantText: "",
-			activeTurns: new Map(),
-			activeTools: new Map(),
-		};
-		state.promptState = prompt;
-
-		writeRawTrace(config, state, {
-			type: "agent_prompt_start",
-			cwd,
-			prompt: event.prompt,
-			systemPrompt: event.systemPrompt || "",
-			sessionReason: state.sessionReason,
-			previousSessionFile: state.previousSessionFile || undefined,
-		});
-
-		try {
-			if (!canTrace(config)) return;
-
-			await ensureLocalLangfuseStarted(config);
-			if (state.promptState !== prompt) return;
-			const lf = await getClient(config);
-			if (state.promptState !== prompt) return;
-			const trace = lf.trace({
-				name: "pi-agent",
-				input: telemetryText(config, event.prompt, config.traceInputMaxChars),
-				sessionId: state.sessionId || undefined,
-				userId: getUserId(config),
-				tags: buildTraceTags(config, state, cwd),
-				release: config.release || undefined,
-				environment: config.environment || undefined,
-				metadata: {
-					redaction: redactionMetadata(config),
-					cwd,
-					systemPrompt: telemetryText(
-						config,
-						event.systemPrompt || "",
-						config.traceInputMaxChars,
-					),
-					model: state.model,
-					provider: state.provider,
-					sessionReason: state.sessionReason,
-					runtime: getRuntimeName(),
-					sessionRoot: getSessionRoot(state.sessionFile),
-					sessionFile: state.sessionFile || undefined,
-					previousSessionFile: state.previousSessionFile || undefined,
-					tiaActive: process.env.TIA_ACTIVE === "1",
-					tiaCommand: process.env.TIA_COMMAND || undefined,
-				},
-			});
-
-			if (state.promptState === prompt) prompt.trace = trace;
-		} catch (e) {
-			console.warn("📊 Langfuse: Failed to create trace", e);
-		}
-	});
-
-	pi.on("agent_start", async (_event, ctx) => {
-		const state = getTypedSessionState(ctx);
-		const prompt = state?.promptState;
-		if (!state || !prompt) return;
-		const config = resolveConfig(settings);
-		if (!canTrace(config) || !prompt.trace) return;
-		try {
-			const lf = await getClient(config);
-			if (state.promptState !== prompt) return;
-			prompt.promptSpan = lf.span({
-				name: "agent.prompt",
-				traceId: prompt.trace.id,
-				input: telemetryText(
-					config,
-					prompt.userPrompt,
-					config.traceInputMaxChars,
-				),
-				metadata: {
-					redaction: redactionMetadata(config),
-					cwd: prompt.cwd,
-					model: state.model,
-					provider: state.provider,
-					sessionReason: state.sessionReason,
-				},
-			});
-		} catch (e) {
-			console.warn("📊 Langfuse: Failed to create prompt span", e);
-		}
-	});
-
-	pi.on("turn_start", async (event, ctx) => {
-		const state = getTypedSessionState(ctx);
-		const prompt = state?.promptState;
-		if (!state || !prompt) return;
-		const config = resolveConfig(settings);
-		prompt.turns += 1;
-		const turnState: TurnState = {
-			index: event.turnIndex,
-			startedAt: Date.now(),
-		};
-		prompt.activeTurns.set(event.turnIndex, turnState);
-		if (!canTrace(config) || !prompt.trace) return;
-		try {
-			const lf = await getClient(config);
-			if (
-				state.promptState !== prompt ||
-				prompt.activeTurns.get(event.turnIndex) !== turnState
-			)
-				return;
-			turnState.span = lf.span({
-				name: "agent.turn",
-				traceId: prompt.trace.id,
-				parentObservationId: prompt.promptSpan?.id,
-				metadata: {
-					redaction: redactionMetadata(config),
-					turnIndex: event.turnIndex,
-					turnNumber: prompt.turns,
-					model: state.model,
-					provider: state.provider,
-				},
-			});
-		} catch (e) {
-			console.warn("📊 Langfuse: Failed to create turn span", e);
-		}
-	});
+	pi.on("turn_start", turnLifecycle.turnStart);
 
 	// Capture full messages (system prompt + conversation history + tools) before
 	// each LLM call. These are used as the generation input so Langfuse UI shows
@@ -1228,42 +676,7 @@ export default async function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("turn_end", async (event, ctx) => {
-		const state = getTypedSessionState(ctx);
-		const prompt = state?.promptState;
-		if (!state || !prompt) return;
-		const config = resolveConfig(settings);
-
-		const message = event.message as {
-			role?: string;
-			content?: Array<{ type: string; text?: string }>;
-			usage?: PiUsage;
-		};
-		const turnState = prompt.activeTurns.get(event.turnIndex);
-		const outputText = extractTextFromContent(message.content).trim();
-
-		const usage = message.usage;
-		const standardUsage = standardUsageFromUsage(usage);
-		const usageDetails = usageDetailsFromUsage(usage);
-		const costDetails = costDetailsFromUsage(usage);
-
-		if (canTrace(config)) {
-			turnState?.span?.end({
-				output: outputText
-					? telemetryText(config, outputText, config.traceOutputMaxChars)
-					: undefined,
-				usage: standardUsage,
-				usageDetails,
-				costDetails,
-				metadata: {
-					turnIndex: event.turnIndex,
-					durationMs: turnState ? Date.now() - turnState.startedAt : undefined,
-					toolResults: event.toolResults?.length ?? 0,
-				},
-			});
-		}
-		prompt.activeTurns.delete(event.turnIndex);
-	});
+	pi.on("turn_end", turnLifecycle.turnEnd);
 
 	pi.on("before_provider_request", async (event, ctx) => {
 		const state = getTypedSessionState(ctx);
@@ -1356,33 +769,7 @@ export default async function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("agent_end", async (event, ctx) => {
-		const state = getTypedSessionState(ctx);
-		const prompt = state?.promptState;
-		if (!state || !prompt) return;
-		const eventData = event as {
-			messages?: Array<{
-				role: string;
-				content: Array<{ type: string; text?: string }>;
-			}>;
-		};
-		const messages = eventData.messages || [];
-		const lastAssistant = messages
-			.filter((message) => message.role === "assistant")
-			.pop();
-		const config = resolveConfig(settings);
-		if (lastAssistant) {
-			const output = extractTextFromContent(lastAssistant.content).trim();
-			if (output) {
-				prompt.lastAssistantText = telemetryText(
-					config,
-					output,
-					config.traceOutputMaxChars,
-				);
-			}
-		}
-		await finalizePrompt(state, config, true);
-	});
+	pi.on("agent_end", agentLifecycle.agentEnd);
 
 	pi.on("session_compact", async (_event, ctx) => {
 		const state = getTypedSessionState(ctx);
@@ -1415,7 +802,7 @@ export default async function (pi: ExtensionAPI) {
 			reason: "shutdown",
 		});
 		drainRawTraceQueue();
-		await finalizePrompt(state, config, true);
+		await agentLifecycle.finalizePrompt(state, config, true);
 		sessionOwner.deleteState(state);
 		if (!hasActiveSessionLeases()) await shutdownClient();
 	});

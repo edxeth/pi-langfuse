@@ -118,3 +118,42 @@ Verification gates:
 Item-specific evidence: The registered extension harness interleaved prompt, turn, context, provider, generation, tool, model-select, compaction, agent-end, and shutdown events for two sessions. It asserted trace IDs, parent observation IDs, model/provider metadata, usage counters, tool errors, compact counts, final output, raw JSONL session paths, and cleanup after shutdown. A second regression registered two extension instances and confirmed that one shutdown did not close the shared client needed by the other. The package dry-run included the compiled session-state module and retained the `dist/index.js` entrypoint. No dependency audit was required by this item. The credentialed external E2E remained skipped because credentials were unavailable; local registered-handler coverage exercised the real extension path without paid services.
 
 Remaining risks: Duplicate and out-of-order lifecycle idempotency, modular handler extraction, the Langfuse v5 and OpenTelemetry facade, privacy budgets, fallback ingestion, additive telemetry, operator commands, and release documentation remain for later items. Client replacement across independently configured runtimes still belongs to the later runtime integration work. Credentialed external ingestion remains unverified.
+
+## Handoff 2026-07-20
+
+Selected item: Agent and turn lifecycle behavior is moved behind explicit handler boundaries without changing emitted trace behavior.
+
+Starting Git HEAD: `542d33aa08cea7308f2f50da157236f34b4a0053`.
+
+Decision rationale and assumptions: The plan prioritizes lifecycle seams after the Node.js toolchain and session ownership contracts. I moved prompt start, prompt finalization, agent start/end, and turn start/end into lifecycle-owned modules. The entrypoint still registers commands and events, creates session state, and supplies explicit dependencies. Shared formatting, raw-trace, tag, usage, and state types moved into internal modules because both the remaining event handlers and the new lifecycle handlers use them. Handler registration order remains unchanged. No remote reference or credentials were needed.
+
+Changed files:
+- `src/index.ts`: wires lifecycle handlers and retains command, settings, session, tool, context, generation, and provider registration.
+- `src/agent-lifecycle.ts`: owns prompt creation, prompt finalization, agent start, and agent end behavior.
+- `src/turn-lifecycle.ts`: owns turn start and turn end behavior.
+- `src/telemetry-helpers.ts`: owns shared telemetry shaping, raw-trace, tag, and usage helpers.
+- `src/lifecycle-types.ts`: owns shared prompt, turn, tool, and usage types.
+- `.ralph/items.json`: marked the selected item passing and recorded its evidence.
+- `.ralph/progress.md`: recorded this handoff.
+
+Targeted results:
+- `npm run typecheck` passed after implementation and after the review fix.
+- `npm test -- --run src/compatibility.test.ts src/index.test.ts` passed 15 tests in 2 files after the review fix.
+- `npx biome check src/index.ts src/agent-lifecycle.ts src/turn-lifecycle.ts src/telemetry-helpers.ts src/lifecycle-types.ts` passed with no fixes applied after the review fix.
+- `git diff --check HEAD` passed.
+
+GLM review findings and disposition: GLM reported one supported P1 finding. Biome import organization failed in `src/index.ts`, `src/agent-lifecycle.ts`, `src/turn-lifecycle.ts`, and `src/telemetry-helpers.ts`. I applied Biome's safe organize-imports fix to the five selected source files. The targeted check and the full Biome gate passed afterward. GLM reported no other material finding.
+
+GPT Sol review findings and disposition: GPT Sol reported the same supported P1 import-organization finding and no lifecycle, concurrency, compatibility, redaction, packaging, or test gap. I applied the same safe fix and reran the targeted and full checks. No other material finding remained.
+
+Verification gates:
+- `node -e "const major = Number(process.versions.node.split('.')[0]); if (major < 22) { console.error('Node.js 22+ required'); process.exit(1); }"` passed.
+- `npx biome check .` passed with no fixes applied.
+- `npm run typecheck` passed.
+- `npm test` passed with 56 tests and 1 credential-gated E2E test skipped.
+- `npm run build` passed.
+- `npm pack --dry-run` passed. The package listed `dist/index.js`, the lifecycle modules, declarations, maps, and `package.json` across 62 files.
+
+Item-specific evidence: The existing registered extension compatibility harness exercised the public event path through prompt start, agent start, turn start/end, generation, tools, agent end, compaction, shutdown, settings refresh, raw traces, redaction, and compiled entrypoint loading. It asserted the existing `pi-agent`, `agent.prompt`, `agent.turn`, `llm-response`, and `tool:<name>` hierarchy, parent IDs, tags, trace I/O, usage and cost fields, compact metadata, raw records, and cleanup. No dependency audit was required by this item. The credentialed external E2E remained skipped because credentials were unavailable; local registered-handler coverage did not require them.
+
+Remaining risks: Generation and tool handler extraction, duplicate and out-of-order lifecycle idempotency, Langfuse v5 and OpenTelemetry transport, privacy budgets, fallback ingestion, additive telemetry, operator commands, and release documentation remain for later items. Credentialed external ingestion remains unverified.
