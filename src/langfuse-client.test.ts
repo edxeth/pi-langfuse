@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "./config.js";
 import {
+	flushClient,
 	getRuntime,
 	getRuntimeRegistrySizeForTest,
+	setRuntimeTimeoutsForTest,
 	shutdownClient,
 } from "./langfuse-client.js";
 
@@ -54,7 +56,13 @@ const mocks = vi.hoisted(() => {
 		return raw;
 	}
 
+	const traceGet = vi.fn(async () => ({ id: "visible-trace" }));
+	const ingestionBatch = vi.fn(async () => ({ successes: [], errors: [] }));
 	const client = {
+		api: {
+			trace: { get: traceGet },
+			ingestion: { batch: ingestionBatch },
+		},
 		score: {
 			create: vi.fn(),
 			flush: vi.fn(async () => undefined),
@@ -68,10 +76,18 @@ const mocks = vi.hoisted(() => {
 		forceFlush: vi.fn(async () => undefined),
 		shutdown: vi.fn(async () => undefined),
 	}));
-	const BasicTracerProvider = vi.fn(() => ({
-		forceFlush: vi.fn(async () => undefined),
-		shutdown: vi.fn(async () => undefined),
-	}));
+	const tracerProviders: Array<{
+		forceFlush: ReturnType<typeof vi.fn>;
+		shutdown: ReturnType<typeof vi.fn>;
+	}> = [];
+	const BasicTracerProvider = vi.fn(() => {
+		const provider = {
+			forceFlush: vi.fn(async () => undefined),
+			shutdown: vi.fn(async () => undefined),
+		};
+		tracerProviders.push(provider);
+		return provider;
+	});
 	const AsyncHooksContextManager = vi.fn(() => ({
 		enable: vi.fn(function (this: unknown) {
 			return this;
@@ -124,6 +140,9 @@ const mocks = vi.hoisted(() => {
 		LangfuseSpanProcessor,
 		BasicTracerProvider,
 		AsyncHooksContextManager,
+		traceGet,
+		ingestionBatch,
+		tracerProviders,
 		context,
 		trace,
 		tracing,
@@ -177,9 +196,10 @@ const config: Config = {
 
 describe("langfuse v5 runtime facade", () => {
 	afterEach(async () => {
+		await shutdownClient();
 		vi.clearAllMocks();
 		mocks.records.length = 0;
-		await shutdownClient();
+		mocks.tracerProviders.length = 0;
 	});
 
 	it("sanitizes trace, span, generation, and update/end payloads before OTel calls", async () => {
@@ -303,5 +323,264 @@ describe("langfuse v5 runtime facade", () => {
 		});
 		expect(observedTraceId).toBe(trace.id);
 		expect(mocks.context.with).toHaveBeenCalled();
+	});
+
+	it("bounds prompt flush without shutting down the shared runtime", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 20,
+			traceVisibilityMs: 10,
+			pollIntervalMs: 1,
+		});
+		let provider: (typeof mocks.tracerProviders)[number] | undefined;
+		try {
+			await getRuntime(config);
+			provider = mocks.tracerProviders[mocks.tracerProviders.length - 1];
+			if (!provider) throw new Error("tracer provider was not created");
+			provider.forceFlush.mockImplementation(
+				() => new Promise<never>(() => {}),
+			);
+			const startedAt = Date.now();
+			await flushClient();
+			expect(Date.now() - startedAt).toBeLessThan(80);
+			expect(mocks.client.shutdown).not.toHaveBeenCalled();
+			expect(provider.shutdown).not.toHaveBeenCalled();
+		} finally {
+			provider?.forceFlush.mockResolvedValue(undefined);
+			restoreTimeouts();
+		}
+	});
+
+	it("bounds every shutdown dependency independently", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 20,
+			traceVisibilityMs: 10,
+			pollIntervalMs: 1,
+		});
+		try {
+			for (const dependency of [
+				"otel flush",
+				"score flush",
+				"client shutdown",
+				"tracer shutdown",
+			]) {
+				mocks.client.flush.mockReset().mockResolvedValue(undefined);
+				mocks.client.shutdown.mockReset().mockResolvedValue(undefined);
+				mocks.traceGet.mockReset().mockResolvedValue({ id: "visible-trace" });
+				mocks.ingestionBatch
+					.mockReset()
+					.mockResolvedValue({ successes: [], errors: [] });
+				const lf = await getRuntime(config);
+				const trace = lf.trace({ name: "pi-agent" });
+				const prompt = lf.span({ name: "agent.prompt", traceId: trace.id });
+				prompt.end({ output: "done" });
+				const provider =
+					mocks.tracerProviders[mocks.tracerProviders.length - 1];
+				if (!provider) throw new Error("tracer provider was not created");
+				if (dependency === "otel flush") {
+					provider.forceFlush.mockImplementation(
+						() => new Promise<never>(() => {}),
+					);
+				} else if (dependency === "score flush") {
+					mocks.client.flush.mockImplementation(
+						() => new Promise<never>(() => {}),
+					);
+				} else if (dependency === "client shutdown") {
+					mocks.client.shutdown.mockImplementation(
+						() => new Promise<never>(() => {}),
+					);
+				} else {
+					provider.shutdown.mockImplementation(
+						() => new Promise<never>(() => {}),
+					);
+				}
+				const startedAt = Date.now();
+				await shutdownClient();
+				expect(Date.now() - startedAt).toBeLessThan(180);
+				expect(mocks.client.flush).toHaveBeenCalledTimes(1);
+				expect(mocks.client.shutdown).toHaveBeenCalledTimes(1);
+				expect(provider.forceFlush).toHaveBeenCalledTimes(1);
+				expect(provider.shutdown).toHaveBeenCalledTimes(1);
+			}
+		} finally {
+			restoreTimeouts();
+		}
+	});
+
+	it("falls back once with redacted trace and observation facts", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 20,
+			traceVisibilityMs: 10,
+			pollIntervalMs: 1,
+		});
+		try {
+			const secret = "sk-lf-test-secret-1234567890";
+			mocks.traceGet.mockReset().mockRejectedValue(new Error("not visible"));
+			mocks.ingestionBatch
+				.mockReset()
+				.mockResolvedValue({ successes: [], errors: [] });
+			const lf = await getRuntime(config);
+			const trace = lf.trace({
+				id: "a".repeat(32),
+				name: "pi-agent",
+				input: `prompt ${secret}`,
+				sessionId: "fallback-session",
+				metadata: { source: "test" },
+			});
+			trace.setTraceIO?.({
+				input: `prompt ${secret}`,
+				output: "final answer",
+			});
+			const prompt = lf.span({ name: "agent.prompt", traceId: trace.id });
+			const turn = lf.span({
+				name: "agent.turn",
+				traceId: trace.id,
+				parentObservationId: prompt.id,
+			});
+			const generation = lf.generation({
+				name: "llm-response",
+				traceId: trace.id,
+				parentObservationId: turn.id,
+				model: "fallback-model",
+			});
+			const tool = lf.span({
+				name: "tool:bash",
+				traceId: trace.id,
+				parentObservationId: turn.id,
+				input: `command ${secret}`,
+			});
+			generation.end({
+				output: "generated answer",
+				usageDetails: { input: 4, output: 6, total: 10 },
+				costDetails: { total: 0.1 },
+			});
+			tool.end({
+				output: `tool output ${secret}`,
+				isError: true,
+				statusMessage: "tool failed",
+			});
+			turn.end({ output: "final answer" });
+			prompt.end({ output: "final answer" });
+
+			await flushClient();
+			expect(mocks.client.shutdown).not.toHaveBeenCalled();
+			await shutdownClient();
+			await shutdownClient();
+
+			expect(mocks.ingestionBatch).toHaveBeenCalledTimes(1);
+			const requestValue = (
+				mocks.ingestionBatch.mock.calls as unknown as Array<[unknown]>
+			)[0]?.[0];
+			if (!requestValue) throw new Error("fallback request was not captured");
+			const request = requestValue as {
+				batch: Array<{
+					type: string;
+					timestamp: string;
+					body: Record<string, unknown>;
+				}>;
+			};
+			const traceEvent = request.batch.find(
+				(event) => event.type === "trace-create",
+			);
+			const generationEvent = request.batch.find(
+				(event) => event.type === "generation-create",
+			);
+			const toolEvent = request.batch.find(
+				(event) => event.type === "span-create" && event.body.id === tool.id,
+			);
+			const turnEvent = request.batch.find(
+				(event) => event.type === "span-create" && event.body.id === turn.id,
+			);
+			const promptEvent = request.batch.find(
+				(event) => event.type === "span-create" && event.body.id === prompt.id,
+			);
+			if (
+				!traceEvent ||
+				!promptEvent ||
+				!turnEvent ||
+				!generationEvent ||
+				!toolEvent
+			) {
+				throw new Error("fallback batch is missing a trace observation");
+			}
+			expect(traceEvent.body).toMatchObject({
+				id: trace.id,
+				name: "pi-agent",
+				output: "final answer",
+				sessionId: "fallback-session",
+			});
+			expect(String(traceEvent.body.input)).toContain("[REDACTED:");
+			expect(promptEvent.body.traceId).toBe(trace.id);
+			expect(promptEvent.body.parentObservationId).toBeUndefined();
+			expect(turnEvent.body.parentObservationId).toBe(prompt.id);
+			expect(generationEvent.body).toMatchObject({
+				traceId: trace.id,
+				parentObservationId: turn.id,
+				model: "fallback-model",
+				usageDetails: { input: 4, output: 6, total: 10 },
+				costDetails: { total: 0.1 },
+			});
+			expect(toolEvent.body).toMatchObject({
+				traceId: trace.id,
+				parentObservationId: turn.id,
+				level: "ERROR",
+				statusMessage: "tool failed",
+			});
+			for (const event of request.batch) {
+				expect(event.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+				if (event.type !== "trace-create") {
+					expect(event.body.startTime).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+					expect(event.body.endTime).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+				}
+			}
+			expect(JSON.stringify(request)).not.toContain(secret);
+		} finally {
+			restoreTimeouts();
+		}
+	});
+
+	it("chunks oversized fallback batches and retires drained traces", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 20,
+			traceVisibilityMs: 10,
+			pollIntervalMs: 1,
+		});
+		try {
+			const payload = "x ".repeat(1_100_000);
+			mocks.traceGet.mockReset().mockRejectedValue(new Error("not visible"));
+			mocks.ingestionBatch
+				.mockReset()
+				.mockResolvedValue({ successes: [], errors: [] });
+			const fallbackConfig = {
+				...config,
+				payloadMaxStringChars: Infinity,
+				payloadMaxToolChars: Infinity,
+				payloadMaxDepth: Infinity,
+				payloadMaxArrayItems: Infinity,
+				payloadMaxObjectKeys: Infinity,
+				payloadMaxNodes: Infinity,
+			};
+			const lf = await getRuntime(fallbackConfig);
+			for (const id of ["c".repeat(32), "d".repeat(32)]) {
+				const trace = lf.trace({ id, name: "pi-agent", input: payload });
+				const prompt = lf.span({ name: "agent.prompt", traceId: trace.id });
+				prompt.end({ output: "done" });
+			}
+
+			await flushClient();
+			const calls = mocks.ingestionBatch.mock.calls as unknown as Array<
+				[unknown]
+			>;
+
+			expect(calls.length).toBeGreaterThan(1);
+			for (const [request] of calls) {
+				expect(
+					Buffer.byteLength(JSON.stringify(request), "utf8"),
+				).toBeLessThanOrEqual(3_500_000);
+			}
+			await shutdownClient();
+			expect(mocks.ingestionBatch).toHaveBeenCalledTimes(calls.length);
+		} finally {
+			restoreTimeouts();
+		}
 	});
 });

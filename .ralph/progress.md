@@ -422,3 +422,47 @@ Verification gates:
 Item-specific evidence: The real registered extension path exported an ephemeral local OTLP trace with one `pi-agent` trace, one `agent.prompt` root, two `agent.turn` spans, two `llm-response` generations, and two concurrent tool spans. The test verified parent IDs, shared trace ID, trace-level redacted input and final output, streaming partial metadata, usage and cost fields, score linkage, tags, release, environment, session and user IDs, raw JSONL records, and secret absence. No dependency audit was named by this item. The credentialed E2E remains skipped because credentials were unavailable; the local HTTP substitute covers the real v5 export path without paid services.
 
 Remaining risks: Credentialed Langfuse ingestion remains unverified. REST fallback, additive telemetry, operator commands, release documentation, and production dependency audit evidence remain for later items. The pre-existing untracked Ralph loop, plan, and prompt files were not staged.
+
+## Iteration start 2026-07-20
+
+Selected item: Telemetry shutdown is bounded and a tested REST fallback preserves completed traces when OTel data is not visible.
+
+Starting Git HEAD: `7b7f5f9384cea6c411a558ead8f36c1873bc2873`.
+
+Decision rationale and assumptions: The plan prioritizes bounded shutdown and fallback ingestion before additive telemetry and operator controls. Prompt completion keeps using `flushClient()`; client and tracer shutdown remain explicit runtime-teardown operations. Each shutdown step uses a finite internal timeout. Completed snapshots drain after bounded prompt flushes and again during final teardown. Each trace gets one fallback attempt, and REST events split into batches no larger than the Langfuse 3.5 MB ingestion limit. The pinned reference repository supplied REST and timeout API evidence only; the local facade and compatibility contract remain authoritative.
+
+## Handoff 2026-07-20
+
+Selected item: Telemetry shutdown is bounded and a tested REST fallback preserves completed traces when OTel data is not visible.
+
+Decision rationale and assumptions: Session-scoped runtime persistence stays unchanged. Prompt flushes now bound OTel and score flushes, drain completed fallback records without shutting down the shared client, and retire each record after its single visibility or REST attempt. Final teardown bounds OTel flush, score flush, client shutdown, and tracer shutdown. The fallback adapter stores shaped and redacted trace facts separately from the aliased `agent.prompt` root observation, preserving the required `pi-agent` trace name.
+
+Changed files:
+- `src/langfuse-client.ts`: adds bounded flush and shutdown orchestration and wires the fallback store and drain.
+- `src/rest-fallback.ts`: adds typed trace and observation snapshots, visibility checks, REST ingestion, single-attempt retirement, and 3.5 MB batch chunking.
+- `src/langfuse-client.test.ts`: covers stalled prompt and shutdown dependencies, shared-runtime persistence, fallback identity and hierarchy, trace I/O, generation usage and cost, tool errors, timestamps, redaction, exactly-once retirement, and oversized batch splitting.
+- `src/langfuse-client.integration.test.ts`: drives the real Langfuse v5 and OTel client against an ephemeral local HTTP server and verifies 404 visibility fallback.
+- `.ralph/items.json`: marks this item passing and records its regression evidence.
+- `.ralph/progress.md`: records this iteration and handoff.
+
+Targeted results:
+- `npm test -- --run src/langfuse-client.test.ts src/langfuse-client.integration.test.ts`: passed 12 tests in 2 files.
+- `npm run typecheck -- --pretty false`: passed.
+- `npx biome check src/langfuse-client.ts src/rest-fallback.ts src/langfuse-client.test.ts src/langfuse-client.integration.test.ts`: passed.
+- `git diff --check 7b7f5f9384cea6c411a558ead8f36c1873bc2873`: passed.
+
+GLM review findings and disposition: GLM reported no material findings and approved the implementation. Its non-blocking note about retaining completed snapshots became covered by the GPT Sol repair; no GLM code fix was required.
+
+GPT Sol review findings and disposition: The trace-name finding was supported and fixed by separating trace-level updates from root-observation updates and asserting `pi-agent` in both fallback tests. The snapshot-retention and batch-size finding was supported and fixed by draining on prompt flush, retiring attempted records, and chunking requests at 3.5 MB. The maintainability finding was supported and fixed by extracting `src/rest-fallback.ts`. No findings were rejected or left unresolved. No second review was launched.
+
+Verification gates:
+- `node -e "const major = Number(process.versions.node.split('.')[0]); if (major < 22) { console.error('Node.js 22+ required'); process.exit(1); }"`: passed.
+- `npx biome check .`: passed with two existing informational configuration messages and no fixes.
+- `npm run typecheck`: passed.
+- `npm test`: passed with 80 tests and 1 credential-gated E2E test skipped.
+- `npm run build`: passed.
+- `npm pack --dry-run`: passed; the 78-file package includes `dist/index.js` and `dist/rest-fallback.js`.
+
+Item-specific evidence: The local HTTP server replaced only the unavailable credentialed Langfuse endpoint. The real v5 client exported OTel data, received a bounded 404 visibility check, and sent the redacted trace, root span, turn, generation, and tool facts through the REST batch API. Unit tests stalled each shutdown dependency independently and verified prompt flush persistence. The oversized payload test verified multiple REST calls whose serialized requests stayed within 3.5 MB. No dependency audit was named by this item, so no audit command was required. Credentialed external ingestion remains unverified.
+
+Remaining risks: Later items still own additive model and health telemetry, operator commands, release documentation, production dependency audit evidence, and credentialed external-ingestion verification. The ignored Ralph loop, plan, and prompt files and generated `dist/` output were not staged.

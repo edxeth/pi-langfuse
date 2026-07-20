@@ -3,7 +3,12 @@ import type { AddressInfo } from "node:net";
 import { trace as otelTrace } from "@opentelemetry/api";
 import { afterEach, describe, expect, it } from "vitest";
 import type { Config } from "./config.js";
-import { flushClient, getRuntime, shutdownClient } from "./langfuse-client.js";
+import {
+	flushClient,
+	getRuntime,
+	setRuntimeTimeoutsForTest,
+	shutdownClient,
+} from "./langfuse-client.js";
 
 const baseConfig: Omit<Config, "host"> = {
 	enabled: true,
@@ -107,6 +112,163 @@ describe("langfuse v5 local runtime", () => {
 			expect(payloads.join("\n")).toContain("first");
 			expect(payloads.join("\n")).toContain("second");
 		} finally {
+			await shutdownClient();
+			await new Promise<void>((resolve, reject) => {
+				server.close((error) => (error ? reject(error) : resolve()));
+			});
+		}
+	});
+
+	it("ingests an invisible completed trace through the REST fallback", async () => {
+		const requests: Array<{ url: string; body: string }> = [];
+		const server = createServer((request, response) => {
+			const chunks: Buffer[] = [];
+			request.on("data", (chunk: Buffer) => chunks.push(chunk));
+			request.on("end", () => {
+				const body = Buffer.concat(chunks).toString("utf8");
+				requests.push({ url: request.url || "", body });
+				if (request.url?.includes("/api/public/traces/")) {
+					response.statusCode = 404;
+					response.end("not found");
+					return;
+				}
+				response.statusCode = 200;
+				response.setHeader("content-type", "application/json");
+				response.end(JSON.stringify({ successes: [], errors: [] }));
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", () => resolve());
+		});
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 500,
+			traceVisibilityMs: 25,
+			pollIntervalMs: 1,
+		});
+
+		try {
+			const address = server.address() as AddressInfo;
+			const runtime = await getRuntime({
+				...baseConfig,
+				host: `http://127.0.0.1:${address.port}`,
+			});
+			const trace = runtime.trace({
+				id: "b".repeat(32),
+				name: "pi-agent",
+				input: "sk-local-test",
+				output: "final answer",
+				sessionId: "rest-fallback-session",
+			});
+			trace.setTraceIO?.({
+				input: "sk-local-test",
+				output: "final answer",
+			});
+			const prompt = runtime.span({ name: "agent.prompt", traceId: trace.id });
+			const turn = runtime.span({
+				name: "agent.turn",
+				traceId: trace.id,
+				parentObservationId: prompt.id,
+			});
+			const generation = runtime.generation({
+				name: "llm-response",
+				traceId: trace.id,
+				parentObservationId: turn.id,
+				model: "fallback-model",
+			});
+			const tool = runtime.span({
+				name: "tool:bash",
+				traceId: trace.id,
+				parentObservationId: turn.id,
+			});
+			generation.end({
+				output: "generated answer",
+				usageDetails: { input: 4, output: 6, total: 10 },
+			});
+			tool.end({ isError: true, statusMessage: "tool failed" });
+			turn.end({ output: "final answer" });
+			prompt.end({ output: "final answer" });
+
+			await shutdownClient();
+
+			const fallbackRequest = requests
+				.map(({ body }) => {
+					try {
+						return JSON.parse(body) as {
+							metadata?: Record<string, unknown>;
+							batch?: Array<{
+								type: string;
+								body: Record<string, unknown>;
+							}>;
+						};
+					} catch {
+						return undefined;
+					}
+				})
+				.find((payload) => payload?.metadata?.fallback === "rest-ingestion");
+			if (!fallbackRequest?.batch) {
+				throw new Error("REST fallback request was not received");
+			}
+			const traceEvent = fallbackRequest.batch.find(
+				(event) => event.type === "trace-create",
+			);
+			const generationEvent = fallbackRequest.batch.find(
+				(event) => event.type === "generation-create",
+			);
+			const toolEvent = fallbackRequest.batch.find(
+				(event) => event.type === "span-create" && event.body.id === tool.id,
+			);
+			expect(fallbackRequest.metadata).toMatchObject({
+				fallback: "rest-ingestion",
+				reason: "otel-trace-not-visible-after-flush",
+			});
+			expect(fallbackRequest.batch).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						type: "trace-create",
+						body: expect.objectContaining({
+							id: trace.id,
+							output: "final answer",
+							sessionId: "rest-fallback-session",
+						}),
+					}),
+					expect.objectContaining({
+						type: "span-create",
+						body: expect.objectContaining({
+							id: turn.id,
+							parentObservationId: prompt.id,
+						}),
+					}),
+				]),
+			);
+			if (!traceEvent || !generationEvent || !toolEvent) {
+				throw new Error("REST fallback observations are incomplete");
+			}
+			expect(traceEvent.body).toMatchObject({
+				name: "pi-agent",
+				input: expect.stringContaining("[REDACTED:"),
+			});
+			expect(generationEvent.body).toMatchObject({
+				id: generation.id,
+				traceId: trace.id,
+				parentObservationId: turn.id,
+				model: "fallback-model",
+				usageDetails: { input: 4, output: 6, total: 10 },
+			});
+			expect(toolEvent.body).toMatchObject({
+				traceId: trace.id,
+				parentObservationId: turn.id,
+				level: "ERROR",
+				statusMessage: "tool failed",
+			});
+			for (const event of fallbackRequest.batch) {
+				if (event.type === "trace-create") continue;
+				expect(event.body.startTime).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+				expect(event.body.endTime).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+			}
+			expect(JSON.stringify(fallbackRequest)).not.toContain("sk-local-test");
+		} finally {
+			restoreTimeouts();
 			await shutdownClient();
 			await new Promise<void>((resolve, reject) => {
 				server.close((error) => (error ? reject(error) : resolve()));

@@ -18,6 +18,18 @@ import {
 	shapeLangfuseTraceBody,
 } from "./payload-policy.js";
 import { sanitizeForTelemetry } from "./redaction.js";
+import {
+	completeTrace,
+	createRestFallbackStore,
+	drainCompletedRestFallback,
+	endObservation,
+	type RestFallbackObservationBody,
+	type RestFallbackStore,
+	recordObservation,
+	recordTrace,
+	updateObservation,
+	updateTrace,
+} from "./rest-fallback.js";
 
 type LangfuseMetadata = Record<string, unknown>;
 
@@ -155,6 +167,7 @@ interface RuntimeState {
 	readonly scoreClient: LangfuseClient;
 	readonly observations: Map<string, VendorObservation>;
 	readonly traces: Map<string, RuntimeTrace>;
+	readonly fallbackStore: RestFallbackStore;
 }
 
 class RuntimeIdGenerator {
@@ -180,6 +193,32 @@ class RuntimeIdGenerator {
 let runtime: RuntimeState | null = null;
 let runtimeTransition: Promise<void> = Promise.resolve();
 let registeredContextManager: AsyncHooksContextManager | undefined;
+const DEFAULT_SHUTDOWN_STEP_TIMEOUT_MS = 2_000;
+const DEFAULT_TRACE_VISIBILITY_TIMEOUT_MS = 1_500;
+const TRACE_VISIBILITY_POLL_INTERVAL_MS = 200;
+let shutdownStepTimeoutMs = DEFAULT_SHUTDOWN_STEP_TIMEOUT_MS;
+let traceVisibilityTimeoutMs = DEFAULT_TRACE_VISIBILITY_TIMEOUT_MS;
+let traceVisibilityPollIntervalMs = TRACE_VISIBILITY_POLL_INTERVAL_MS;
+
+export function setRuntimeTimeoutsForTest(timeouts: {
+	shutdownStepMs: number;
+	traceVisibilityMs: number;
+	pollIntervalMs: number;
+}) {
+	const previous = {
+		shutdownStepMs: shutdownStepTimeoutMs,
+		traceVisibilityMs: traceVisibilityTimeoutMs,
+		pollIntervalMs: traceVisibilityPollIntervalMs,
+	};
+	shutdownStepTimeoutMs = timeouts.shutdownStepMs;
+	traceVisibilityTimeoutMs = timeouts.traceVisibilityMs;
+	traceVisibilityPollIntervalMs = timeouts.pollIntervalMs;
+	return () => {
+		shutdownStepTimeoutMs = previous.shutdownStepMs;
+		traceVisibilityTimeoutMs = previous.traceVisibilityMs;
+		traceVisibilityPollIntervalMs = previous.pollIntervalMs;
+	};
+}
 
 function isBase64DataUri(value: string): boolean {
 	return /^data:[^,;]+(?:;[^,;]+)*;base64,[A-Za-z0-9+/=_-]+$/i.test(value);
@@ -380,6 +419,19 @@ function createTrace(
 		),
 	);
 	const vendorRoot = root as unknown as VendorObservation;
+	const fallback = recordTrace(rt.fallbackStore, {
+		id: vendorRoot.traceId,
+		timestamp: new Date().toISOString(),
+		body: shaped,
+	});
+	recordObservation(rt.fallbackStore, {
+		id: vendorRoot.id,
+		traceId: vendorRoot.traceId,
+		name: "agent.prompt",
+		type: "SPAN",
+		startTime: fallback.timestamp,
+		body: shaped,
+	});
 	const initialTraceIO = traceIOAttributes(shaped);
 	if (
 		initialTraceIO.input !== undefined ||
@@ -407,6 +459,8 @@ function createTrace(
 					runtimeTrace.lastUpdate,
 					shapedUpdate,
 				);
+				updateTrace(rt.fallbackStore, vendorRoot.traceId, shapedUpdate);
+				updateObservation(rt.fallbackStore, vendorRoot.id, shapedUpdate);
 				runWithVendorContext(vendorRoot, () => {
 					propagateAttributes(
 						propagationAttributes(runtimeTrace.lastUpdate),
@@ -432,14 +486,31 @@ function createTrace(
 					runtimeTrace.lastUpdate,
 					shapedIO,
 				);
+				updateTrace(rt.fallbackStore, vendorRoot.traceId, shapedIO);
+				updateObservation(rt.fallbackStore, vendorRoot.id, shapedIO);
 				runWithVendorContext(vendorRoot, () => {
 					vendorRoot.setTraceIO(shapedIO);
 				});
 			},
 			end(endBody) {
 				if (runtimeTrace.ended) return;
-				if (endBody) vendorRoot.update(observationAttributes(endBody));
+				const shapedEnd = endBody
+					? (shapeBody(config, endBody, (policyConfig, value) =>
+							shapeLangfuseObservationBody(policyConfig, "agent.prompt", value),
+						) as ObservationBody)
+					: undefined;
+				if (shapedEnd) {
+					updateTrace(rt.fallbackStore, vendorRoot.traceId, shapedEnd);
+					updateObservation(rt.fallbackStore, vendorRoot.id, shapedEnd);
+					vendorRoot.update(observationAttributes(shapedEnd));
+				}
 				runtimeTrace.ended = true;
+				endObservation(
+					rt.fallbackStore,
+					vendorRoot.id,
+					new Date().toISOString(),
+				);
+				completeTrace(rt.fallbackStore, vendorRoot.traceId);
 				vendorRoot.end();
 				removeObservation(rt, vendorRoot);
 			},
@@ -467,6 +538,7 @@ function wrapObservation<T extends LangfuseSpan | LangfuseGeneration>(
 	const rootTrace = Array.from(rt.traces.values()).find(
 		(trace) => trace.root.id === observation.id,
 	);
+	const fallback = rt.fallbackStore.traces.get(observation.traceId);
 	const update = (body?: ObservationBody) => {
 		if (!body || ended) return;
 		const shaped = shapeBody(config, body, (policyConfig, value) =>
@@ -486,6 +558,7 @@ function wrapObservation<T extends LangfuseSpan | LangfuseGeneration>(
 		if (rootTrace) {
 			rootTrace.lastUpdate = effective as TraceUpdateBody;
 		}
+		updateObservation(rt.fallbackStore, observation.id, shaped);
 		observation.update(observationAttributes(effective));
 	};
 	const wrapped = {
@@ -496,6 +569,15 @@ function wrapObservation<T extends LangfuseSpan | LangfuseGeneration>(
 			if (ended) return;
 			update(body);
 			ended = true;
+			endObservation(
+				rt.fallbackStore,
+				observation.id,
+				new Date().toISOString(),
+			);
+			if (rootTrace && fallback) {
+				rootTrace.ended = true;
+				completeTrace(rt.fallbackStore, observation.traceId);
+			}
 			observation.end();
 			removeObservation(rt, observation);
 		},
@@ -534,6 +616,17 @@ function createObservation(
 				{ asType },
 			);
 	rt.observations.set(observation.id, observation);
+	if (rt.fallbackStore.traces.has(shaped.traceId)) {
+		recordObservation(rt.fallbackStore, {
+			id: observation.id,
+			traceId: observation.traceId,
+			name: shaped.name,
+			type: asType === "generation" ? "GENERATION" : "SPAN",
+			startTime: new Date().toISOString(),
+			parentObservationId: parent?.id,
+			body: shaped as RestFallbackObservationBody,
+		});
+	}
 	return observation;
 }
 
@@ -622,27 +715,61 @@ function createRuntime(config: Config): RuntimeState {
 		}),
 		observations: new Map(),
 		traces: new Map(),
+		fallbackStore: createRestFallbackStore(),
 	};
+}
+
+async function withTimeout<T>(
+	label: string,
+	operation: Promise<T> | undefined,
+	timeoutMs = shutdownStepTimeoutMs,
+	onTimeout?: () => void,
+): Promise<T | undefined> {
+	if (!operation) return undefined;
+	let timer: NodeJS.Timeout | undefined;
+	try {
+		return await Promise.race([
+			Promise.resolve(operation),
+			new Promise<undefined>((resolve) => {
+				timer = setTimeout(() => {
+					onTimeout?.();
+					console.warn(`📊 Langfuse: ${label} timed out after ${timeoutMs}ms`);
+					resolve(undefined);
+				}, timeoutMs);
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
 }
 
 async function shutdownRuntime(rt: RuntimeState) {
 	try {
-		await rt.tracerProvider.forceFlush();
+		await withTimeout("OTel force flush", rt.tracerProvider.forceFlush());
 	} catch (error) {
 		console.warn("📊 Langfuse: Failed to flush OpenTelemetry spans", error);
 	}
 	try {
-		await rt.scoreClient.flush();
+		await drainCompletedRestFallback(rt.fallbackStore, rt.scoreClient, {
+			requestTimeoutMs: shutdownStepTimeoutMs,
+			visibilityTimeoutMs: traceVisibilityTimeoutMs,
+			pollIntervalMs: traceVisibilityPollIntervalMs,
+		});
+	} catch (error) {
+		console.warn("📊 Langfuse: Failed REST fallback ingestion", error);
+	}
+	try {
+		await withTimeout("Langfuse score flush", rt.scoreClient.flush());
 	} catch (error) {
 		console.warn("📊 Langfuse: Failed to flush Langfuse scores", error);
 	}
 	try {
-		await rt.scoreClient.shutdown();
+		await withTimeout("Langfuse client shutdown", rt.scoreClient.shutdown());
 	} catch (error) {
 		console.warn("📊 Langfuse: Failed to shut down Langfuse client", error);
 	}
 	try {
-		await rt.tracerProvider.shutdown();
+		await withTimeout("OTel tracer shutdown", rt.tracerProvider.shutdown());
 	} catch (error) {
 		console.warn("📊 Langfuse: Failed to shut down OpenTelemetry", error);
 	}
@@ -669,8 +796,32 @@ async function withRuntimeTransition<T>(
 export function flushClient() {
 	return withRuntimeTransition(async () => {
 		if (!runtime) return;
-		await runtime.tracerProvider.forceFlush();
-		await runtime.scoreClient.flush();
+		try {
+			await withTimeout(
+				"OTel force flush",
+				runtime.tracerProvider.forceFlush(),
+			);
+		} catch (error) {
+			console.warn("📊 Langfuse: Failed to flush OpenTelemetry spans", error);
+		}
+		try {
+			await drainCompletedRestFallback(
+				runtime.fallbackStore,
+				runtime.scoreClient,
+				{
+					requestTimeoutMs: shutdownStepTimeoutMs,
+					visibilityTimeoutMs: traceVisibilityTimeoutMs,
+					pollIntervalMs: traceVisibilityPollIntervalMs,
+				},
+			);
+		} catch (error) {
+			console.warn("📊 Langfuse: Failed REST fallback ingestion", error);
+		}
+		try {
+			await withTimeout("Langfuse score flush", runtime.scoreClient.flush());
+		} catch (error) {
+			console.warn("📊 Langfuse: Failed to flush Langfuse scores", error);
+		}
 	});
 }
 

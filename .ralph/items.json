@@ -162,8 +162,8 @@
 				"When a completed trace is not visible after a bounded check, ingest it through the Langfuse REST batch API exactly once.",
 				"Stall each shutdown dependency independently and verify completion remains bounded; verify fallback preserves trace ID, parent IDs, trace I/O, generation model and usage fields, tool errors, timestamps, and redaction."
 			],
-			"passes": false,
-			"regression_notes": ""
+			"passes": true,
+			"regression_notes": "Added a typed REST fallback adapter with bounded OTel, score, client, and tracer flush/shutdown; redacted completed-trace snapshots; prompt-flush draining; exactly-once retirement; trace-name preservation; parent, trace-I/O, generation, tool-error, timestamp, and redaction retention; and 3.5 MB batch chunking. Targeted runtime and ephemeral local HTTP tests passed. Full gates passed with 80 tests and 1 credential-gated E2E skipped. GLM approved. GPT Sol's supported trace-name, snapshot-retention/batch-size, and fallback-module findings were fixed; no second review was launched."
 		},
 		{
 			"category": "observability",
