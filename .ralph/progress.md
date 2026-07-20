@@ -198,3 +198,43 @@ Verification gates:
 Item-specific evidence: The registered extension harness exercised the real public event path through multiple turns, context snapshots, provider request and response metadata including retry and terminal status, normal and missing message-start responses, thinking/text streaming, tool-call assistant messages, generation finalization, usage/cost score creation, and correct `agent.turn` parentage. The package build and dry-run include the new compiled generation handler while retaining `dist/index.js`. The credentialed external E2E remained skipped because credentials were unavailable; no dependency audit was required by this item.
 
 Remaining risks: Host-shaped events do not provide cross-turn request IDs, so arbitrary concurrent response reordering cannot be distinguished beyond the active-turn boundary; later lifecycle/idempotency work must define that contract. Tool handler extraction, privacy budgets, Langfuse v5 and OpenTelemetry transport, fallback ingestion, additive telemetry, operator commands, and release documentation remain for later items.
+
+## Handoff 2026-07-20
+
+Selected item: Tool lifecycle behavior is owned by a dedicated handler with concurrent toolCallId correlation and unchanged raw and Langfuse output.
+
+Starting Git HEAD: `d200ca6277d269bec976d7c9e03797e2cde35d02`.
+
+Decision rationale and assumptions: The plan places tool lifecycle ownership after prompt, turn, and generation seams. `toolCallId` identifies one semantic call across `tool_call` and `tool_execution_start`, and across `tool_result` and `tool_execution_end`. `tool_result` remains provisional so later Pi result handlers can change content or `isError`; `tool_execution_end` supplies the authoritative normal completion. A result-only call completes during prompt cleanup without the abandoned marker. A call with no result completes as an interrupted tool. Completed tool state stays in the session map until prompt cleanup so a late companion event cannot create a second span. The compatibility harness replaces only the unavailable Langfuse transport with an in-memory fake; the registered extension event path, shaping, raw trace writer, redaction, and cleanup remain real.
+
+Changed files:
+- `src/tool-lifecycle.ts`: owns tool start, update, result, end, span creation, correlation, completion, and interruption cleanup.
+- `src/index.ts`: wires the dedicated tool handlers and removes the inline tool lifecycle implementation.
+- `src/agent-lifecycle.ts`: delegates pending tool cleanup while preserving the synchronous no-tool ownership path.
+- `src/lifecycle-types.ts`: adds per-tool span, completion, error, turn, and parent ownership state.
+- `src/compatibility.test.ts`: adds registered-path coverage for concurrent tools, both start events, out-of-order completion, progress, images, provisional and final status, result-only completion, interruption, parentage, raw records, redaction, and exact span end counts.
+- `.ralph/items.json`: marks this item passing and records its regression evidence.
+- `.ralph/progress.md`: records this handoff.
+
+Targeted results:
+- Baseline `npm test -- --run src/compatibility.test.ts`: failed 1 test and passed 8 tests because the baseline ignored a `tool_call`-first semantic call and emitted no `tool_call` raw record.
+- Final `npm test -- --run src/compatibility.test.ts src/index.test.ts`: passed 17 tests in 2 files after implementation and review fixes.
+- `npm run typecheck`: passed.
+- `npx biome check src/index.ts src/agent-lifecycle.ts src/lifecycle-types.ts src/tool-lifecycle.ts src/compatibility.test.ts`: passed.
+- `git diff --check HEAD`: passed.
+
+GLM review findings and disposition: GLM reported no material findings. Its minor observations about retaining completed tools until prompt cleanup and repeated argument summarization were retained because the map retention accepts late companion events without duplicate spans, cleanup clears it, and the extra bounded shaping work does not change behavior. The review also noted that the fake did not detect duplicate end calls; the GPT Sol review fix added an end-call counter assertion.
+
+GPT Sol review findings and disposition: The P1 finding at `src/tool-lifecycle.ts` was supported. The handler previously ended spans from provisional `tool_result` data, so a later Pi handler or final `tool_execution_end` could not correct status or output. The handler now stores provisional result data, finalizes normal completion from `tool_execution_end`, replaces provisional output with the final result, and completes result-only calls during cleanup without marking them abandoned. The P2 test gaps were supported and fixed with progress assertions, exact end-call counts, mismatched provisional and final status, and a result-only call. No other material finding remained. No second review was launched.
+
+Verification gates:
+- `node -e "const major = Number(process.versions.node.split('.')[0]); if (major < 22) { console.error('Node.js 22+ required'); process.exit(1); }"`: passed on Node.js 26.
+- `npx biome check .`: passed for 34 files.
+- `npm run typecheck`: passed.
+- `npm test`: passed with 58 tests and 1 credential-gated E2E test skipped.
+- `npm run build`: passed.
+- `npm pack --dry-run`: passed and listed 70 files, including `dist/index.js` and `dist/tool-lifecycle.js`.
+
+Item-specific evidence: The registered extension harness exercised `tool_call`-first and `tool_execution_start`-first calls, duplicate start ownership, concurrent tools, out-of-order completion, progress updates, image content, final errors, a result-only call, a missing completion, session shutdown cleanup, trace and turn parentage, one end call per span, and unchanged raw tool record types and fields. The build and package dry-run compiled and included the new handler while retaining `dist/index.js`. No dependency audit was required by this item. The credentialed external E2E remained skipped because credentials were unavailable; local telemetry tests used the documented in-memory transport substitute without paid services.
+
+Remaining risks: Completed tool entries remain in `activeTools` until prompt cleanup, and external Langfuse ingestion remains unverified. Broader duplicate and out-of-order lifecycle events, privacy budgets, Langfuse v5 and OpenTelemetry transport, fallback ingestion, additive telemetry, operator commands, and release documentation remain outside this item.

@@ -66,6 +66,15 @@ export interface ToolState {
 	toolName: string;
 	startedAt: number;
 	span?: LangfuseSpan;
+	spanStartPromise?: Promise<void>;
+	spanEnded?: boolean;
+	finishPromise?: Promise<void>;
+	completionSeen?: boolean;
+	resultSeen?: boolean;
+	executionEndSeen?: boolean;
+	errorCounted?: boolean;
+	turnIndex?: number;
+	parentObservationId?: string;
 	argsSummary: string;
 	argsRaw?: unknown;
 	partialOutput?: string;

@@ -75,6 +75,7 @@ const telemetry = vi.hoisted(() => {
 				}),
 				end: vi.fn((end: Record<string, unknown>) => {
 					record.end = end;
+					record.endCalls = Number(record.endCalls ?? 0) + 1;
 				}),
 			};
 		}),
@@ -1779,6 +1780,263 @@ describe("executable compatibility contract", () => {
 		);
 
 		await handler("session_shutdown")({}, context);
+	});
+
+	it("correlates concurrent tool lifecycle events through registered handlers", async () => {
+		const agentDir = tempRoot("pi-langfuse-tool-agent-");
+		const rawTraceDir = join(agentDir, "raw-traces");
+		const sessionFile =
+			"/tmp/pi-agent/sessions/--tool-project--/tool-session.jsonl";
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "tool-public",
+			"secret-key": "tool-secret",
+			"base-url": "http://tool-host",
+			"raw-trace-enabled": true,
+			"raw-trace-dir": rawTraceDir,
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+
+		const context = {
+			model: { id: "tool-model", provider: "tool-provider" },
+			sessionManager: {
+				getSessionFile: () => sessionFile,
+				getSessionId: () => "tool-session",
+			},
+		};
+		const handler = (name: string) => eventHandler(pi, name);
+
+		await handler("session_start")({ reason: "startup" }, context);
+		await handler("model_select")(
+			{ model: { id: "tool-model", provider: "tool-provider" } },
+			context,
+		);
+		await handler("before_agent_start")(
+			{
+				prompt: "tool prompt",
+				systemPrompt: "tool system",
+				systemPromptOptions: { cwd: "/tmp/tool-project" },
+			},
+			context,
+		);
+		await handler("agent_start")({}, context);
+		await handler("turn_start")({ turnIndex: 0 }, context);
+
+		await Promise.all([
+			handler("tool_call")(
+				{
+					toolCallId: "tool-a",
+					toolName: "bash",
+					input: { command: "echo a" },
+				},
+				context,
+			),
+			handler("tool_execution_start")(
+				{
+					toolCallId: "tool-b",
+					toolName: "read",
+					args: { path: "/tmp/b.txt" },
+				},
+				context,
+			),
+		]);
+		await handler("tool_execution_start")(
+			{
+				toolCallId: "tool-a",
+				toolName: "bash",
+				args: { command: "echo a" },
+			},
+			context,
+		);
+		await Promise.all([
+			handler("tool_execution_update")(
+				{
+					toolCallId: "tool-a",
+					toolName: "bash",
+					args: { command: "echo a" },
+					partialResult: { content: [{ type: "text", text: "partial a" }] },
+				},
+				context,
+			),
+			handler("tool_execution_update")(
+				{
+					toolCallId: "tool-b",
+					toolName: "read",
+					args: { path: "/tmp/b.txt" },
+					partialResult: {
+						content: [{ type: "image", data: "data:image/png;base64,AAAA" }],
+					},
+				},
+				context,
+			),
+		]);
+		await handler("tool_execution_start")(
+			{
+				toolCallId: "tool-c",
+				toolName: "edit",
+				args: { path: "/tmp/c.txt" },
+			},
+			context,
+		);
+		await handler("tool_execution_update")(
+			{
+				toolCallId: "tool-c",
+				toolName: "edit",
+				args: { path: "/tmp/c.txt" },
+				partialResult: { content: [{ type: "text", text: "partial c" }] },
+			},
+			context,
+		);
+		await handler("tool_execution_start")(
+			{
+				toolCallId: "tool-d",
+				toolName: "write",
+				args: { path: "/tmp/d.txt" },
+			},
+			context,
+		);
+
+		// Completion events arrive out of order. Each event is independently usable,
+		// and a later companion event must not create or end another span.
+		await handler("tool_result")(
+			{
+				toolCallId: "tool-b",
+				toolName: "read",
+				input: { path: "/tmp/b.txt" },
+				content: [
+					{ type: "text", text: "provisional read" },
+					{ type: "image", data: "data:image/png;base64,BBBB" },
+				],
+				isError: false,
+			},
+			context,
+		);
+		await handler("tool_result")(
+			{
+				toolCallId: "tool-d",
+				toolName: "write",
+				input: { path: "/tmp/d.txt" },
+				content: [{ type: "text", text: "result-only" }],
+				isError: false,
+			},
+			context,
+		);
+		await handler("tool_execution_end")(
+			{
+				toolCallId: "tool-a",
+				toolName: "bash",
+				result: { content: [{ type: "text", text: "result a" }] },
+				isError: false,
+			},
+			context,
+		);
+		await handler("tool_execution_end")(
+			{
+				toolCallId: "tool-b",
+				toolName: "read",
+				result: { content: [{ type: "text", text: "read failed" }] },
+				isError: true,
+			},
+			context,
+		);
+
+		await handler("session_shutdown")({}, context);
+		drainRawTraceQueue();
+
+		const trace = latestRecord(telemetry.state.traces, "pi-agent");
+		const turn = latestRecord(telemetry.state.observations, "agent.turn");
+		const tools = telemetry.state.observations.filter((record) =>
+			["tool:bash", "tool:read", "tool:edit", "tool:write"].includes(
+				record.name || "",
+			),
+		);
+		expect(tools).toHaveLength(4);
+		expect(tools.map((tool) => tool.name)).toEqual(
+			expect.arrayContaining([
+				"tool:bash",
+				"tool:read",
+				"tool:edit",
+				"tool:write",
+			]),
+		);
+		for (const tool of tools) {
+			expect(tool.traceId).toBe(trace.id);
+			expect(tool.parentObservationId).toBe(turn.id);
+			expect(tool.endCalls).toBe(1);
+			expect(tool.end).toMatchObject({
+				metadata: { durationMs: expect.any(Number) },
+			});
+		}
+		expect(
+			latestRecord(telemetry.state.observations, "tool:bash").lastUpdate,
+		).toMatchObject({
+			output: "partial a",
+			metadata: { partial: true, tool: "bash" },
+		});
+		expect(
+			latestRecord(telemetry.state.observations, "tool:bash").end,
+		).toMatchObject({
+			isError: false,
+			output: "result a",
+		});
+		expect(
+			latestRecord(telemetry.state.observations, "tool:read").end,
+		).toMatchObject({
+			isError: true,
+			output: "read failed",
+		});
+		expect(
+			latestRecord(telemetry.state.observations, "tool:edit").end,
+		).toMatchObject({
+			isError: true,
+			statusMessage: "tool ended without completion event",
+			metadata: { abandoned: true },
+		});
+		const resultOnlyEnd = latestRecord(
+			telemetry.state.observations,
+			"tool:write",
+		).end as Record<string, unknown>;
+		expect(resultOnlyEnd).toMatchObject({
+			isError: false,
+			output: "result-only",
+		});
+		expect(resultOnlyEnd.metadata).not.toHaveProperty("abandoned");
+		expect(
+			latestRecord(telemetry.state.traces, "pi-agent").lastUpdate,
+		).toMatchObject({
+			metadata: { toolCalls: 4, toolErrors: 1 },
+		});
+
+		const rawPath = join(rawTraceDir, "--tool-project--", "tool-session.jsonl");
+		const records = readFileSync(rawPath, "utf-8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+		expect(
+			records.filter((record) => record.type === "tool_call"),
+		).toHaveLength(1);
+		expect(
+			records.filter((record) => record.type === "tool_execution_start"),
+		).toHaveLength(4);
+		expect(
+			records.filter((record) => record.type === "tool_result_first_seen"),
+		).toHaveLength(2);
+		expect(
+			records.filter((record) => record.type === "tool_execution_end"),
+		).toHaveLength(2);
+		expect(rawRecord(records, "tool_result_first_seen")).toMatchObject({
+			toolCallId: "tool-b",
+			contentSummary:
+				"provisional read\n[1 image content block(s) from tool result]",
+			imgBlocks: 1,
+			isError: false,
+		});
+		expect(
+			records
+				.filter((record) => record.type === "tool_execution_end")
+				.map((record) => record.toolCallId),
+		).toEqual(expect.arrayContaining(["tool-a", "tool-b"]));
 	});
 
 	it("keeps the compiled package entrypoint loadable", async () => {

@@ -42,6 +42,7 @@ export interface AgentLifecycleDependencies {
 	truncate: typeof truncate;
 	extractTextFromContent: typeof extractTextFromContent;
 	abandonTurnGenerations: (turn: TurnState) => Promise<void>;
+	abandonTools: (state: SessionState<PromptState>) => Promise<void>;
 }
 
 export interface AgentLifecycleHandlers {
@@ -69,22 +70,7 @@ export function createAgentLifecycleHandlers(
 		const prompt = state.promptState;
 		if (!prompt) return;
 
-		for (const [, tool] of prompt.activeTools) {
-			tool.span?.end({
-				isError: tool.isError ?? true,
-				output: tool.resultOutput || tool.partialOutput,
-				statusMessage: tool.isError
-					? "tool error"
-					: "tool ended without completion event",
-				metadata: {
-					tool: tool.toolName,
-					argsSummary: tool.argsSummary,
-					durationMs: Date.now() - tool.startedAt,
-					abandoned: true,
-				},
-			});
-		}
-		prompt.activeTools.clear();
+		if (prompt.activeTools.size > 0) await deps.abandonTools(state);
 
 		for (const [, turn] of prompt.activeTurns) {
 			await deps.abandonTurnGenerations(turn);

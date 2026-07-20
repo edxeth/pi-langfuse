@@ -12,7 +12,7 @@ import {
 import { exportRedactedData } from "./export.js";
 import { createGenerationLifecycleHandlers } from "./generation-lifecycle.js";
 import { flushClient, getClient, shutdownClient } from "./langfuse-client.js";
-import type { PromptState, ToolState } from "./lifecycle-types.js";
+import type { PromptState } from "./lifecycle-types.js";
 import { ensureLocalLangfuseStarted } from "./local-autostart.js";
 import { runLangfuseInit } from "./local-init.js";
 import { appendRawTrace, drainRawTraceQueue } from "./raw-trace.js";
@@ -32,7 +32,6 @@ import {
 import {
 	buildTraceTags,
 	costDetailsFromUsage,
-	currentTurnIndex,
 	estimateJsonBytes,
 	extractTextFromContent,
 	getRuntimeName,
@@ -51,6 +50,7 @@ import {
 	usageDetailsFromUsage,
 	writeRawTrace,
 } from "./telemetry-helpers.js";
+import { createToolLifecycleHandlers } from "./tool-lifecycle.js";
 import { createTurnLifecycleHandlers } from "./turn-lifecycle.js";
 
 const LANGFUSE_STATUS_KEY = "pi-langfuse:status";
@@ -170,6 +170,17 @@ export default async function (pi: ExtensionAPI) {
 		writeRawTrace,
 	});
 
+	const toolLifecycle = createToolLifecycleHandlers({
+		getConfig: () => resolveConfig(settings),
+		getSessionState,
+		canTrace,
+		getClient,
+		redactToolContent,
+		summarizeToolArgs,
+		summarizeToolResult,
+		writeRawTrace,
+	});
+
 	const agentLifecycle = createAgentLifecycleHandlers({
 		getConfig: () => resolveConfig(settings),
 		updateStatus: (ctx, config) => {
@@ -191,6 +202,7 @@ export default async function (pi: ExtensionAPI) {
 		truncate,
 		extractTextFromContent,
 		abandonTurnGenerations: generationLifecycle.abandonTurn,
+		abandonTools: toolLifecycle.abandon,
 	});
 	const turnLifecycle = createTurnLifecycleHandlers({
 		getConfig: () => resolveConfig(settings),
@@ -315,158 +327,11 @@ export default async function (pi: ExtensionAPI) {
 	// Capture context and generation lifecycle through the dedicated generation handler.
 	pi.on("context", generationLifecycle.context);
 
-	pi.on("tool_call", async (event, ctx) => {
-		const state = getTypedSessionState(ctx);
-		const prompt = state?.promptState;
-		const tool = prompt?.activeTools.get(event.toolCallId);
-		if (!state || !prompt || !tool) return;
-		const config = resolveConfig(settings);
-		tool.argsSummary = summarizeToolArgs(config, event.toolName, event.input);
-		tool.argsRaw = event.input;
-		writeRawTrace(config, state, {
-			type: "tool_call",
-			turnIndex: currentTurnIndex(prompt),
-			toolCallId: event.toolCallId,
-			toolName: event.toolName,
-			input: event.input,
-		});
-		tool.span?.update?.({
-			input: tool.argsSummary,
-			metadata: {
-				tool: event.toolName,
-				argsSummary: tool.argsSummary,
-			},
-		});
-	});
-
-	pi.on("tool_execution_start", async (event, ctx) => {
-		const state = getTypedSessionState(ctx);
-		const prompt = state?.promptState;
-		if (!state || !prompt) return;
-		const config = resolveConfig(settings);
-
-		prompt.toolCalls += 1;
-		const activeTurns = Array.from(prompt.activeTurns.values());
-		const activeTurn =
-			activeTurns.length > 0 ? activeTurns[activeTurns.length - 1] : undefined;
-		const toolState: ToolState = {
-			toolName: event.toolName,
-			startedAt: Date.now(),
-			argsSummary: summarizeToolArgs(config, event.toolName, event.args),
-			argsRaw: event.args,
-		};
-		prompt.activeTools.set(event.toolCallId, toolState);
-		writeRawTrace(config, state, {
-			type: "tool_execution_start",
-			turnIndex: activeTurn?.index,
-			toolCallId: event.toolCallId,
-			toolName: event.toolName,
-			args: event.args,
-		});
-
-		if (!canTrace(config) || !prompt.trace) return;
-		try {
-			const lf = await getClient(config);
-			if (
-				state.promptState !== prompt ||
-				prompt.activeTools.get(event.toolCallId) !== toolState
-			)
-				return;
-			toolState.span = lf.span({
-				name: `tool:${event.toolName}`,
-				traceId: prompt.trace.id,
-				parentObservationId: activeTurn?.span?.id || prompt.promptSpan?.id,
-				input: toolState.argsSummary,
-				metadata: {
-					tool: event.toolName,
-					toolCallId: event.toolCallId,
-					argsSummary: toolState.argsSummary,
-					turnIndex: activeTurn?.index,
-				},
-			});
-		} catch (e) {
-			console.warn("📊 Langfuse: Failed to create tool span", e);
-		}
-	});
-
-	pi.on("tool_execution_update", async (event, ctx) => {
-		const state = getTypedSessionState(ctx);
-		const tool = state?.promptState?.activeTools.get(event.toolCallId);
-		if (!state || !tool) return;
-		const config = resolveConfig(settings);
-		if (!config.captureToolProgress) return;
-		tool.partialOutput = summarizeToolResult(config, event.partialResult);
-		tool.span?.update?.({
-			output: tool.partialOutput,
-			metadata: {
-				partial: true,
-				tool: tool.toolName,
-			},
-		});
-	});
-
-	pi.on("tool_result", async (event, ctx) => {
-		const state = getTypedSessionState(ctx);
-		const prompt = state?.promptState;
-		const tool = prompt?.activeTools.get(event.toolCallId);
-		if (!state || !prompt || !tool) return;
-		const config = resolveConfig(settings);
-		tool.resultOutput = summarizeToolResult(config, { content: event.content });
-		tool.isError = event.isError;
-		const imgCount = (event.content ?? []).filter(
-			(c: { type: string }) => c.type === "image" || c.type === "image_url",
-		).length;
-		writeRawTrace(config, state, {
-			type: "tool_result_first_seen",
-			turnIndex: currentTurnIndex(prompt),
-			toolCallId: event.toolCallId,
-			toolName: event.toolName,
-			inputSummary: summarizeToolArgs(config, event.toolName, event.input),
-			contentSummary: redactToolContent(config, { content: event.content }),
-			contentTruncated: false,
-			imgBlocks: imgCount || undefined,
-			isError: event.isError,
-		});
-	});
-
-	pi.on("tool_execution_end", async (event, ctx) => {
-		const state = getTypedSessionState(ctx);
-		const prompt = state?.promptState;
-		const tool = prompt?.activeTools.get(event.toolCallId);
-		if (!state || !prompt || !tool) return;
-		const config = resolveConfig(settings);
-		tool.isError = event.isError;
-		if (event.isError) {
-			prompt.toolErrors += 1;
-		}
-		const durationMs = Date.now() - tool.startedAt;
-		writeRawTrace(config, state, {
-			type: "tool_execution_end",
-			turnIndex: currentTurnIndex(prompt),
-			toolCallId: event.toolCallId,
-			toolName: event.toolName,
-			argsSummary: tool.argsSummary,
-			resultSummary: redactToolContent(config, event.result),
-			resultTruncated: false,
-			isError: event.isError,
-			durationMs,
-		});
-		const output =
-			tool.resultOutput ||
-			summarizeToolResult(config, event.result) ||
-			tool.partialOutput;
-		tool.span?.end({
-			isError: event.isError,
-			output: output || undefined,
-			statusMessage: event.isError ? "tool execution failed" : undefined,
-			metadata: {
-				tool: tool.toolName,
-				argsSummary: tool.argsSummary,
-				durationMs,
-			},
-		});
-		prompt.activeTools.delete(event.toolCallId);
-	});
+	pi.on("tool_call", toolLifecycle.toolCall);
+	pi.on("tool_execution_start", toolLifecycle.toolExecutionStart);
+	pi.on("tool_execution_update", toolLifecycle.toolExecutionUpdate);
+	pi.on("tool_result", toolLifecycle.toolResult);
+	pi.on("tool_execution_end", toolLifecycle.toolExecutionEnd);
 
 	pi.on("message_start", generationLifecycle.messageStart);
 	pi.on("message_update", generationLifecycle.messageUpdate);

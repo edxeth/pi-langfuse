@@ -102,8 +102,8 @@
 				"Exercise concurrent tools completing out of order, progress updates, image blocks, errors, missing completion, and interruption.",
 				"Assert one tool:<name> span per semantic call, correct parentage, duration and error metadata, and unchanged raw tool record formats."
 			],
-			"passes": false,
-			"regression_notes": ""
+			"passes": true,
+			"regression_notes": "Added registered-handler coverage for both start events, toolCallId correlation, concurrent out-of-order tools, progress updates, image blocks, provisional versus final completion status, result-only completion, interruption cleanup, one span/end call, parentage, duration/error metadata, raw record shapes, and redaction. Targeted tests, full gates, build, and package dry-run passed. GLM found no material issues. GPT Sol's supported provisional tool_result finding was fixed by finalizing normal completion from tool_execution_end and result-aware cleanup; the regression now asserts exact end counts, progress output, status disagreement, and result-only behavior. Credentialed E2E remains skipped; local registered-path coverage exercises the real handlers without paid credentials."
 		},
 		{
 			"category": "correctness",
