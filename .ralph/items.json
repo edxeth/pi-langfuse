@@ -90,8 +90,8 @@
 				"Exercise normal text, thinking plus text, tool-call assistant messages, missing message_start, and provider error paths.",
 				"Assert each semantic model request produces at most one llm-response generation under the correct agent.turn span with existing input, output, usage, cost, and model behavior."
 			],
-			"passes": false,
-			"regression_notes": ""
+			"passes": true,
+			"regression_notes": "Added a registered-extension generation handler with per-turn request state, immutable input snapshots, retry-safe provider response metadata, missing message_start fallback, terminal error finalization, thinking/text streaming, tool-call messages, usage/cost scoring, and exact trace parentage. Targeted and full verification passed; the credential-gated E2E remains skipped."
 		},
 		{
 			"category": "maintainability",

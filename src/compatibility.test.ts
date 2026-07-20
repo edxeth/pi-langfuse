@@ -1400,6 +1400,387 @@ describe("executable compatibility contract", () => {
 		await eventHandler(pi, "session_shutdown")();
 	});
 
+	it("keeps one correlated generation per model request across response edge cases", async () => {
+		const agentDir = tempRoot("pi-langfuse-generation-agent-");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "generation-public",
+			"secret-key": "generation-secret",
+			"base-url": "http://generation-host",
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+
+		const sessionFile =
+			"/tmp/pi-agent/sessions/--generation--/generation-session.jsonl";
+		const context = {
+			model: { id: "generation-model", provider: "generation-provider" },
+			sessionManager: {
+				getSessionFile: () => sessionFile,
+				getSessionId: () => "generation-session",
+			},
+		};
+		const handler = (name: string) => eventHandler(pi, name);
+
+		await handler("session_start")({ reason: "startup" }, context);
+		await handler("model_select")(
+			{ model: { id: "generation-model", provider: "generation-provider" } },
+			context,
+		);
+		await handler("before_agent_start")(
+			{
+				prompt: "generation prompt",
+				systemPrompt: "generation system",
+				systemPromptOptions: { cwd: "/tmp/generation" },
+			},
+			context,
+		);
+		await handler("agent_start")({}, context);
+
+		await handler("turn_start")({ turnIndex: 0 }, context);
+		await handler("context")(
+			{
+				messages: [
+					{ role: "system", content: "generation system" },
+					{ role: "user", content: "turn zero" },
+				],
+			},
+			context,
+		);
+		await handler("before_provider_request")(
+			{
+				payload: {
+					model: "generation-model",
+					messages: [{ role: "user", content: "turn zero" }],
+				},
+			},
+			context,
+		);
+		await handler("message_start")({ message: { role: "assistant" } }, context);
+		await handler("message_update")(
+			{
+				message: { role: "assistant" },
+				assistantMessageEvent: { type: "thinking_delta", delta: "think " },
+			},
+			context,
+		);
+		await handler("message_update")(
+			{
+				message: { role: "assistant" },
+				assistantMessageEvent: { type: "text_delta", delta: "answer-0" },
+			},
+			context,
+		);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "answer-0" }],
+					model: "generation-model-final-0",
+					usage: {
+						input: 4,
+						output: 5,
+						totalTokens: 9,
+						cost: { input: 0.04, output: 0.05, total: 0.09 },
+					},
+				},
+			},
+			context,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			context,
+		);
+
+		await handler("turn_start")({ turnIndex: 1 }, context);
+		await handler("context")(
+			{ messages: [{ role: "user", content: "tool request" }] },
+			context,
+		);
+		await handler("before_provider_request")(
+			{
+				payload: {
+					model: "generation-model",
+					messages: [{ role: "user", content: "tool request" }],
+				},
+			},
+			context,
+		);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [
+						{
+							type: "toolCall",
+							id: "call-1",
+							name: "bash",
+							arguments: { command: "pwd" },
+						},
+					],
+					model: "generation-model-final-1",
+					usage: { input: 6, output: 2, totalTokens: 8 },
+				},
+			},
+			context,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 1,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			context,
+		);
+
+		await handler("turn_start")({ turnIndex: 2 }, context);
+		await handler("before_provider_request")(
+			{
+				payload: {
+					model: "generation-model",
+					messages: [{ role: "user", content: "provider error" }],
+				},
+			},
+			context,
+		);
+		await handler("after_provider_response")(
+			{
+				status: 503,
+				headers: {},
+			},
+			context,
+		);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [],
+					model: "generation-model-error",
+					stopReason: "error",
+					usage: { input: 7, output: 0, totalTokens: 7 },
+				},
+			},
+			context,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 2,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			context,
+		);
+
+		await handler("turn_start")({ turnIndex: 3 }, context);
+		await handler("context")(
+			{ messages: [{ role: "user", content: "request three" }] },
+			context,
+		);
+		await handler("before_provider_request")(
+			{ payload: { model: "generation-model" } },
+			context,
+		);
+		await handler("context")(
+			{ messages: [{ role: "user", content: "later context" }] },
+			context,
+		);
+		await handler("after_provider_response")(
+			{ status: 200, headers: {} },
+			context,
+		);
+		await handler("message_start")({ message: { role: "assistant" } }, context);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "answer-3" }],
+					model: "generation-model-final-3",
+					usage: { input: 2, output: 2, totalTokens: 4 },
+				},
+			},
+			context,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 3,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			context,
+		);
+
+		await handler("turn_start")({ turnIndex: 4 }, context);
+		await handler("before_provider_request")(
+			{ payload: { model: "generation-model" } },
+			context,
+		);
+		await handler("after_provider_response")(
+			{ status: 429, headers: {} },
+			context,
+		);
+		await handler("after_provider_response")(
+			{ status: 200, headers: {} },
+			context,
+		);
+		await handler("message_start")({ message: { role: "assistant" } }, context);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "answer-4" }],
+					model: "generation-model-final-4",
+					usage: { input: 1, output: 1, totalTokens: 2 },
+				},
+			},
+			context,
+		);
+
+		const trace = latestRecord(telemetry.state.traces, "pi-agent");
+		const generations = telemetry.state.observations.filter(
+			(record) => record.name === "llm-response",
+		);
+		expect(generations).toHaveLength(5);
+		const generationsByRequest = new Map(
+			generations.map((generation) => [
+				(generation.metadata as { requestKey?: string }).requestKey,
+				generation,
+			]),
+		);
+		const generation0 = generationsByRequest.get("turn:0:request:0");
+		const generation1 = generationsByRequest.get("turn:1:request:0");
+		const generation2 = generationsByRequest.get("turn:2:request:0");
+		const generation3 = generationsByRequest.get("turn:3:request:0");
+		const generation4 = generationsByRequest.get("turn:4:request:0");
+		if (
+			!generation0 ||
+			!generation1 ||
+			!generation2 ||
+			!generation3 ||
+			!generation4
+		) {
+			throw new Error("all request-correlated generations are required");
+		}
+
+		for (const generation of generations) {
+			expect(generation.traceId).toBe(trace.id);
+		}
+		const turn0 = latestRecord(
+			telemetry.state.observations.filter(
+				(record) =>
+					(record.metadata as { turnIndex?: number } | undefined)?.turnIndex ===
+						0 && record.name === "agent.turn",
+			),
+			"agent.turn",
+		);
+		const turn1 = latestRecord(
+			telemetry.state.observations.filter(
+				(record) =>
+					(record.metadata as { turnIndex?: number } | undefined)?.turnIndex ===
+						1 && record.name === "agent.turn",
+			),
+			"agent.turn",
+		);
+		const turn2 = latestRecord(
+			telemetry.state.observations.filter(
+				(record) =>
+					(record.metadata as { turnIndex?: number } | undefined)?.turnIndex ===
+						2 && record.name === "agent.turn",
+			),
+			"agent.turn",
+		);
+		const turn3 = latestRecord(
+			telemetry.state.observations.filter(
+				(record) =>
+					(record.metadata as { turnIndex?: number } | undefined)?.turnIndex ===
+						3 && record.name === "agent.turn",
+			),
+			"agent.turn",
+		);
+		const turn4 = latestRecord(
+			telemetry.state.observations.filter(
+				(record) =>
+					(record.metadata as { turnIndex?: number } | undefined)?.turnIndex ===
+						4 && record.name === "agent.turn",
+			),
+			"agent.turn",
+		);
+		expect(generation0.parentObservationId).toBe(turn0.id);
+		expect(generation1.parentObservationId).toBe(turn1.id);
+		expect(generation2.parentObservationId).toBe(turn2.id);
+		expect(generation3.parentObservationId).toBe(turn3.id);
+		expect(generation4.parentObservationId).toBe(turn4.id);
+		expect(generation0.input).toEqual([
+			{ role: "system", content: "generation system" },
+			{ role: "user", content: "turn zero" },
+		]);
+		expect(generation0.end).toMatchObject({
+			output: "answer-0",
+			model: "generation-model-final-0",
+			usage: { input: 4, output: 5, total: 9 },
+			costDetails: { input: 0.04, output: 0.05, total: 0.09 },
+			metadata: { thinking: "think " },
+		});
+		expect(generation1.input).toEqual([
+			{ role: "user", content: "tool request" },
+		]);
+		expect(generation1.end).toMatchObject({
+			model: "generation-model-final-1",
+			usage: { input: 6, output: 2, total: 8 },
+		});
+		expect(generation2).toMatchObject({
+			metadata: expect.objectContaining({
+				providerResponseStatus: 503,
+				providerResponseStatuses: [503],
+			}),
+			end: expect.objectContaining({
+				isError: true,
+				statusMessage: expect.stringContaining("503"),
+			}),
+		});
+		expect(generation3.input).toEqual([
+			{ role: "user", content: "request three" },
+		]);
+		expect(generation3.metadata).toMatchObject({
+			providerResponseStatus: 200,
+			providerResponseStatuses: [200],
+		});
+		expect(generation4.lastUpdate).toMatchObject({
+			metadata: {
+				providerResponseStatus: 200,
+				providerResponseStatuses: [429, 200],
+			},
+		});
+		expect(generation4.end).toMatchObject({
+			output: "answer-4",
+			model: "generation-model-final-4",
+		});
+		expect(telemetry.state.scores).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					name: "input_tokens",
+					value: 4,
+					observationId: generation0.id,
+				}),
+				expect.objectContaining({
+					name: "output_tokens",
+					value: 5,
+					observationId: generation0.id,
+				}),
+				expect.objectContaining({
+					name: "total_cost",
+					value: 0.09,
+					observationId: generation0.id,
+				}),
+			]),
+		);
+
+		await handler("session_shutdown")({}, context);
+	});
+
 	it("keeps the compiled package entrypoint loadable", async () => {
 		const packageJson = JSON.parse(
 			readFileSync(new URL("../package.json", import.meta.url), "utf-8"),

@@ -39,14 +39,27 @@ export interface TurnState {
 	index: number;
 	startedAt: number;
 	span?: LangfuseSpan;
-	generation?: LangfuseGeneration;
-	streamingText?: string;
-	streamingThinking?: string;
+	generations: Map<string, GenerationState>;
+	generationOrder: string[];
+	nextGenerationIndex: number;
 	requests?: Array<{
 		timestamp: string;
 		payloadSize: number;
 		model: string;
 	}>;
+}
+
+export interface GenerationState {
+	requestKey: string;
+	startedAt: number;
+	generation?: LangfuseGeneration;
+	startPromise?: Promise<void>;
+	ended: boolean;
+	streamingText: string;
+	streamingThinking: string;
+	metadata: Record<string, unknown>;
+	inputSnapshot?: unknown;
+	requestModel?: string;
 }
 
 export interface ToolState {

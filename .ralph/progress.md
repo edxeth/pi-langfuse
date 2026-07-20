@@ -157,3 +157,44 @@ Verification gates:
 Item-specific evidence: The existing registered extension compatibility harness exercised the public event path through prompt start, agent start, turn start/end, generation, tools, agent end, compaction, shutdown, settings refresh, raw traces, redaction, and compiled entrypoint loading. It asserted the existing `pi-agent`, `agent.prompt`, `agent.turn`, `llm-response`, and `tool:<name>` hierarchy, parent IDs, tags, trace I/O, usage and cost fields, compact metadata, raw records, and cleanup. No dependency audit was required by this item. The credentialed external E2E remained skipped because credentials were unavailable; local registered-handler coverage did not require them.
 
 Remaining risks: Generation and tool handler extraction, duplicate and out-of-order lifecycle idempotency, Langfuse v5 and OpenTelemetry transport, privacy budgets, fallback ingestion, additive telemetry, operator commands, and release documentation remain for later items. Credentialed external ingestion remains unverified.
+
+## Handoff 2026-07-20
+
+Selected item: Generation lifecycle behavior is owned by a dedicated handler with stable request correlation and existing usage and cost semantics.
+
+Starting Git HEAD: `60d3bcaad87d189f5da160b8957a1d9902532059`.
+
+Decision rationale and assumptions: Generation extraction is the next maintainability boundary after agent and turn extraction. The installed Pi host exposes no per-request identifier on `before_provider_request`, `after_provider_response`, or message events, so the handler uses one ordered pending request state per active turn, with optional top-level request keys only when an adapter supplies them at the provider boundary. Provider response statuses are metadata, not terminal lifecycle events, because one semantic request can receive retryable responses before its final message. Each request captures its bounded generation input at `before_provider_request` so later context events cannot replace it. A local fake replaces only the unavailable Langfuse transport; registered Pi handlers and all local shaping paths remain real.
+
+Changed files:
+- `src/generation-lifecycle.ts`: added the dedicated context, provider-request/response, message streaming/finalization, scoring, request-state, retry metadata, input snapshot, and abandoned-generation boundary.
+- `src/index.ts`: wires the generation handlers and delegates generation cleanup from agent finalization.
+- `src/lifecycle-types.ts`: adds per-request generation state and immutable input ownership to turns.
+- `src/turn-lifecycle.ts`: initializes per-turn generation state.
+- `src/agent-lifecycle.ts`: delegates generation abandonment to the generation handler.
+- `src/compatibility.test.ts`: adds registered-path coverage for normal text, thinking plus text, tool-call messages, missing `message_start`, terminal provider errors, retryable `429 -> 200` responses, input snapshots, trace parentage, usage, cost, model, and scores.
+- `.ralph/items.json`: marked this item passing and recorded its regression coverage.
+- `.ralph/progress.md`: recorded this handoff.
+
+Targeted results:
+- Baseline `npm test -- --run src/compatibility.test.ts`: intentionally failed the new regression with 1 failed / 7 passed because `after_provider_response` was not registered in the baseline.
+- Final targeted `npm test -- --run src/compatibility.test.ts src/index.test.ts`: passed 16 tests in 2 files after review fixes.
+- `npm run typecheck` passed after implementation and review fixes.
+- `npx biome check src/index.ts src/generation-lifecycle.ts src/lifecycle-types.ts src/turn-lifecycle.ts src/agent-lifecycle.ts src/compatibility.test.ts` passed.
+- `git diff --check HEAD` passed.
+
+GLM review findings and disposition: GLM reported no material correctness blocker. Its finding that synthetic request-key fields were not emitted by the installed Pi host was supported; the regression now uses host-shaped events and ordered per-turn state, and message-local identifiers are no longer used. Its note that provider-response and streaming-error branches are not the normal host error path was addressed by keeping response statuses non-terminal and finalizing actual `message_end` error messages; the defensive branches remain contained.
+
+GPT Sol review findings and disposition: Three P1 findings were supported and fixed. Retryable response statuses no longer end a generation, so repeated response attempts remain one generation. Synthetic `requestId`/message `turnIndex` fixtures were removed; the test now uses the installed host event shapes and real turn lifecycle fields only. Generation input is captured per request before later context events and the delayed-context regression asserts the original input.
+
+Verification gates:
+- `node -e "const major = Number(process.versions.node.split('.')[0]); if (major < 22) { console.error('Node.js 22+ required'); process.exit(1); }"` passed.
+- `npx biome check .` passed with no fixes applied.
+- `npm run typecheck` passed.
+- `npm test` passed with 57 tests and 1 credential-gated E2E test skipped.
+- `npm run build` passed.
+- `npm pack --dry-run` passed and listed `dist/index.js`, `dist/generation-lifecycle.js`, declarations, maps, and `package.json` across 66 files.
+
+Item-specific evidence: The registered extension harness exercised the real public event path through multiple turns, context snapshots, provider request and response metadata including retry and terminal status, normal and missing message-start responses, thinking/text streaming, tool-call assistant messages, generation finalization, usage/cost score creation, and correct `agent.turn` parentage. The package build and dry-run include the new compiled generation handler while retaining `dist/index.js`. The credentialed external E2E remained skipped because credentials were unavailable; no dependency audit was required by this item.
+
+Remaining risks: Host-shaped events do not provide cross-turn request IDs, so arbitrary concurrent response reordering cannot be distinguished beyond the active-turn boundary; later lifecycle/idempotency work must define that contract. Tool handler extraction, privacy budgets, Langfuse v5 and OpenTelemetry transport, fallback ingestion, additive telemetry, operator commands, and release documentation remain for later items.

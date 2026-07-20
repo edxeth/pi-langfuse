@@ -48,6 +48,9 @@ export function createTurnLifecycleHandlers(
 		const turnState: TurnState = {
 			index: event.turnIndex,
 			startedAt: Date.now(),
+			generations: new Map(),
+			generationOrder: [],
+			nextGenerationIndex: 0,
 		};
 		prompt.activeTurns.set(event.turnIndex, turnState);
 		if (!deps.canTrace(config) || !prompt.trace) return;

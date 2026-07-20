@@ -10,8 +10,9 @@ import {
 	resolveConfig,
 } from "./config.js";
 import { exportRedactedData } from "./export.js";
+import { createGenerationLifecycleHandlers } from "./generation-lifecycle.js";
 import { flushClient, getClient, shutdownClient } from "./langfuse-client.js";
-import type { PiUsage, PromptState, ToolState } from "./lifecycle-types.js";
+import type { PromptState, ToolState } from "./lifecycle-types.js";
 import { ensureLocalLangfuseStarted } from "./local-autostart.js";
 import { runLangfuseInit } from "./local-init.js";
 import { appendRawTrace, drainRawTraceQueue } from "./raw-trace.js";
@@ -150,6 +151,25 @@ export default async function (pi: ExtensionAPI) {
 	const getTypedSessionState = (ctx: ExtensionContext | undefined) =>
 		getSessionState(ctx);
 
+	const generationLifecycle = createGenerationLifecycleHandlers({
+		getConfig: () => resolveConfig(settings),
+		getSessionState,
+		canTrace,
+		getClient,
+		telemetryText,
+		redactionMetadata,
+		extractTextFromContent,
+		standardUsageFromUsage,
+		usageDetailsFromUsage,
+		costDetailsFromUsage,
+		summarizeMessages,
+		summarizeProviderPayload,
+		summarizeProviderRequestMessages,
+		safeJson,
+		estimateJsonBytes,
+		writeRawTrace,
+	});
+
 	const agentLifecycle = createAgentLifecycleHandlers({
 		getConfig: () => resolveConfig(settings),
 		updateStatus: (ctx, config) => {
@@ -170,6 +190,7 @@ export default async function (pi: ExtensionAPI) {
 		redactionMetadata,
 		truncate,
 		extractTextFromContent,
+		abandonTurnGenerations: generationLifecycle.abandonTurn,
 	});
 	const turnLifecycle = createTurnLifecycleHandlers({
 		getConfig: () => resolveConfig(settings),
@@ -291,35 +312,8 @@ export default async function (pi: ExtensionAPI) {
 
 	pi.on("turn_start", turnLifecycle.turnStart);
 
-	// Capture full messages (system prompt + conversation history + tools) before
-	// each LLM call. These are used as the generation input so Langfuse UI shows
-	// the complete prompt instead of just the user's text.
-	pi.on("context", async (event, ctx) => {
-		const state = getTypedSessionState(ctx);
-		const prompt = state?.promptState;
-		if (!state || !prompt) return;
-		const config = resolveConfig(settings);
-
-		// Store full context messages for raw trace (redacted at write time).
-		prompt.lastContextMessages = event.messages as Array<{
-			role: string;
-			content: unknown;
-		}>;
-
-		if (!canTrace(config)) return;
-
-		const activeTurns = Array.from(prompt.activeTurns.values());
-		const activeTurn =
-			activeTurns.length > 0 ? activeTurns[activeTurns.length - 1] : undefined;
-		if (!activeTurn) return;
-
-		// Keep only bounded message summaries on the live path. Full context belongs
-		// to Pi's canonical session and raw traces, not synchronous telemetry.
-		prompt.lastMessages = summarizeMessages(
-			config,
-			event.messages as Array<{ role?: string; content?: unknown }>,
-		);
-	});
+	// Capture context and generation lifecycle through the dedicated generation handler.
+	pi.on("context", generationLifecycle.context);
 
 	pi.on("tool_call", async (event, ctx) => {
 		const state = getTypedSessionState(ctx);
@@ -474,300 +468,14 @@ export default async function (pi: ExtensionAPI) {
 		prompt.activeTools.delete(event.toolCallId);
 	});
 
-	pi.on("message_start", async (event, ctx) => {
-		const state = getTypedSessionState(ctx);
-		const prompt = state?.promptState;
-		if (!state || !prompt) return;
-		const config = resolveConfig(settings);
-		if (!canTrace(config) || !prompt.trace) return;
-
-		const message = event.message as { role?: string };
-		if (message.role !== "assistant") return;
-
-		const activeTurns = Array.from(prompt.activeTurns.values());
-		const turnState =
-			activeTurns.length > 0 ? activeTurns[activeTurns.length - 1] : undefined;
-		if (!turnState) return;
-
-		turnState.streamingText = "";
-		turnState.streamingThinking = "";
-
-		// Use the full messages captured from `context` as generation input.
-		// Langfuse renders chat message arrays natively in the UI, showing the
-		// complete LLM prompt (system prompt, conversation history, tools, etc.),
-		// instead of just the raw user text.
-		const generationInput = prompt.lastMessages
-			? prompt.lastMessages
-			: telemetryText(config, prompt.userPrompt, config.traceInputMaxChars);
-
-		try {
-			const lf = await getClient(config);
-			if (
-				state.promptState !== prompt ||
-				prompt.activeTurns.get(turnState.index) !== turnState
-			)
-				return;
-			turnState.generation = lf.generation({
-				name: "llm-response",
-				traceId: prompt.trace.id,
-				parentObservationId: turnState.span?.id || prompt.promptSpan?.id,
-				input: generationInput,
-				model: state.model || undefined,
-				metadata: {
-					redaction: redactionMetadata(config),
-					turnIndex: turnState.index,
-					model: state.model,
-					provider: state.provider,
-				},
-			});
-		} catch (e) {
-			console.warn("📊 Langfuse: Failed to start generation", e);
-		}
-	});
-
-	pi.on("message_update", async (event, ctx) => {
-		const state = getTypedSessionState(ctx);
-		const prompt = state?.promptState;
-		if (!state || !prompt) return;
-		const config = resolveConfig(settings);
-		if (!canTrace(config)) return;
-
-		const message = event.message as { role?: string };
-		if (message.role !== "assistant") return;
-
-		const activeTurns = Array.from(prompt.activeTurns.values());
-		const turnState =
-			activeTurns.length > 0 ? activeTurns[activeTurns.length - 1] : undefined;
-		if (!turnState?.generation) return;
-
-		const assistantEvent = event.assistantMessageEvent as {
-			type: string;
-			delta?: string;
-		};
-		if (!assistantEvent) return;
-
-		if (assistantEvent.type === "text_delta") {
-			turnState.streamingText =
-				(turnState.streamingText || "") + (assistantEvent.delta ?? "");
-		} else if (assistantEvent.type === "thinking_delta") {
-			turnState.streamingThinking =
-				(turnState.streamingThinking || "") + (assistantEvent.delta ?? "");
-		}
-
-		// Optionally update the generation in real-time if configured
-		if (config.captureMessageUpdates) {
-			turnState.generation.update?.({
-				output: telemetryText(
-					config,
-					(turnState.streamingThinking || "") + (turnState.streamingText || ""),
-					config.traceOutputMaxChars,
-				),
-				metadata: {
-					hasThinking: !!turnState.streamingThinking,
-					partial: true,
-				},
-			});
-		}
-	});
-
-	pi.on("message_end", async (event, ctx) => {
-		const state = getTypedSessionState(ctx);
-		const prompt = state?.promptState;
-		if (!state || !prompt) return;
-		const config = resolveConfig(settings);
-
-		const message = event.message as {
-			role?: string;
-			content?: Array<{ type: string; text?: string }>;
-			model?: string;
-			usage?: PiUsage;
-		};
-		if (message.role !== "assistant") return;
-
-		const activeTurns = Array.from(prompt.activeTurns.values());
-		const turnState =
-			activeTurns.length > 0 ? activeTurns[activeTurns.length - 1] : undefined;
-		if (!turnState) return;
-
-		const outputText = extractTextFromContent(message.content).trim();
-		const finalOutput =
-			outputText ||
-			(turnState.streamingThinking || "") + (turnState.streamingText || "");
-
-		const usage = message.usage;
-		const standardUsage = standardUsageFromUsage(usage);
-		const usageDetails = usageDetailsFromUsage(usage);
-		const costDetails = costDetailsFromUsage(usage);
-
-		prompt.lastAssistantText = telemetryText(
-			config,
-			finalOutput,
-			config.traceOutputMaxChars,
-		);
-		prompt.lastUsage = usage;
-		writeRawTrace(config, state, {
-			type: "assistant_output",
-			turnIndex: turnState.index,
-			text: finalOutput,
-			thinking: turnState.streamingThinking || undefined,
-			usage,
-			messageModel: message.model || undefined,
-		});
-
-		if (usage) {
-			prompt.tokensIn +=
-				(usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
-			prompt.tokensOut += usage.output ?? 0;
-			prompt.cacheRead += usage.cacheRead ?? 0;
-			prompt.cacheWrite += usage.cacheWrite ?? 0;
-		}
-
-		if (!canTrace(config) || !prompt.trace || !turnState.generation) return;
-
-		try {
-			turnState.generation.end({
-				output:
-					telemetryText(config, finalOutput, config.traceOutputMaxChars) ||
-					undefined,
-				usage: standardUsage,
-				usageDetails,
-				costDetails,
-				model: message.model || state.model || undefined,
-				metadata: {
-					model: message.model || state.model,
-					provider: state.provider,
-					turnIndex: turnState.index,
-					thinking: turnState.streamingThinking || undefined,
-				},
-			});
-
-			const lf = await getClient(config);
-			if (
-				state.promptState !== prompt ||
-				prompt.activeTurns.get(turnState.index) !== turnState
-			)
-				return;
-			if (usage?.input) {
-				lf.score({
-					name: "input_tokens",
-					value: usage.input,
-					traceId: prompt.trace.id,
-					observationId: turnState.generation.id,
-				});
-			}
-			if (usage?.output) {
-				lf.score({
-					name: "output_tokens",
-					value: usage.output,
-					traceId: prompt.trace.id,
-					observationId: turnState.generation.id,
-				});
-			}
-			if (typeof usage?.cost?.total === "number") {
-				lf.score({
-					name: "total_cost",
-					value: usage.cost.total,
-					traceId: prompt.trace.id,
-					observationId: turnState.generation.id,
-				});
-			}
-		} catch (e) {
-			console.warn("📊 Langfuse: Failed to end generation", e);
-		}
-	});
+	pi.on("message_start", generationLifecycle.messageStart);
+	pi.on("message_update", generationLifecycle.messageUpdate);
+	pi.on("message_end", generationLifecycle.messageEnd);
 
 	pi.on("turn_end", turnLifecycle.turnEnd);
 
-	pi.on("before_provider_request", async (event, ctx) => {
-		const state = getTypedSessionState(ctx);
-		const prompt = state?.promptState;
-		if (!state || !prompt) return;
-		const config = resolveConfig(settings);
-
-		const activeTurns = Array.from(prompt.activeTurns.values());
-		const turnState =
-			activeTurns.length > 0 ? activeTurns[activeTurns.length - 1] : undefined;
-		if (!turnState) return;
-
-		try {
-			const payloadSummary = summarizeProviderPayload(
-				config,
-				event.payload,
-				state.model,
-			);
-			const payloadSummaryText = safeJson(
-				config,
-				payloadSummary,
-				config.providerPayloadMaxChars,
-			);
-			const reqModel =
-				typeof (event.payload as Record<string, unknown>)?.model === "string"
-					? ((event.payload as Record<string, unknown>).model as string)
-					: state.model;
-			// Source request messages from the actual provider payload (what was sent),
-			// falling back to the context event snapshot if the payload doesn't have messages.
-			const payloadMessages = Array.isArray(
-				(event.payload as Record<string, unknown>)?.messages,
-			)
-				? (event.payload as Record<string, unknown>).messages
-				: prompt.lastContextMessages;
-			if (config.rawTraceProviderRequestMode !== "off") {
-				const providerRequestBase = {
-					type: "provider_request",
-					turnIndex: turnState.index,
-					model: reqModel,
-					messageCount: Array.isArray(payloadMessages)
-						? payloadMessages.length
-						: undefined,
-					estimatedBytes: estimateJsonBytes(payloadMessages),
-					payloadCaptured: config.captureProviderPayload,
-					payloadSummary: config.captureProviderPayload
-						? payloadSummaryText
-						: undefined,
-				};
-				writeRawTrace(
-					config,
-					state,
-					config.rawTraceProviderRequestMode === "full"
-						? {
-								...providerRequestBase,
-								captureMode: "full",
-								messages: payloadMessages,
-							}
-						: {
-								...providerRequestBase,
-								captureMode: "summary",
-								messagesSummary: summarizeProviderRequestMessages(
-									config,
-									payloadMessages,
-								),
-								fullMessagesOmitted: Array.isArray(payloadMessages),
-							},
-				);
-			}
-			const payloadSize = payloadSummaryText.length;
-			if (!turnState.requests) turnState.requests = [];
-			turnState.requests.push({
-				timestamp: new Date().toISOString(),
-				payloadSize,
-				model: reqModel,
-			});
-
-			// Update turn span metadata with requests info. Full payload capture is
-			// intentionally opt-in because provider payloads can contain large context
-			// and sensitive data. Enable it with captureProviderPayload=true.
-			turnState.span?.update?.({
-				metadata: {
-					requests: turnState.requests,
-					providerPayload: config.captureProviderPayload
-						? payloadSummaryText
-						: undefined,
-				},
-			});
-		} catch (_e) {
-			// ignore
-		}
-	});
+	pi.on("before_provider_request", generationLifecycle.beforeProviderRequest);
+	pi.on("after_provider_response", generationLifecycle.afterProviderResponse);
 
 	pi.on("agent_end", agentLifecycle.agentEnd);
 

@@ -6,7 +6,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { Config, canTrace } from "./config.js";
 import type { flushClient, getClient } from "./langfuse-client.js";
-import type { PromptState } from "./lifecycle-types.js";
+import type { PromptState, TurnState } from "./lifecycle-types.js";
 import type { ensureLocalLangfuseStarted } from "./local-autostart.js";
 import type { redactionMetadata } from "./redaction.js";
 import type { SessionContextLike, SessionState } from "./session-state.js";
@@ -41,6 +41,7 @@ export interface AgentLifecycleDependencies {
 	redactionMetadata: typeof redactionMetadata;
 	truncate: typeof truncate;
 	extractTextFromContent: typeof extractTextFromContent;
+	abandonTurnGenerations: (turn: TurnState) => Promise<void>;
 }
 
 export interface AgentLifecycleHandlers {
@@ -86,17 +87,7 @@ export function createAgentLifecycleHandlers(
 		prompt.activeTools.clear();
 
 		for (const [, turn] of prompt.activeTurns) {
-			if (turn.generation) {
-				turn.generation.end({
-					isError: true,
-					statusMessage: "generation abandoned during prompt finalization",
-					metadata: {
-						abandoned: true,
-						turnIndex: turn.index,
-						durationMs: Date.now() - turn.startedAt,
-					},
-				});
-			}
+			await deps.abandonTurnGenerations(turn);
 			turn.span?.end({
 				metadata: {
 					turnIndex: turn.index,
