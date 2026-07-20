@@ -742,6 +742,519 @@ describe("executable compatibility contract", () => {
 		});
 	});
 
+	it("keeps overlapping session state isolated through registered handlers", async () => {
+		const agentDir = tempRoot("pi-langfuse-session-isolation-agent-");
+		const rawTraceDir = join(agentDir, "raw-traces");
+		const sessionIdA = "2026-07-20T18-00-00-000Z_session-a";
+		const sessionIdB = "2026-07-20T18-00-01-000Z_session-b";
+		const sessionFileA = `/tmp/pi-agent/sessions/--session-a--/${sessionIdA}.jsonl`;
+		const sessionFileB = `/tmp/pi-agent/sessions/--session-b--/${sessionIdB}.jsonl`;
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "isolation-public",
+			"secret-key": "isolation-secret",
+			"base-url": "http://isolation-host",
+			"raw-trace-enabled": true,
+			"raw-trace-dir": rawTraceDir,
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+
+		const contextA = {
+			model: { id: "model-a", provider: "provider-a" },
+			sessionManager: {
+				getSessionFile: () => sessionFileA,
+				getSessionId: () => "session-a",
+			},
+		};
+		const contextB = {
+			model: { id: "model-b", provider: "provider-b" },
+			sessionManager: {
+				getSessionFile: () => sessionFileB,
+				getSessionId: () => "session-b",
+			},
+		};
+		const handler = (name: string) => eventHandler(pi, name);
+
+		await handler("session_start")({ reason: "startup" }, contextA);
+		await handler("session_start")({ reason: "startup" }, contextB);
+		await handler("model_select")(
+			{ model: { id: "model-a", provider: "provider-a" } },
+			contextA,
+		);
+		await handler("model_select")(
+			{ model: { id: "model-b", provider: "provider-b" } },
+			contextB,
+		);
+
+		await Promise.all([
+			handler("before_agent_start")(
+				{
+					prompt: "prompt-a",
+					systemPrompt: "system-a",
+					systemPromptOptions: { cwd: "/tmp/project-a" },
+				},
+				contextA,
+			),
+			handler("before_agent_start")(
+				{
+					prompt: "prompt-b",
+					systemPrompt: "system-b",
+					systemPromptOptions: { cwd: "/tmp/project-b" },
+				},
+				contextB,
+			),
+		]);
+		await Promise.all([
+			handler("agent_start")({}, contextA),
+			handler("agent_start")({}, contextB),
+		]);
+		await Promise.all([
+			handler("turn_start")({ turnIndex: 0 }, contextA),
+			handler("turn_start")({ turnIndex: 0 }, contextB),
+		]);
+		await Promise.all([
+			handler("context")(
+				{ messages: [{ role: "user", content: "context-a" }] },
+				contextA,
+			),
+			handler("context")(
+				{ messages: [{ role: "user", content: "context-b" }] },
+				contextB,
+			),
+		]);
+		await Promise.all([
+			handler("tool_execution_start")(
+				{
+					toolCallId: "tool-a",
+					toolName: "bash",
+					args: { command: "echo a" },
+				},
+				contextA,
+			),
+			handler("tool_execution_start")(
+				{
+					toolCallId: "tool-b",
+					toolName: "bash",
+					args: { command: "echo b" },
+				},
+				contextB,
+			),
+		]);
+		await Promise.all([
+			handler("tool_call")(
+				{
+					toolCallId: "tool-a",
+					toolName: "bash",
+					input: { command: "echo a" },
+				},
+				contextA,
+			),
+			handler("tool_call")(
+				{
+					toolCallId: "tool-b",
+					toolName: "bash",
+					input: { command: "echo b" },
+				},
+				contextB,
+			),
+		]);
+		await Promise.all([
+			handler("before_provider_request")(
+				{
+					payload: {
+						model: "model-a",
+						messages: [{ role: "user", content: "context-a" }],
+					},
+				},
+				contextA,
+			),
+			handler("before_provider_request")(
+				{
+					payload: {
+						model: "model-b",
+						messages: [{ role: "user", content: "context-b" }],
+					},
+				},
+				contextB,
+			),
+		]);
+		await Promise.all([
+			handler("message_start")({ message: { role: "assistant" } }, contextA),
+			handler("message_start")({ message: { role: "assistant" } }, contextB),
+		]);
+		await Promise.all([
+			handler("message_update")(
+				{
+					message: { role: "assistant" },
+					assistantMessageEvent: { type: "text_delta", delta: "answer-a" },
+				},
+				contextA,
+			),
+			handler("message_update")(
+				{
+					message: { role: "assistant" },
+					assistantMessageEvent: { type: "text_delta", delta: "answer-b" },
+				},
+				contextB,
+			),
+		]);
+		await Promise.all([
+			handler("tool_result")(
+				{
+					toolCallId: "tool-a",
+					toolName: "bash",
+					input: { command: "echo a" },
+					content: [{ type: "text", text: "result-a" }],
+					isError: false,
+				},
+				contextA,
+			),
+			handler("tool_result")(
+				{
+					toolCallId: "tool-b",
+					toolName: "bash",
+					input: { command: "echo b" },
+					content: [{ type: "text", text: "result-b" }],
+					isError: true,
+				},
+				contextB,
+			),
+		]);
+		await Promise.all([
+			handler("message_end")(
+				{
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "answer-a" }],
+						model: "model-a-final",
+						usage: { input: 2, output: 3, totalTokens: 5 },
+					},
+				},
+				contextA,
+			),
+			handler("message_end")(
+				{
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "answer-b" }],
+						model: "model-b-final",
+						usage: { input: 5, output: 7, totalTokens: 12 },
+					},
+				},
+				contextB,
+			),
+		]);
+		await Promise.all([
+			handler("tool_execution_end")(
+				{
+					toolCallId: "tool-a",
+					toolName: "bash",
+					result: { content: [{ type: "text", text: "result-a" }] },
+					isError: false,
+				},
+				contextA,
+			),
+			handler("tool_execution_end")(
+				{
+					toolCallId: "tool-b",
+					toolName: "bash",
+					result: { content: [{ type: "text", text: "result-b" }] },
+					isError: true,
+				},
+				contextB,
+			),
+		]);
+		await Promise.all([
+			handler("turn_end")(
+				{
+					turnIndex: 0,
+					message: { role: "assistant", content: [] },
+					toolResults: [],
+				},
+				contextA,
+			),
+			handler("turn_end")(
+				{
+					turnIndex: 0,
+					message: { role: "assistant", content: [] },
+					toolResults: [],
+				},
+				contextB,
+			),
+		]);
+		await handler("session_compact")({}, contextA);
+		await handler("session_compact")({}, contextA);
+		await handler("session_compact")({}, contextB);
+		await Promise.all([
+			handler("agent_end")(
+				{
+					messages: [
+						{
+							role: "assistant",
+							content: [{ type: "text", text: "answer-a" }],
+						},
+					],
+				},
+				contextA,
+			),
+			handler("agent_end")(
+				{
+					messages: [
+						{
+							role: "assistant",
+							content: [{ type: "text", text: "answer-b" }],
+						},
+					],
+				},
+				contextB,
+			),
+		]);
+		await Promise.all([
+			handler("session_shutdown")({}, contextA),
+			handler("session_shutdown")({}, contextB),
+		]);
+		drainRawTraceQueue();
+
+		const traceA = telemetry.state.traces.find(
+			(record) => record.sessionId === sessionIdA,
+		);
+		const traceB = telemetry.state.traces.find(
+			(record) => record.sessionId === sessionIdB,
+		);
+		expect(traceA).toBeDefined();
+		expect(traceB).toBeDefined();
+		if (!traceA || !traceB) throw new Error("isolated traces were not created");
+
+		for (const [
+			trace,
+			traceSessionId,
+			model,
+			provider,
+			cwd,
+			output,
+			compactCount,
+			toolError,
+		] of [
+			[
+				traceA,
+				sessionIdA,
+				"model-a",
+				"provider-a",
+				"/tmp/project-a",
+				"answer-a",
+				2,
+				0,
+			],
+			[
+				traceB,
+				sessionIdB,
+				"model-b",
+				"provider-b",
+				"/tmp/project-b",
+				"answer-b",
+				1,
+				1,
+			],
+		] as const) {
+			const observations = telemetry.state.observations.filter(
+				(record) => record.traceId === trace.id,
+			);
+			const prompt = latestRecord(observations, "agent.prompt");
+			const turn = latestRecord(observations, "agent.turn");
+			const generation = latestRecord(observations, "llm-response");
+			const tool = latestRecord(observations, "tool:bash");
+			expect(observations.map((record) => record.name)).toEqual([
+				"agent.prompt",
+				"agent.turn",
+				"tool:bash",
+				"llm-response",
+			]);
+			expect(turn.parentObservationId).toBe(prompt.id);
+			expect(generation.parentObservationId).toBe(turn.id);
+			expect(tool.parentObservationId).toBe(turn.id);
+			for (const observation of observations) {
+				expect(observation.traceId).toBe(trace.id);
+				expect(observation.end).toBeDefined();
+			}
+			expect(trace.lastUpdate).toMatchObject({
+				output,
+				sessionId: traceSessionId,
+				metadata: {
+					model,
+					provider,
+					cwd,
+					turns: 1,
+					toolCalls: 1,
+					toolErrors: toolError,
+					compactCount,
+				},
+			});
+			expect(prompt.metadata).toMatchObject({ cwd, model, provider });
+			expect(prompt.end).toMatchObject({
+				output,
+				metadata: {
+					turns: 1,
+					toolCalls: 1,
+					toolErrors: toolError,
+					compactCount,
+				},
+			});
+			expect(generation.end).toMatchObject({ output });
+			expect(tool.end).toMatchObject({ isError: toolError === 1 });
+		}
+
+		const rawA = readFileSync(
+			join(rawTraceDir, "--session-a--", `${sessionIdA}.jsonl`),
+			"utf-8",
+		)
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+		const rawB = readFileSync(
+			join(rawTraceDir, "--session-b--", `${sessionIdB}.jsonl`),
+			"utf-8",
+		)
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+		for (const [records, sessionId, prompt, output] of [
+			[rawA, sessionIdA, "prompt-a", "answer-a"],
+			[rawB, sessionIdB, "prompt-b", "answer-b"],
+		] as const) {
+			expect(records.length).toBeGreaterThan(0);
+			expect(records.every((record) => record.sessionId === sessionId)).toBe(
+				true,
+			);
+			expect(rawRecord(records, "agent_prompt_start").prompt).toBe(prompt);
+			expect(rawRecord(records, "assistant_output").text).toBe(output);
+			expect(rawRecord(records, "provider_request").model).toBe(
+				sessionId === sessionIdA ? "model-a" : "model-b",
+			);
+		}
+		expect(
+			rawA
+				.filter((record) => record.type === "session_compact")
+				.map((record) => record.compactCount),
+		).toEqual([1, 2]);
+		expect(
+			rawB
+				.filter((record) => record.type === "session_compact")
+				.map((record) => record.compactCount),
+		).toEqual([1]);
+		expect(telemetry.state.shutdowns).toBe(1);
+
+		const observationCount = telemetry.state.observations.length;
+		await handler("tool_execution_end")(
+			{
+				toolCallId: "tool-a",
+				toolName: "bash",
+				result: { content: [{ type: "text", text: "late" }] },
+				isError: false,
+			},
+			contextA,
+		);
+		expect(telemetry.state.observations).toHaveLength(observationCount);
+	});
+
+	it("keeps the shared client alive across independent extension runtimes", async () => {
+		const agentDir = tempRoot("pi-langfuse-client-ownership-agent-");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const settings = {
+			enabled: true,
+			"public-key": "ownership-public",
+			"secret-key": "ownership-secret",
+			"base-url": "http://ownership-host",
+		};
+		const piA = createTestPi(settings);
+		const piB = createTestPi(settings);
+		await registerExtension(piA as unknown as ExtensionAPI);
+		const contextA = {
+			model: { id: "model-a", provider: "provider-a" },
+			sessionManager: {
+				getSessionFile: () =>
+					"/tmp/pi-agent/sessions/--ownership-a--/2026-07-20T18-10-00-000Z_a.jsonl",
+				getSessionId: () => "a",
+			},
+		};
+		await eventHandler(piA, "session_start")({ reason: "startup" }, contextA);
+		await eventHandler(piA, "before_agent_start")(
+			{
+				prompt: "prompt-a",
+				systemPrompt: "system-a",
+				systemPromptOptions: { cwd: "/tmp/ownership-a" },
+			},
+			contextA,
+		);
+
+		await registerExtension(piB as unknown as ExtensionAPI);
+		expect(telemetry.state.shutdowns).toBe(0);
+		const contextB = {
+			model: { id: "model-b", provider: "provider-b" },
+			sessionManager: {
+				getSessionFile: () =>
+					"/tmp/pi-agent/sessions/--ownership-b--/2026-07-20T18-10-01-000Z_b.jsonl",
+				getSessionId: () => "b",
+			},
+		};
+		await eventHandler(piB, "session_start")({ reason: "startup" }, contextB);
+		await eventHandler(piA, "session_shutdown")({}, contextA);
+		expect(telemetry.state.shutdowns).toBe(0);
+		await eventHandler(piB, "before_agent_start")(
+			{
+				prompt: "prompt-b-next",
+				systemPrompt: "system-b-next",
+				systemPromptOptions: { cwd: "/tmp/ownership-b" },
+			},
+			contextB,
+		);
+		expect(telemetry.state.traces).toHaveLength(2);
+		await eventHandler(piB, "session_shutdown")({}, contextB);
+		expect(telemetry.state.shutdowns).toBe(1);
+	});
+
+	it("does not create an observation after its prompt ownership is replaced", async () => {
+		const agentDir = tempRoot("pi-langfuse-observation-ownership-agent-");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "observation-public",
+			"secret-key": "observation-secret",
+			"base-url": "http://observation-host",
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+		const context = {
+			model: { id: "model", provider: "provider" },
+			sessionManager: {
+				getSessionFile: () =>
+					"/tmp/pi-agent/sessions/--observation--/2026-07-20T18-20-00-000Z_session.jsonl",
+				getSessionId: () => "session",
+			},
+		};
+		await eventHandler(pi, "session_start")({ reason: "startup" }, context);
+		await eventHandler(pi, "before_agent_start")(
+			{
+				prompt: "first",
+				systemPrompt: "system-first",
+				systemPromptOptions: { cwd: "/tmp/observation" },
+			},
+			context,
+		);
+
+		const pendingAgentStart = eventHandler(pi, "agent_start")({}, context);
+		const replacement = eventHandler(pi, "before_agent_start")(
+			{
+				prompt: "second",
+				systemPrompt: "system-second",
+				systemPromptOptions: { cwd: "/tmp/observation" },
+			},
+			context,
+		);
+		await Promise.all([pendingAgentStart, replacement]);
+		expect(telemetry.state.observations).toHaveLength(0);
+		await eventHandler(pi, "session_shutdown")({}, context);
+	});
+
 	it("captures configuration source precedence through the registered settings bridge", async () => {
 		const cases: Array<{
 			name: string;

@@ -80,3 +80,41 @@ Verification gates:
 Item-specific evidence: The replacement lockfile has 547 package entries and `npm ci` completed in a clean checkout. The registered compatibility path, configuration, raw traces, export, local setup, redaction, and compiled entrypoint tests passed without runtime changes. No dependency audit was required by this item. The external credentialed E2E remains skipped because credentials are unavailable.
 
 Remaining risks: The exact Node.js 22 patch used by CI was not available locally; local verification used Node.js 26 and the lower-bound gate passed. The lockfile resolves the Pi peer package to a release requiring Node.js `>=22.19.0`; CI's `node-version: 22` uses the current Node 22 patch. Session isolation, lifecycle ownership, privacy policy, telemetry transport, fallback ingestion, and release documentation remain for later items.
+
+## Handoff 2026-07-20
+
+Selected item: Runtime state is isolated by Pi session so overlapping asynchronous sessions cannot contaminate each other.
+
+Starting Git HEAD: `52e30b8897fc91d960e5c20611f8be13d4007007`.
+
+Decision rationale and assumptions: The plan places session ownership immediately after the Node.js and lockfile contract. The implementation uses a `SessionStateOwner` keyed by the persisted session-file path. Unpersisted sessions use the session-manager identity or session ID as the ownership key. Telemetry keeps the existing filename-stem session ID, so the internal Pi session ID does not change trace or raw-record correlation. Direct handler calls without a context resolve only when one local session exists; ambiguous calls do nothing instead of guessing. A process-wide session lease set protects the shared Langfuse client when separate extension runtimes overlap.
+
+Changed files:
+- `src/session-state.ts`: added the explicit per-session state owner, compatibility session-ID derivation, and process-wide session leases.
+- `src/index.ts`: moved session, model, provider, prompt, counter, observation, raw-trace, finalization, and shutdown state behind the owner; passed Pi context through every lifecycle handler; added post-await ownership checks before vendor observations; kept the shared client alive until the last session lease ends.
+- `src/compatibility.test.ts`: added registered-handler coverage for overlapping sessions, realistic Pi session IDs, independent extension runtimes, shared-client lifetime, per-session hierarchy and counters, raw-trace paths, final output, and late-event cleanup.
+- `src/index.test.ts`: closes session state in the existing direct-handler tests.
+- `.ralph/items.json`: marked only this item passing and recorded its regression coverage.
+- `.ralph/progress.md`: recorded this handoff.
+
+Targeted results:
+- `npm test -- --run src/compatibility.test.ts src/index.test.ts` passed 15 tests in 2 files.
+- `npm run typecheck -- --pretty false` passed.
+- `npx biome check src/index.ts src/session-state.ts src/compatibility.test.ts src/index.test.ts` passed.
+- `git diff --check HEAD` passed.
+
+GLM review findings and disposition: GLM supported the session-ID compatibility finding and the missing production `getSessionId()` test path. The code now derives the emitted ID from the filename stem, and the overlap test uses filenames whose stems differ from `getSessionId()` values. No other material GLM finding remained.
+
+GPT Sol review findings and disposition: GPT Sol supported the process-global client-lifetime finding. The code now uses process-wide session leases, removes factory-start client shutdown, and shuts down the client only after the last lease. The independent-runtime regression covers one runtime shutting down while another continues. GPT Sol supported the session-ID finding; the filename-stem fix and realistic test cover it. GPT Sol supported stale observation creation after asynchronous client work; ownership checks now run after local autostart and client awaits before trace, span, and generation creation, with a replacement-prompt regression. The report's model/provider reset watch-out was not material for this item because Pi emits model selection again and `before_agent_start` falls back to the context model; no change was needed.
+
+Verification gates:
+- `node -e "const major = Number(process.versions.node.split('.')[0]); if (major < 22) { console.error('Node.js 22+ required'); process.exit(1); }"` passed.
+- `npx biome check .` passed with no fixes applied.
+- `npm run typecheck` passed.
+- `npm test` passed with 56 tests and 1 credential-gated E2E test skipped.
+- `npm run build` passed.
+- `npm pack --dry-run` passed and listed `dist/index.js`, declarations, maps, `dist/session-state.js`, and `package.json`.
+
+Item-specific evidence: The registered extension harness interleaved prompt, turn, context, provider, generation, tool, model-select, compaction, agent-end, and shutdown events for two sessions. It asserted trace IDs, parent observation IDs, model/provider metadata, usage counters, tool errors, compact counts, final output, raw JSONL session paths, and cleanup after shutdown. A second regression registered two extension instances and confirmed that one shutdown did not close the shared client needed by the other. The package dry-run included the compiled session-state module and retained the `dist/index.js` entrypoint. No dependency audit was required by this item. The credentialed external E2E remained skipped because credentials were unavailable; local registered-handler coverage exercised the real extension path without paid services.
+
+Remaining risks: Duplicate and out-of-order lifecycle idempotency, modular handler extraction, the Langfuse v5 and OpenTelemetry facade, privacy budgets, fallback ingestion, additive telemetry, operator commands, and release documentation remain for later items. Client replacement across independently configured runtimes still belongs to the later runtime integration work. Credentialed external ingestion remains unverified.

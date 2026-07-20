@@ -66,8 +66,8 @@
 				"Overlap two sessions with interleaved prompt, turn, generation, tool, model-select, compact, and shutdown events.",
 				"Assert trace identity, counters, model/provider, active observations, raw-trace paths, final output, and cleanup remain isolated."
 			],
-			"passes": false,
-			"regression_notes": ""
+			"passes": true,
+			"regression_notes": "Added a registered-handler session isolation harness for overlapping sessions, realistic filename versus Pi session IDs, independent extension runtimes, shared-client lease lifetime, per-session trace hierarchy and counters, raw-trace paths, final output, and late-event cleanup. Added post-await ownership checks before trace, span, and generation creation."
 		},
 		{
 			"category": "maintainability",

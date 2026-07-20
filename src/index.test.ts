@@ -1,7 +1,7 @@
 import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import registerExtension from "./index.js";
 
 type ExtensionArg = Parameters<typeof registerExtension>[0];
@@ -27,6 +27,15 @@ describe("index (extension entry)", () => {
 		delete process.env.PI_LANGFUSE_SKIP_UNPERSISTED;
 		delete process.env.PI_LANGFUSE_RAW_PROVIDER_REQUEST;
 		delete process.env.PI_CODING_AGENT_DIR;
+	});
+
+	afterEach(async () => {
+		const sessionShutdownCall = mockPi.on.mock.calls.find(
+			(call) => call[0] === "session_shutdown",
+		);
+		if (sessionShutdownCall) {
+			await (sessionShutdownCall[1] as EventHandler)({}, undefined);
+		}
 	});
 
 	async function captureRawProviderRequestRecords(options: {

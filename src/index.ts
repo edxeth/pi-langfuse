@@ -1,5 +1,8 @@
 import { basename } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import {
 	type Config,
 	canTrace,
@@ -19,6 +22,12 @@ import { ensureLocalLangfuseStarted } from "./local-autostart.js";
 import { runLangfuseInit } from "./local-init.js";
 import { appendRawTrace, drainRawTraceQueue } from "./raw-trace.js";
 import { redactionMetadata, redactString } from "./redaction.js";
+import {
+	hasActiveSessionLeases,
+	type SessionContextLike,
+	type SessionState,
+	SessionStateOwner,
+} from "./session-state.js";
 import {
 	EXTENSION_ID,
 	getStoredSettingsValues,
@@ -82,15 +91,6 @@ interface ToolState {
 	resultOutput?: string;
 	isError?: boolean;
 }
-
-let currentSessionId = "";
-let currentSessionFile = "";
-let currentPreviousSessionFile = "";
-let currentSessionReason = "startup";
-let currentModel = "";
-let currentProvider = "";
-let promptState: PromptState | null = null;
-let compactCount = 0;
 
 const LANGFUSE_STATUS_KEY = "pi-langfuse:status";
 
@@ -271,7 +271,11 @@ function summarizeMessages(
 	return selected;
 }
 
-function summarizeProviderPayload(config: Config, payload: unknown) {
+function summarizeProviderPayload(
+	config: Config,
+	payload: unknown,
+	fallbackModel: string,
+) {
 	if (!payload || typeof payload !== "object") return { type: typeof payload };
 	const data = payload as Record<string, unknown>;
 	const messages = Array.isArray(data.messages)
@@ -281,7 +285,7 @@ function summarizeProviderPayload(config: Config, payload: unknown) {
 			)
 		: undefined;
 	return {
-		model: typeof data.model === "string" ? data.model : currentModel,
+		model: typeof data.model === "string" ? data.model : fallbackModel,
 		messageCount: Array.isArray(data.messages)
 			? data.messages.length
 			: undefined,
@@ -391,7 +395,7 @@ function getRuntimeName() {
 	return process.env.TIA_ACTIVE === "1" ? "tia" : "pi";
 }
 
-function getSessionRoot(sessionFile = currentSessionFile) {
+function getSessionRoot(sessionFile: string) {
 	const marker = "/sessions/";
 	const index = sessionFile.indexOf(marker);
 	return index >= 0
@@ -399,21 +403,20 @@ function getSessionRoot(sessionFile = currentSessionFile) {
 		: undefined;
 }
 
-function rawTraceBase(turnIndex?: number) {
+function rawTraceBase(state: SessionState<PromptState>, turnIndex?: number) {
 	return {
 		timestamp: new Date().toISOString(),
-		sessionId: currentSessionId || undefined,
-		sessionFile: currentSessionFile || undefined,
+		sessionId: state.sessionId || undefined,
+		sessionFile: state.sessionFile || undefined,
 		turnIndex,
-		provider: currentProvider || undefined,
-		model: currentModel || undefined,
+		provider: state.provider || undefined,
+		model: state.model || undefined,
 		runtime: getRuntimeName(),
 	};
 }
 
-function currentTurnIndex() {
-	if (!promptState) return undefined;
-	const activeTurns = Array.from(promptState.activeTurns.values());
+function currentTurnIndex(prompt: PromptState) {
+	const activeTurns = Array.from(prompt.activeTurns.values());
 	return activeTurns.length > 0
 		? activeTurns[activeTurns.length - 1]?.index
 		: undefined;
@@ -421,19 +424,25 @@ function currentTurnIndex() {
 
 function writeRawTrace(
 	config: Config,
+	state: SessionState<PromptState>,
 	record: { type: string } & Record<string, unknown>,
 ) {
-	appendRawTrace(config, currentSessionFile, {
+	appendRawTrace(config, state.sessionFile, {
 		...rawTraceBase(
+			state,
 			typeof record.turnIndex === "number" ? record.turnIndex : undefined,
 		),
 		redaction: redactionMetadata(config),
-		traceId: promptState?.trace?.id,
+		traceId: state.promptState?.trace?.id,
 		...record,
 	});
 }
 
-function buildTraceTags(config: Config | undefined, cwd: string) {
+function buildTraceTags(
+	config: Config | undefined,
+	state: SessionState<PromptState>,
+	cwd: string,
+) {
 	const runtime = getRuntimeName();
 	const tags = [
 		"pi",
@@ -443,16 +452,21 @@ function buildTraceTags(config: Config | undefined, cwd: string) {
 	];
 	const projectName = basename(cwd || process.cwd());
 	if (projectName) tags.push(`project:${projectName}`);
-	if (currentProvider) tags.push(`provider:${currentProvider}`);
-	if (currentModel) tags.push(`model:${currentModel}`);
-	if (currentSessionReason) tags.push(`session:${currentSessionReason}`);
+	if (state.provider) tags.push(`provider:${state.provider}`);
+	if (state.model) tags.push(`model:${state.model}`);
+	if (state.sessionReason) tags.push(`session:${state.sessionReason}`);
 	return Array.from(new Set(tags)).slice(0, 20);
 }
 
-async function finalizePrompt(config: Config | undefined, flush = false) {
-	if (!promptState) return;
+async function finalizePrompt(
+	state: SessionState<PromptState>,
+	config: Config | undefined,
+	flush = false,
+) {
+	const prompt = state.promptState;
+	if (!prompt) return;
 
-	for (const [, tool] of promptState.activeTools) {
+	for (const [, tool] of prompt.activeTools) {
 		tool.span?.end({
 			isError: tool.isError ?? true,
 			output: tool.resultOutput || tool.partialOutput,
@@ -467,9 +481,9 @@ async function finalizePrompt(config: Config | undefined, flush = false) {
 			},
 		});
 	}
-	promptState.activeTools.clear();
+	prompt.activeTools.clear();
 
-	for (const [, turn] of promptState.activeTurns) {
+	for (const [, turn] of prompt.activeTurns) {
 		if (turn.generation) {
 			turn.generation.end({
 				isError: true,
@@ -490,77 +504,86 @@ async function finalizePrompt(config: Config | undefined, flush = false) {
 			statusMessage: "turn ended during cleanup",
 		});
 	}
-	promptState.activeTurns.clear();
+	prompt.activeTurns.clear();
 
-	promptState.promptSpan?.end({
-		output: promptState.lastAssistantText || undefined,
+	prompt.promptSpan?.end({
+		output: prompt.lastAssistantText || undefined,
 		metadata: {
 			completed: true,
-			toolCalls: promptState.toolCalls,
-			toolErrors: promptState.toolErrors,
-			turns: promptState.turns,
-			durationMs: Date.now() - promptState.startedAt,
-			compactCount,
+			toolCalls: prompt.toolCalls,
+			toolErrors: prompt.toolErrors,
+			turns: prompt.turns,
+			durationMs: Date.now() - prompt.startedAt,
+			compactCount: state.compactCount,
 		},
 	});
 
-	promptState.trace?.update({
-		output: promptState.lastAssistantText || undefined,
+	prompt.trace?.update({
+		output: prompt.lastAssistantText || undefined,
 		userId: getUserId(config),
-		sessionId: currentSessionId || undefined,
-		tags: buildTraceTags(config, promptState.cwd),
+		sessionId: state.sessionId || undefined,
+		tags: buildTraceTags(config, state, prompt.cwd),
 		release: config?.release || undefined,
 		environment: config?.environment || undefined,
 		metadata: {
 			redaction: config ? redactionMetadata(config) : undefined,
-			cwd: promptState.cwd,
+			cwd: prompt.cwd,
 			systemPrompt: config
-				? telemetryText(
-						config,
-						promptState.systemPrompt,
-						config.traceInputMaxChars,
-					)
-				: truncate(promptState.systemPrompt, 2000),
-			model: currentModel,
-			provider: currentProvider,
-			sessionReason: currentSessionReason,
+				? telemetryText(config, prompt.systemPrompt, config.traceInputMaxChars)
+				: truncate(prompt.systemPrompt, 2000),
+			model: state.model,
+			provider: state.provider,
+			sessionReason: state.sessionReason,
 			runtime: getRuntimeName(),
-			sessionRoot: getSessionRoot(),
-			sessionFile: currentSessionFile || undefined,
-			previousSessionFile: currentPreviousSessionFile || undefined,
+			sessionRoot: getSessionRoot(state.sessionFile),
+			sessionFile: state.sessionFile || undefined,
+			previousSessionFile: state.previousSessionFile || undefined,
 			tiaActive: process.env.TIA_ACTIVE === "1",
 			tiaCommand: process.env.TIA_COMMAND || undefined,
 			completed: true,
-			turns: promptState.turns,
-			toolCalls: promptState.toolCalls,
-			toolErrors: promptState.toolErrors,
-			tokensIn: promptState.tokensIn,
-			tokensOut: promptState.tokensOut,
-			cacheRead: promptState.cacheRead,
-			cacheWrite: promptState.cacheWrite,
-			compactCount,
-			durationMs: Date.now() - promptState.startedAt,
+			turns: prompt.turns,
+			toolCalls: prompt.toolCalls,
+			toolErrors: prompt.toolErrors,
+			tokensIn: prompt.tokensIn,
+			tokensOut: prompt.tokensOut,
+			cacheRead: prompt.cacheRead,
+			cacheWrite: prompt.cacheWrite,
+			compactCount: state.compactCount,
+			durationMs: Date.now() - prompt.startedAt,
 		},
 	});
 
 	if (flush) {
 		await flushClient();
 	}
-	promptState = null;
+	if (state.promptState === prompt) state.promptState = null;
 }
 
 export default async function (pi: ExtensionAPI) {
 	let settings = getStoredSettingsValues(pi);
 	let lastUiContext: LangfuseUiContext | undefined;
+	const sessionOwner = new SessionStateOwner<PromptState>();
 
 	const refreshConfig = async () => {
 		settings = getStoredSettingsValues(pi);
 		registerSettings(pi, getLiveSettingsView(settings));
-		await finalizePrompt(resolveConfig(settings), true);
-		await shutdownClient();
+		const config = resolveConfig(settings);
+		for (const state of sessionOwner.values()) {
+			await finalizePrompt(state, config);
+		}
+		await flushClient();
+		if (!hasActiveSessionLeases()) await shutdownClient();
 		announceConfigState(settings);
-		updateLangfuseStatusLine(lastUiContext, resolveConfig(settings));
+		updateLangfuseStatusLine(lastUiContext, config);
 	};
+
+	const getSessionState = (
+		ctx: SessionContextLike | undefined,
+		create = false,
+	) => (create ? sessionOwner.getOrCreate(ctx) : sessionOwner.get(ctx));
+
+	const getTypedSessionState = (ctx: ExtensionContext | undefined) =>
+		getSessionState(ctx);
 
 	pi.events.on("pi-extension-settings:ready", () => {
 		registerSettings(pi, getLiveSettingsView(settings));
@@ -615,77 +638,78 @@ export default async function (pi: ExtensionAPI) {
 		},
 	});
 
-	await shutdownClient();
 	announceConfigState(settings);
 
 	pi.on("session_start", async (event, ctx) => {
+		const state = getSessionState(ctx, true);
+		if (!state) return;
 		lastUiContext = ctx;
 		updateLangfuseStatusLine(ctx, resolveConfig(settings));
-		const sessionFile = ctx.sessionManager.getSessionFile();
-		currentSessionFile = sessionFile || "";
-		if (sessionFile) {
-			const filename = sessionFile.split("/").pop() || "";
-			currentSessionId = filename.replace(".jsonl", "");
-		} else {
-			currentSessionId = "";
-		}
+		const config = resolveConfig(settings);
+		await finalizePrompt(state, config);
+
+		state.sessionFile = ctx.sessionManager.getSessionFile() || "";
 		const data = event as typeof event & {
 			reason?: string;
 			previousSessionFile?: string;
 		};
-		currentSessionReason = data.reason || "startup";
-		currentPreviousSessionFile = data.previousSessionFile || "";
-		compactCount = 0;
-		const config = resolveConfig(settings);
-		appendRawTrace(config, currentSessionFile, {
+		state.sessionReason = data.reason || "startup";
+		state.previousSessionFile = data.previousSessionFile || "";
+		state.compactCount = 0;
+		appendRawTrace(config, state.sessionFile, {
 			type: "session_start",
 			timestamp: new Date().toISOString(),
-			sessionId: currentSessionId || undefined,
-			sessionFile: currentSessionFile || undefined,
-			reason: currentSessionReason,
-			previousSessionFile: currentPreviousSessionFile || undefined,
+			sessionId: state.sessionId || undefined,
+			sessionFile: state.sessionFile || undefined,
+			reason: state.sessionReason,
+			previousSessionFile: state.previousSessionFile || undefined,
 			runtime: getRuntimeName(),
 			redaction: redactionMetadata(config),
 		});
 	});
 
-	pi.on("model_select", async (event, _ctx) => {
-		currentModel = event.model?.id || "";
-		currentProvider = event.model?.provider || "";
-		if (promptState) {
+	pi.on("model_select", async (event, ctx) => {
+		const state = getSessionState(ctx, true);
+		if (!state) return;
+		state.model = event.model?.id || "";
+		state.provider = event.model?.provider || "";
+		const prompt = state.promptState;
+		if (prompt) {
 			const config = resolveConfig(settings);
-			promptState.trace?.update({
+			prompt.trace?.update({
 				metadata: {
-					model: currentModel,
-					provider: currentProvider,
+					model: state.model,
+					provider: state.provider,
 				},
-				tags: buildTraceTags(config, promptState.cwd),
+				tags: buildTraceTags(config, state, prompt.cwd),
 			});
 		}
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
+		const state = getSessionState(ctx, true);
+		if (!state) return;
 		lastUiContext = ctx;
 		const config = resolveConfig(settings);
 		updateLangfuseStatusLine(ctx, config);
 		const sessionFile = ctx.sessionManager.getSessionFile();
 		if (config.skipUnpersistedSessions && !sessionFile) return;
 		if (!canTrace(config) && !config.rawTraceEnabled) return;
-		currentSessionFile = sessionFile || "";
+		state.sessionFile = sessionFile || "";
 
-		await finalizePrompt(config, false);
+		await finalizePrompt(state, config);
 
 		const eventData = event as typeof event & {
 			systemPromptOptions?: { cwd?: string };
 		};
 		const cwd = eventData.systemPromptOptions?.cwd || process.cwd();
 
-		if (!currentModel && ctx.model) {
-			currentModel = ctx.model.id || "";
-			currentProvider = ctx.model.provider || "";
+		if (!state.model && ctx.model) {
+			state.model = ctx.model.id || "";
+			state.provider = ctx.model.provider || "";
 		}
 
-		promptState = {
+		const prompt: PromptState = {
 			userPrompt: event.prompt,
 			systemPrompt: event.systemPrompt || "",
 			cwd,
@@ -701,27 +725,30 @@ export default async function (pi: ExtensionAPI) {
 			activeTurns: new Map(),
 			activeTools: new Map(),
 		};
+		state.promptState = prompt;
 
-		writeRawTrace(config, {
+		writeRawTrace(config, state, {
 			type: "agent_prompt_start",
 			cwd,
 			prompt: event.prompt,
 			systemPrompt: event.systemPrompt || "",
-			sessionReason: currentSessionReason,
-			previousSessionFile: currentPreviousSessionFile || undefined,
+			sessionReason: state.sessionReason,
+			previousSessionFile: state.previousSessionFile || undefined,
 		});
 
 		try {
 			if (!canTrace(config)) return;
 
 			await ensureLocalLangfuseStarted(config);
+			if (state.promptState !== prompt) return;
 			const lf = await getClient(config);
+			if (state.promptState !== prompt) return;
 			const trace = lf.trace({
 				name: "pi-agent",
 				input: telemetryText(config, event.prompt, config.traceInputMaxChars),
-				sessionId: currentSessionId || undefined,
+				sessionId: state.sessionId || undefined,
 				userId: getUserId(config),
-				tags: buildTraceTags(config, cwd),
+				tags: buildTraceTags(config, state, cwd),
 				release: config.release || undefined,
 				environment: config.environment || undefined,
 				metadata: {
@@ -732,44 +759,47 @@ export default async function (pi: ExtensionAPI) {
 						event.systemPrompt || "",
 						config.traceInputMaxChars,
 					),
-					model: currentModel,
-					provider: currentProvider,
-					sessionReason: currentSessionReason,
+					model: state.model,
+					provider: state.provider,
+					sessionReason: state.sessionReason,
 					runtime: getRuntimeName(),
-					sessionRoot: getSessionRoot(),
-					sessionFile: currentSessionFile || undefined,
-					previousSessionFile: currentPreviousSessionFile || undefined,
+					sessionRoot: getSessionRoot(state.sessionFile),
+					sessionFile: state.sessionFile || undefined,
+					previousSessionFile: state.previousSessionFile || undefined,
 					tiaActive: process.env.TIA_ACTIVE === "1",
 					tiaCommand: process.env.TIA_COMMAND || undefined,
 				},
 			});
 
-			promptState.trace = trace;
+			if (state.promptState === prompt) prompt.trace = trace;
 		} catch (e) {
 			console.warn("📊 Langfuse: Failed to create trace", e);
 		}
 	});
 
-	pi.on("agent_start", async () => {
-		if (!promptState) return;
+	pi.on("agent_start", async (_event, ctx) => {
+		const state = getTypedSessionState(ctx);
+		const prompt = state?.promptState;
+		if (!state || !prompt) return;
 		const config = resolveConfig(settings);
-		if (!canTrace(config) || !promptState.trace) return;
+		if (!canTrace(config) || !prompt.trace) return;
 		try {
 			const lf = await getClient(config);
-			promptState.promptSpan = lf.span({
+			if (state.promptState !== prompt) return;
+			prompt.promptSpan = lf.span({
 				name: "agent.prompt",
-				traceId: promptState.trace.id,
+				traceId: prompt.trace.id,
 				input: telemetryText(
 					config,
-					promptState.userPrompt,
+					prompt.userPrompt,
 					config.traceInputMaxChars,
 				),
 				metadata: {
 					redaction: redactionMetadata(config),
-					cwd: promptState.cwd,
-					model: currentModel,
-					provider: currentProvider,
-					sessionReason: currentSessionReason,
+					cwd: prompt.cwd,
+					model: state.model,
+					provider: state.provider,
+					sessionReason: state.sessionReason,
 				},
 			});
 		} catch (e) {
@@ -777,28 +807,35 @@ export default async function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("turn_start", async (event) => {
-		if (!promptState) return;
+	pi.on("turn_start", async (event, ctx) => {
+		const state = getTypedSessionState(ctx);
+		const prompt = state?.promptState;
+		if (!state || !prompt) return;
 		const config = resolveConfig(settings);
-		promptState.turns += 1;
+		prompt.turns += 1;
 		const turnState: TurnState = {
 			index: event.turnIndex,
 			startedAt: Date.now(),
 		};
-		promptState.activeTurns.set(event.turnIndex, turnState);
-		if (!canTrace(config) || !promptState.trace) return;
+		prompt.activeTurns.set(event.turnIndex, turnState);
+		if (!canTrace(config) || !prompt.trace) return;
 		try {
 			const lf = await getClient(config);
+			if (
+				state.promptState !== prompt ||
+				prompt.activeTurns.get(event.turnIndex) !== turnState
+			)
+				return;
 			turnState.span = lf.span({
 				name: "agent.turn",
-				traceId: promptState.trace.id,
-				parentObservationId: promptState.promptSpan?.id,
+				traceId: prompt.trace.id,
+				parentObservationId: prompt.promptSpan?.id,
 				metadata: {
 					redaction: redactionMetadata(config),
 					turnIndex: event.turnIndex,
-					turnNumber: promptState.turns,
-					model: currentModel,
-					provider: currentProvider,
+					turnNumber: prompt.turns,
+					model: state.model,
+					provider: state.provider,
 				},
 			});
 		} catch (e) {
@@ -809,40 +846,44 @@ export default async function (pi: ExtensionAPI) {
 	// Capture full messages (system prompt + conversation history + tools) before
 	// each LLM call. These are used as the generation input so Langfuse UI shows
 	// the complete prompt instead of just the user's text.
-	pi.on("context", async (event) => {
-		if (!promptState) return;
+	pi.on("context", async (event, ctx) => {
+		const state = getTypedSessionState(ctx);
+		const prompt = state?.promptState;
+		if (!state || !prompt) return;
 		const config = resolveConfig(settings);
 
 		// Store full context messages for raw trace (redacted at write time).
-		promptState.lastContextMessages = event.messages as Array<{
+		prompt.lastContextMessages = event.messages as Array<{
 			role: string;
 			content: unknown;
 		}>;
 
 		if (!canTrace(config)) return;
 
-		const activeTurns = Array.from(promptState.activeTurns.values());
+		const activeTurns = Array.from(prompt.activeTurns.values());
 		const activeTurn =
 			activeTurns.length > 0 ? activeTurns[activeTurns.length - 1] : undefined;
 		if (!activeTurn) return;
 
 		// Keep only bounded message summaries on the live path. Full context belongs
 		// to Pi's canonical session and raw traces, not synchronous telemetry.
-		promptState.lastMessages = summarizeMessages(
+		prompt.lastMessages = summarizeMessages(
 			config,
 			event.messages as Array<{ role?: string; content?: unknown }>,
 		);
 	});
 
-	pi.on("tool_call", async (event) => {
-		const tool = promptState?.activeTools.get(event.toolCallId);
-		if (!tool) return;
+	pi.on("tool_call", async (event, ctx) => {
+		const state = getTypedSessionState(ctx);
+		const prompt = state?.promptState;
+		const tool = prompt?.activeTools.get(event.toolCallId);
+		if (!state || !prompt || !tool) return;
 		const config = resolveConfig(settings);
 		tool.argsSummary = summarizeToolArgs(config, event.toolName, event.input);
 		tool.argsRaw = event.input;
-		writeRawTrace(config, {
+		writeRawTrace(config, state, {
 			type: "tool_call",
-			turnIndex: currentTurnIndex(),
+			turnIndex: currentTurnIndex(prompt),
 			toolCallId: event.toolCallId,
 			toolName: event.toolName,
 			input: event.input,
@@ -856,12 +897,14 @@ export default async function (pi: ExtensionAPI) {
 		});
 	});
 
-	pi.on("tool_execution_start", async (event) => {
-		if (!promptState) return;
+	pi.on("tool_execution_start", async (event, ctx) => {
+		const state = getTypedSessionState(ctx);
+		const prompt = state?.promptState;
+		if (!state || !prompt) return;
 		const config = resolveConfig(settings);
 
-		promptState.toolCalls += 1;
-		const activeTurns = Array.from(promptState.activeTurns.values());
+		prompt.toolCalls += 1;
+		const activeTurns = Array.from(prompt.activeTurns.values());
 		const activeTurn =
 			activeTurns.length > 0 ? activeTurns[activeTurns.length - 1] : undefined;
 		const toolState: ToolState = {
@@ -870,8 +913,8 @@ export default async function (pi: ExtensionAPI) {
 			argsSummary: summarizeToolArgs(config, event.toolName, event.args),
 			argsRaw: event.args,
 		};
-		promptState.activeTools.set(event.toolCallId, toolState);
-		writeRawTrace(config, {
+		prompt.activeTools.set(event.toolCallId, toolState);
+		writeRawTrace(config, state, {
 			type: "tool_execution_start",
 			turnIndex: activeTurn?.index,
 			toolCallId: event.toolCallId,
@@ -879,13 +922,18 @@ export default async function (pi: ExtensionAPI) {
 			args: event.args,
 		});
 
-		if (!canTrace(config) || !promptState.trace) return;
+		if (!canTrace(config) || !prompt.trace) return;
 		try {
 			const lf = await getClient(config);
+			if (
+				state.promptState !== prompt ||
+				prompt.activeTools.get(event.toolCallId) !== toolState
+			)
+				return;
 			toolState.span = lf.span({
 				name: `tool:${event.toolName}`,
-				traceId: promptState.trace.id,
-				parentObservationId: activeTurn?.span?.id || promptState.promptSpan?.id,
+				traceId: prompt.trace.id,
+				parentObservationId: activeTurn?.span?.id || prompt.promptSpan?.id,
 				input: toolState.argsSummary,
 				metadata: {
 					tool: event.toolName,
@@ -899,9 +947,10 @@ export default async function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("tool_execution_update", async (event) => {
-		const tool = promptState?.activeTools.get(event.toolCallId);
-		if (!tool) return;
+	pi.on("tool_execution_update", async (event, ctx) => {
+		const state = getTypedSessionState(ctx);
+		const tool = state?.promptState?.activeTools.get(event.toolCallId);
+		if (!state || !tool) return;
 		const config = resolveConfig(settings);
 		if (!config.captureToolProgress) return;
 		tool.partialOutput = summarizeToolResult(config, event.partialResult);
@@ -914,18 +963,20 @@ export default async function (pi: ExtensionAPI) {
 		});
 	});
 
-	pi.on("tool_result", async (event) => {
-		const tool = promptState?.activeTools.get(event.toolCallId);
-		if (!tool) return;
+	pi.on("tool_result", async (event, ctx) => {
+		const state = getTypedSessionState(ctx);
+		const prompt = state?.promptState;
+		const tool = prompt?.activeTools.get(event.toolCallId);
+		if (!state || !prompt || !tool) return;
 		const config = resolveConfig(settings);
 		tool.resultOutput = summarizeToolResult(config, { content: event.content });
 		tool.isError = event.isError;
 		const imgCount = (event.content ?? []).filter(
 			(c: { type: string }) => c.type === "image" || c.type === "image_url",
 		).length;
-		writeRawTrace(config, {
+		writeRawTrace(config, state, {
 			type: "tool_result_first_seen",
-			turnIndex: currentTurnIndex(),
+			turnIndex: currentTurnIndex(prompt),
 			toolCallId: event.toolCallId,
 			toolName: event.toolName,
 			inputSummary: summarizeToolArgs(config, event.toolName, event.input),
@@ -936,18 +987,20 @@ export default async function (pi: ExtensionAPI) {
 		});
 	});
 
-	pi.on("tool_execution_end", async (event) => {
-		const tool = promptState?.activeTools.get(event.toolCallId);
-		if (!tool) return;
+	pi.on("tool_execution_end", async (event, ctx) => {
+		const state = getTypedSessionState(ctx);
+		const prompt = state?.promptState;
+		const tool = prompt?.activeTools.get(event.toolCallId);
+		if (!state || !prompt || !tool) return;
 		const config = resolveConfig(settings);
 		tool.isError = event.isError;
-		if (event.isError && promptState) {
-			promptState.toolErrors += 1;
+		if (event.isError) {
+			prompt.toolErrors += 1;
 		}
 		const durationMs = Date.now() - tool.startedAt;
-		writeRawTrace(config, {
+		writeRawTrace(config, state, {
 			type: "tool_execution_end",
-			turnIndex: currentTurnIndex(),
+			turnIndex: currentTurnIndex(prompt),
 			toolCallId: event.toolCallId,
 			toolName: event.toolName,
 			argsSummary: tool.argsSummary,
@@ -970,18 +1023,20 @@ export default async function (pi: ExtensionAPI) {
 				durationMs,
 			},
 		});
-		promptState?.activeTools.delete(event.toolCallId);
+		prompt.activeTools.delete(event.toolCallId);
 	});
 
-	pi.on("message_start", async (event) => {
-		if (!promptState) return;
+	pi.on("message_start", async (event, ctx) => {
+		const state = getTypedSessionState(ctx);
+		const prompt = state?.promptState;
+		if (!state || !prompt) return;
 		const config = resolveConfig(settings);
-		if (!canTrace(config) || !promptState.trace) return;
+		if (!canTrace(config) || !prompt.trace) return;
 
 		const message = event.message as { role?: string };
 		if (message.role !== "assistant") return;
 
-		const activeTurns = Array.from(promptState.activeTurns.values());
+		const activeTurns = Array.from(prompt.activeTurns.values());
 		const turnState =
 			activeTurns.length > 0 ? activeTurns[activeTurns.length - 1] : undefined;
 		if (!turnState) return;
@@ -993,27 +1048,28 @@ export default async function (pi: ExtensionAPI) {
 		// Langfuse renders chat message arrays natively in the UI, showing the
 		// complete LLM prompt (system prompt, conversation history, tools, etc.),
 		// instead of just the raw user text.
-		const generationInput = promptState.lastMessages
-			? promptState.lastMessages
-			: telemetryText(
-					config,
-					promptState.userPrompt,
-					config.traceInputMaxChars,
-				);
+		const generationInput = prompt.lastMessages
+			? prompt.lastMessages
+			: telemetryText(config, prompt.userPrompt, config.traceInputMaxChars);
 
 		try {
 			const lf = await getClient(config);
+			if (
+				state.promptState !== prompt ||
+				prompt.activeTurns.get(turnState.index) !== turnState
+			)
+				return;
 			turnState.generation = lf.generation({
 				name: "llm-response",
-				traceId: promptState.trace.id,
-				parentObservationId: turnState.span?.id || promptState.promptSpan?.id,
+				traceId: prompt.trace.id,
+				parentObservationId: turnState.span?.id || prompt.promptSpan?.id,
 				input: generationInput,
-				model: currentModel || undefined,
+				model: state.model || undefined,
 				metadata: {
 					redaction: redactionMetadata(config),
 					turnIndex: turnState.index,
-					model: currentModel,
-					provider: currentProvider,
+					model: state.model,
+					provider: state.provider,
 				},
 			});
 		} catch (e) {
@@ -1021,15 +1077,17 @@ export default async function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("message_update", async (event) => {
-		if (!promptState) return;
+	pi.on("message_update", async (event, ctx) => {
+		const state = getTypedSessionState(ctx);
+		const prompt = state?.promptState;
+		if (!state || !prompt) return;
 		const config = resolveConfig(settings);
 		if (!canTrace(config)) return;
 
 		const message = event.message as { role?: string };
 		if (message.role !== "assistant") return;
 
-		const activeTurns = Array.from(promptState.activeTurns.values());
+		const activeTurns = Array.from(prompt.activeTurns.values());
 		const turnState =
 			activeTurns.length > 0 ? activeTurns[activeTurns.length - 1] : undefined;
 		if (!turnState?.generation) return;
@@ -1064,8 +1122,10 @@ export default async function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("message_end", async (event) => {
-		if (!promptState) return;
+	pi.on("message_end", async (event, ctx) => {
+		const state = getTypedSessionState(ctx);
+		const prompt = state?.promptState;
+		if (!state || !prompt) return;
 		const config = resolveConfig(settings);
 
 		const message = event.message as {
@@ -1076,7 +1136,7 @@ export default async function (pi: ExtensionAPI) {
 		};
 		if (message.role !== "assistant") return;
 
-		const activeTurns = Array.from(promptState.activeTurns.values());
+		const activeTurns = Array.from(prompt.activeTurns.values());
 		const turnState =
 			activeTurns.length > 0 ? activeTurns[activeTurns.length - 1] : undefined;
 		if (!turnState) return;
@@ -1091,13 +1151,13 @@ export default async function (pi: ExtensionAPI) {
 		const usageDetails = usageDetailsFromUsage(usage);
 		const costDetails = costDetailsFromUsage(usage);
 
-		promptState.lastAssistantText = telemetryText(
+		prompt.lastAssistantText = telemetryText(
 			config,
 			finalOutput,
 			config.traceOutputMaxChars,
 		);
-		promptState.lastUsage = usage;
-		writeRawTrace(config, {
+		prompt.lastUsage = usage;
+		writeRawTrace(config, state, {
 			type: "assistant_output",
 			turnIndex: turnState.index,
 			text: finalOutput,
@@ -1107,15 +1167,14 @@ export default async function (pi: ExtensionAPI) {
 		});
 
 		if (usage) {
-			promptState.tokensIn +=
+			prompt.tokensIn +=
 				(usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
-			promptState.tokensOut += usage.output ?? 0;
-			promptState.cacheRead += usage.cacheRead ?? 0;
-			promptState.cacheWrite += usage.cacheWrite ?? 0;
+			prompt.tokensOut += usage.output ?? 0;
+			prompt.cacheRead += usage.cacheRead ?? 0;
+			prompt.cacheWrite += usage.cacheWrite ?? 0;
 		}
 
-		if (!canTrace(config) || !promptState.trace || !turnState.generation)
-			return;
+		if (!canTrace(config) || !prompt.trace || !turnState.generation) return;
 
 		try {
 			turnState.generation.end({
@@ -1125,21 +1184,26 @@ export default async function (pi: ExtensionAPI) {
 				usage: standardUsage,
 				usageDetails,
 				costDetails,
-				model: message.model || currentModel || undefined,
+				model: message.model || state.model || undefined,
 				metadata: {
-					model: message.model || currentModel,
-					provider: currentProvider,
+					model: message.model || state.model,
+					provider: state.provider,
 					turnIndex: turnState.index,
 					thinking: turnState.streamingThinking || undefined,
 				},
 			});
 
 			const lf = await getClient(config);
+			if (
+				state.promptState !== prompt ||
+				prompt.activeTurns.get(turnState.index) !== turnState
+			)
+				return;
 			if (usage?.input) {
 				lf.score({
 					name: "input_tokens",
 					value: usage.input,
-					traceId: promptState.trace.id,
+					traceId: prompt.trace.id,
 					observationId: turnState.generation.id,
 				});
 			}
@@ -1147,7 +1211,7 @@ export default async function (pi: ExtensionAPI) {
 				lf.score({
 					name: "output_tokens",
 					value: usage.output,
-					traceId: promptState.trace.id,
+					traceId: prompt.trace.id,
 					observationId: turnState.generation.id,
 				});
 			}
@@ -1155,7 +1219,7 @@ export default async function (pi: ExtensionAPI) {
 				lf.score({
 					name: "total_cost",
 					value: usage.cost.total,
-					traceId: promptState.trace.id,
+					traceId: prompt.trace.id,
 					observationId: turnState.generation.id,
 				});
 			}
@@ -1164,8 +1228,10 @@ export default async function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("turn_end", async (event) => {
-		if (!promptState) return;
+	pi.on("turn_end", async (event, ctx) => {
+		const state = getTypedSessionState(ctx);
+		const prompt = state?.promptState;
+		if (!state || !prompt) return;
 		const config = resolveConfig(settings);
 
 		const message = event.message as {
@@ -1173,7 +1239,7 @@ export default async function (pi: ExtensionAPI) {
 			content?: Array<{ type: string; text?: string }>;
 			usage?: PiUsage;
 		};
-		const turnState = promptState.activeTurns.get(event.turnIndex);
+		const turnState = prompt.activeTurns.get(event.turnIndex);
 		const outputText = extractTextFromContent(message.content).trim();
 
 		const usage = message.usage;
@@ -1196,20 +1262,26 @@ export default async function (pi: ExtensionAPI) {
 				},
 			});
 		}
-		promptState.activeTurns.delete(event.turnIndex);
+		prompt.activeTurns.delete(event.turnIndex);
 	});
 
-	pi.on("before_provider_request", async (event) => {
-		if (!promptState) return;
+	pi.on("before_provider_request", async (event, ctx) => {
+		const state = getTypedSessionState(ctx);
+		const prompt = state?.promptState;
+		if (!state || !prompt) return;
 		const config = resolveConfig(settings);
 
-		const activeTurns = Array.from(promptState.activeTurns.values());
+		const activeTurns = Array.from(prompt.activeTurns.values());
 		const turnState =
 			activeTurns.length > 0 ? activeTurns[activeTurns.length - 1] : undefined;
 		if (!turnState) return;
 
 		try {
-			const payloadSummary = summarizeProviderPayload(config, event.payload);
+			const payloadSummary = summarizeProviderPayload(
+				config,
+				event.payload,
+				state.model,
+			);
 			const payloadSummaryText = safeJson(
 				config,
 				payloadSummary,
@@ -1218,14 +1290,14 @@ export default async function (pi: ExtensionAPI) {
 			const reqModel =
 				typeof (event.payload as Record<string, unknown>)?.model === "string"
 					? ((event.payload as Record<string, unknown>).model as string)
-					: currentModel;
+					: state.model;
 			// Source request messages from the actual provider payload (what was sent),
 			// falling back to the context event snapshot if the payload doesn't have messages.
 			const payloadMessages = Array.isArray(
 				(event.payload as Record<string, unknown>)?.messages,
 			)
 				? (event.payload as Record<string, unknown>).messages
-				: promptState?.lastContextMessages;
+				: prompt.lastContextMessages;
 			if (config.rawTraceProviderRequestMode !== "off") {
 				const providerRequestBase = {
 					type: "provider_request",
@@ -1242,6 +1314,7 @@ export default async function (pi: ExtensionAPI) {
 				};
 				writeRawTrace(
 					config,
+					state,
 					config.rawTraceProviderRequestMode === "full"
 						? {
 								...providerRequestBase,
@@ -1283,8 +1356,10 @@ export default async function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("agent_end", async (event) => {
-		if (!promptState) return;
+	pi.on("agent_end", async (event, ctx) => {
+		const state = getTypedSessionState(ctx);
+		const prompt = state?.promptState;
+		if (!state || !prompt) return;
 		const eventData = event as {
 			messages?: Array<{
 				role: string;
@@ -1295,46 +1370,53 @@ export default async function (pi: ExtensionAPI) {
 		const lastAssistant = messages
 			.filter((message) => message.role === "assistant")
 			.pop();
+		const config = resolveConfig(settings);
 		if (lastAssistant) {
 			const output = extractTextFromContent(lastAssistant.content).trim();
 			if (output) {
-				const config = resolveConfig(settings);
-				promptState.lastAssistantText = telemetryText(
+				prompt.lastAssistantText = telemetryText(
 					config,
 					output,
 					config.traceOutputMaxChars,
 				);
 			}
 		}
-		await finalizePrompt(resolveConfig(settings), true);
+		await finalizePrompt(state, config, true);
 	});
 
-	pi.on("session_compact", async () => {
-		compactCount += 1;
-		writeRawTrace(resolveConfig(settings), {
+	pi.on("session_compact", async (_event, ctx) => {
+		const state = getTypedSessionState(ctx);
+		if (!state) return;
+		state.compactCount += 1;
+		writeRawTrace(resolveConfig(settings), state, {
 			type: "session_compact",
-			compactCount,
+			compactCount: state.compactCount,
 		});
-		promptState?.trace?.update({
+		state.promptState?.trace?.update({
 			metadata: {
-				compactCount,
+				compactCount: state.compactCount,
 				lastCompactedAt: new Date().toISOString(),
 			},
 		});
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (_event, ctx) => {
+		const state = getTypedSessionState(ctx);
+		if (!state) {
+			if (!hasActiveSessionLeases()) {
+				drainRawTraceQueue();
+				await shutdownClient();
+			}
+			return;
+		}
 		const config = resolveConfig(settings);
-		writeRawTrace(config, {
+		writeRawTrace(config, state, {
 			type: "session_end",
-			timestamp: new Date().toISOString(),
-			sessionId: currentSessionId || undefined,
-			sessionFile: currentSessionFile || undefined,
 			reason: "shutdown",
-			runtime: getRuntimeName(),
 		});
 		drainRawTraceQueue();
-		await finalizePrompt(config, true);
-		await shutdownClient();
+		await finalizePrompt(state, config, true);
+		sessionOwner.deleteState(state);
+		if (!hasActiveSessionLeases()) await shutdownClient();
 	});
 }
