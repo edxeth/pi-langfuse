@@ -103,33 +103,87 @@ The extension does not load an extension-local `config.json`. Use `pi-langfuse.j
 | **Capture Overrides** | `PI_LANGFUSE_CAPTURE_*` | `inherit` | Set field overrides to `on` or `off` for prompt, system prompt, provider input, assistant output, tool input, tool output, or metadata. |
 | **Payload Budgets** | `PI_LANGFUSE_PAYLOAD_MAX_*` | `unlimited` | Bound strings, tool strings, depth, array items, object keys, or total nodes. Use `unlimited` for an explicit unlimited value. |
 
-## Usage
+## Commands
 
-### Toggle tracing
+Six slash commands drive setup, runtime control, diagnostics, and exports. Run them inside the Pi TUI.
+
+| Command | Description |
+| :--- | :--- |
+| `/langfuse-init` | Initialize local self-hosted or remote Langfuse. |
+| `/langfuse:toggle` | Enable or disable tracing. |
+| `/langfuse-status` | Print safe configuration and runtime status. |
+| `/langfuse-test` | Check connectivity and send an isolated test trace. |
+| `/langfuse-privacy` | Show or persist the capture policy. |
+| `/langfuse:export` | Create a local redacted export of sessions and raw traces. |
+
+### /langfuse-init
+
+Configures Langfuse for Pi without overwriting existing files. Local mode creates a self-hosted Docker Compose stack with generated secrets. Remote mode points Pi at Langfuse Cloud or an existing instance.
+
+```text
+/langfuse-init --yes --local
+/langfuse-init --yes --local --no-start
+/langfuse-init --yes --remote \
+  --host https://cloud.langfuse.com \
+  --public-key pk-lf-... \
+  --secret-key sk-lf-...
+/langfuse-init --dir ~/.pi/agent/langfuse
+```
+
+Flags:
+
+| Flag | Effect |
+| :--- | :--- |
+| `--mode local\|remote` | Setup type. `--local`, `--remote`, and `--cloud` select the same modes. |
+| `--dir <path>` | Target directory. Default `$PI_CODING_AGENT_DIR/langfuse`. |
+| `--host <url>` | Langfuse API host. Defaults to `http://localhost:3100` (local) or `https://cloud.langfuse.com` (remote). |
+| `--email`, `--name`, `--password` | Local Langfuse login. |
+| `--public-key`, `--secret-key` | Remote project keys. Also read from `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY`. |
+| `--yes`, `-y` | Skip interactive prompts. |
+| `--no-start` | Write files without running Docker Compose. |
+
+Local mode writes `docker-compose.yml`, `.env`, and `pi-langfuse.json`. Remote mode writes only `pi-langfuse.json`. Init refuses a non-empty directory.
+
+### /langfuse:toggle
 
 ```text
 /langfuse:toggle [on|off]
 ```
 
-### Init options
+With no argument, flips the current tracing state. `on` forces tracing on, `off` forces it off. The change persists to settings, refreshes the active config, updates the status line, and notifies with the resolved host or `disabled`.
 
-```text
-/langfuse-init --yes --local
-/langfuse-init --yes --local --no-start
-/langfuse-init --yes --remote --host https://cloud.langfuse.com --public-key pk-lf-... --secret-key sk-lf-...
-/langfuse-init --dir ~/.pi/agent/langfuse
-```
-
-### Operator commands
+### /langfuse-status
 
 ```text
 /langfuse-status
-/langfuse-test
-/langfuse-privacy
-/langfuse-privacy metadata-only
 ```
 
-`/langfuse-status` masks the public key and never prints the secret key. `/langfuse-test` makes an authenticated request and sends an isolated test trace with a bounded timeout. `/langfuse-privacy` shows or persists the capture policy.
+Prints safe runtime and config status: the ON/OFF label, resolved config source (`settings panel`, `pi-langfuse.json`, `environment`, or `defaults`), host, masked public key, capture policy, active-run state, config path, runtime mode (`disabled`, `v5-otel`, or `unconfigured`), and the last runtime error. The public key is masked; the secret key is never printed.
+
+### /langfuse-test
+
+```text
+/langfuse-test
+```
+
+Requires configured keys. The command makes an authenticated request to `<host>/api/public/projects` and then sends an isolated test trace under a bounded timeout. It reports pass or fail without flushing or closing an active session runtime. Errors are redacted before they reach the notification.
+
+### /langfuse-privacy
+
+```text
+/langfuse-privacy [policy]
+```
+
+With no argument or `show`, prints the capture policy, per-field capture overrides, and payload budgets. With one of `metadata-only`, `prompts-only`, `conversations`, or `full-debug`, it persists the policy to settings and refreshes the active config. Any other input prints usage.
+
+### /langfuse:export
+
+```text
+/langfuse:export [--out <dir>] [--sessions-dir <dir>] [--raw-dir <dir>]
+                 [--sessions-only] [--raw-only] [--no-trufflehog] [--require-trufflehog]
+```
+
+Creates a local redacted copy of Pi sessions and raw traces. The command blocks the TUI during processing. Redaction is always on for exports, and original files are never modified. For the full pipeline, output files, and the recommended standalone CLI for bulk runs, see [Export pipeline](#export-pipeline).
 
 ## Data flow
 
