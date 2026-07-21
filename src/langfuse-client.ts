@@ -554,6 +554,29 @@ function removeObservation(rt: RuntimeState, observation: VendorObservation) {
 	}
 }
 
+function finalizeOpenTraces(rt: RuntimeState) {
+	for (const [traceId, runtimeTrace] of rt.traces) {
+		if (runtimeTrace.ended) continue;
+		runtimeTrace.ended = true;
+		const root = runtimeTrace.root;
+		try {
+			endObservation(rt.fallbackStore, root.id, new Date().toISOString());
+			completeTrace(rt.fallbackStore, traceId);
+		} catch (error) {
+			recordRuntimeError(error);
+		}
+		try {
+			root.end();
+		} catch (error) {
+			recordRuntimeError(error);
+			console.warn(
+				"📊 Langfuse: Failed to end open prompt root during shutdown",
+				error,
+			);
+		}
+	}
+}
+
 function wrapObservation<T extends LangfuseSpan | LangfuseGeneration>(
 	rt: RuntimeState,
 	config: Config,
@@ -626,21 +649,31 @@ function createObservation(
 	const shaped = shapeBody(config, body, (policyConfig, value) =>
 		shapeLangfuseObservationBody(policyConfig, body.name, value),
 	) as typeof body;
+	const traceRoot = rt.traces.get(shaped.traceId)?.root;
 	const parent = shaped.parentObservationId
-		? rt.observations.get(shaped.parentObservationId)
-		: rt.traces.get(shaped.traceId)?.root;
-	const observation = parent
-		? startChildObservation(
-				parent,
-				shaped.name,
-				observationAttributes(shaped as ObservationBody),
-				{ asType },
+		? (rt.observations.get(shaped.parentObservationId) ?? traceRoot)
+		: traceRoot;
+	if (!parent) {
+		throw new Error(
+			`Langfuse: cannot create observation "${shaped.name}" for trace ${shaped.traceId}: the trace is not registered`,
+		);
+	}
+	const runtimeTrace = rt.traces.get(shaped.traceId);
+	const identity = runtimeTrace
+		? propagationAttributes(runtimeTrace.lastUpdate)
+		: undefined;
+	const startChild = () =>
+		startChildObservation(
+			parent,
+			shaped.name,
+			observationAttributes(shaped as ObservationBody),
+			{ asType },
+		);
+	const observation = identity
+		? runWithVendorContext(parent, () =>
+				propagateAttributes(identity, startChild),
 			)
-		: startVendorObservation(
-				shaped.name,
-				observationAttributes(shaped as ObservationBody),
-				{ asType },
-			);
+		: startChild();
 	rt.observations.set(observation.id, observation);
 	if (rt.fallbackStore.traces.has(shaped.traceId)) {
 		recordObservation(rt.fallbackStore, {
@@ -649,7 +682,7 @@ function createObservation(
 			name: shaped.name,
 			type: asType === "generation" ? "GENERATION" : "SPAN",
 			startTime: new Date().toISOString(),
-			parentObservationId: parent?.id,
+			parentObservationId: parent.id,
 			body: shaped as RestFallbackObservationBody,
 		});
 	}
@@ -776,6 +809,7 @@ async function withTimeout<T>(
 }
 
 async function shutdownRuntime(rt: RuntimeState) {
+	finalizeOpenTraces(rt);
 	try {
 		await withTimeout("OTel force flush", rt.tracerProvider.forceFlush());
 	} catch (error) {

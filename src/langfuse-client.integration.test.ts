@@ -275,4 +275,168 @@ describe("langfuse v5 local runtime", () => {
 			});
 		}
 	});
+
+	it("stamps trace identity on child spans before the prompt root exports", async () => {
+		const requests: Array<{ url: string; body: string }> = [];
+		const server = createServer((request, response) => {
+			const chunks: Buffer[] = [];
+			request.on("data", (chunk: Buffer) => chunks.push(chunk));
+			request.on("end", () => {
+				requests.push({
+					url: request.url || "",
+					body: Buffer.concat(chunks).toString("utf8"),
+				});
+				response.statusCode = 200;
+				response.setHeader("content-type", "application/json");
+				response.end(JSON.stringify({ successes: [], errors: [] }));
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", () => resolve());
+		});
+
+		try {
+			const address = server.address() as AddressInfo;
+			const runtime = await getRuntime({
+				...baseConfig,
+				host: `http://127.0.0.1:${address.port}`,
+			});
+			const trace = runtime.trace({
+				name: "pi-agent",
+				id: "c".repeat(32),
+				input: "open prompt",
+				sessionId: "open-session",
+				userId: "open-user",
+			});
+			const prompt = runtime.span({ name: "agent.prompt", traceId: trace.id });
+			const turn = runtime.span({
+				name: "agent.turn",
+				traceId: trace.id,
+				parentObservationId: prompt.id,
+			});
+			turn.end({ output: "turn output" });
+			// The prompt root is intentionally left open (prompt still in flight).
+			await flushClient();
+
+			// Only the ended child (agent.turn) is exported while the root stays open,
+			// so it must carry the trace name itself or the trace would be empty-name.
+			const otelPayload = requests
+				.filter(({ url }) => url.includes("otel"))
+				.map(({ body }) => body)
+				.join("\n");
+			expect(otelPayload).toContain("agent.turn");
+			expect(
+				otelPayload,
+				"child span must carry langfuse.trace.name before the root exports",
+			).toContain("langfuse.trace.name");
+			expect(otelPayload).toContain("pi-agent");
+			expect(otelPayload).toContain(trace.id);
+		} finally {
+			await shutdownClient();
+			await new Promise<void>((resolve, reject) => {
+				server.close((error) => (error ? reject(error) : resolve()));
+			});
+		}
+	});
+
+	it("exports an open prompt root on controlled shutdown", async () => {
+		const requests: Array<{ url: string; body: string }> = [];
+		const server = createServer((request, response) => {
+			const chunks: Buffer[] = [];
+			request.on("data", (chunk: Buffer) => chunks.push(chunk));
+			request.on("end", () => {
+				requests.push({
+					url: request.url || "",
+					body: Buffer.concat(chunks).toString("utf8"),
+				});
+				if (request.url?.includes("/api/public/traces/")) {
+					response.statusCode = 404;
+					response.end("not found");
+					return;
+				}
+				response.statusCode = 200;
+				response.setHeader("content-type", "application/json");
+				response.end(JSON.stringify({ successes: [], errors: [] }));
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", () => resolve());
+		});
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 500,
+			traceVisibilityMs: 25,
+			pollIntervalMs: 1,
+		});
+
+		try {
+			const address = server.address() as AddressInfo;
+			const runtime = await getRuntime({
+				...baseConfig,
+				host: `http://127.0.0.1:${address.port}`,
+			});
+			const trace = runtime.trace({
+				name: "pi-agent",
+				id: "d".repeat(32),
+				sessionId: "shutdown-session",
+			});
+			const prompt = runtime.span({ name: "agent.prompt", traceId: trace.id });
+			const turn = runtime.span({
+				name: "agent.turn",
+				traceId: trace.id,
+				parentObservationId: prompt.id,
+			});
+			turn.end({ output: "turn output" });
+			// Prompt root left open; simulate quitting mid-prompt.
+			await shutdownClient();
+
+			const otelPayloads = requests
+				.filter(({ url }) => url.includes("otel"))
+				.map(({ body }) => body)
+				.join("\n");
+			expect(
+				otelPayloads,
+				"open prompt root must be exported on shutdown",
+			).toContain("agent.prompt");
+		} finally {
+			restoreTimeouts();
+			await shutdownClient();
+			await new Promise<void>((resolve, reject) => {
+				server.close((error) => (error ? reject(error) : resolve()));
+			});
+		}
+	});
+
+	it("rejects a child observation whose parent trace is not registered", async () => {
+		const server = createServer((_request, response) => {
+			response.statusCode = 200;
+			response.setHeader("content-type", "application/json");
+			response.end("{}");
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", () => resolve());
+		});
+
+		try {
+			const address = server.address() as AddressInfo;
+			const runtime = await getRuntime({
+				...baseConfig,
+				host: `http://127.0.0.1:${address.port}`,
+			});
+			expect(() =>
+				runtime.span({
+					name: "agent.turn",
+					traceId: "e".repeat(32),
+					parentObservationId: "0123456789abcdef",
+				}),
+			).toThrow();
+		} finally {
+			await shutdownClient();
+			await new Promise<void>((resolve, reject) => {
+				server.close((error) => (error ? reject(error) : resolve()));
+			});
+		}
+	});
 });
