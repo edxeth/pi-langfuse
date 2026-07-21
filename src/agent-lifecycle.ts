@@ -84,7 +84,6 @@ export function createAgentLifecycleHandlers(
 	deps: AgentLifecycleDependencies,
 ): AgentLifecycleHandlers {
 	const recordPromptScores = async (
-		state: SessionState<PromptState>,
 		prompt: PromptState,
 		config: Config,
 		incomplete: boolean,
@@ -111,7 +110,6 @@ export function createAgentLifecycleHandlers(
 				lf.score({
 					...score,
 					traceId: prompt.trace.id,
-					sessionId: state.sessionId || undefined,
 				});
 			}
 		} catch (error) {
@@ -219,7 +217,7 @@ export function createAgentLifecycleHandlers(
 					},
 				});
 
-				if (config) await recordPromptScores(state, prompt, config, incomplete);
+				if (config) await recordPromptScores(prompt, config, incomplete);
 
 				if (!prompt.promptSpanEnded) {
 					prompt.promptSpanEnded = true;

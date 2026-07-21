@@ -206,16 +206,15 @@ export function createToolLifecycleHandlers(
 		} catch (error) {
 			console.warn("📊 Langfuse: Failed to end tool span", error);
 		}
-		if (body?.isError && tool.span) {
+		if (body?.isError && tool.span && prompt.trace?.id) {
 			try {
 				const lf = await deps.getRuntime(config);
 				lf.score({
 					name: "tool_is_error",
 					value: 1,
 					dataType: "BOOLEAN",
-					traceId: prompt.trace?.id,
+					traceId: prompt.trace.id,
 					observationId: tool.span.id,
-					sessionId: state.sessionId || undefined,
 				});
 			} catch (error) {
 				console.warn("📊 Langfuse: Failed to send tool error score", error);

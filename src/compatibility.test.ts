@@ -3516,6 +3516,14 @@ describe("executable compatibility contract", () => {
 				}),
 			]),
 		);
+		for (const score of telemetry.state.scores) {
+			const hasTraceId = typeof score.traceId === "string";
+			const hasSessionId = typeof score.sessionId === "string";
+			const hasObservationId = typeof score.observationId === "string";
+			expect(hasSessionId).toBe(false);
+			expect(hasTraceId).toBe(true);
+			expect(hasObservationId ? hasTraceId : true).toBe(true);
+		}
 		await eventHandler(pi, "session_shutdown")({}, context);
 	});
 

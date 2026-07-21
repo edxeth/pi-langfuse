@@ -445,30 +445,36 @@ export function createGenerationLifecycleHandlers(
 			generationState.ended = true;
 			try {
 				generationState.generation.end(body);
-				if (usage && state.promptState === prompt) {
+				if (
+					usage &&
+					state.promptState === prompt &&
+					prompt.trace?.id &&
+					generationState.generation
+				) {
 					const lf = await deps.getRuntime(config);
+					const scoreTarget = {
+						traceId: prompt.trace.id,
+						observationId: generationState.generation.id,
+					};
 					if (usage.input) {
 						lf.score({
 							name: "input_tokens",
 							value: usage.input,
-							traceId: prompt.trace?.id,
-							observationId: generationState.generation.id,
+							...scoreTarget,
 						});
 					}
 					if (usage.output) {
 						lf.score({
 							name: "output_tokens",
 							value: usage.output,
-							traceId: prompt.trace?.id,
-							observationId: generationState.generation.id,
+							...scoreTarget,
 						});
 					}
 					if (typeof usage.cost?.total === "number") {
 						lf.score({
 							name: "total_cost",
 							value: usage.cost.total,
-							traceId: prompt.trace?.id,
-							observationId: generationState.generation.id,
+							...scoreTarget,
 						});
 					}
 				}
