@@ -6,6 +6,8 @@ import { createAgentLifecycleHandlers } from "./agent-lifecycle.js";
 import {
 	type Config,
 	canTrace,
+	getConfigFilePath,
+	getConfigSources,
 	getConfigWarnings,
 	resolveConfig,
 } from "./config.js";
@@ -13,15 +15,19 @@ import { exportRedactedData } from "./export.js";
 import { createGenerationLifecycleHandlers } from "./generation-lifecycle.js";
 import {
 	flushClient,
+	getLastRuntimeError,
 	getRuntime,
 	reconfigureRuntime,
+	recordRuntimeError,
 	shutdownClient,
 } from "./langfuse-client.js";
 import type { PromptState } from "./lifecycle-types.js";
 import { ensureLocalLangfuseStarted } from "./local-autostart.js";
 import { runLangfuseInit } from "./local-init.js";
+import { sendIsolatedTestTrace } from "./operator-telemetry.js";
+import { CAPTURE_POLICIES, type CapturePolicy } from "./payload-policy.js";
 import { appendRawTrace, drainRawTraceQueue } from "./raw-trace.js";
-import { redactionMetadata } from "./redaction.js";
+import { redactionMetadata, redactString } from "./redaction.js";
 import {
 	hasActiveSessionLeases,
 	type SessionContextLike,
@@ -60,6 +66,7 @@ import { createToolLifecycleHandlers } from "./tool-lifecycle.js";
 import { createTurnLifecycleHandlers } from "./turn-lifecycle.js";
 
 const LANGFUSE_STATUS_KEY = "pi-langfuse:status";
+const LANGFUSE_TEST_TIMEOUT_MS = 3_000;
 
 interface LangfuseUiContext {
 	ui?: {
@@ -74,6 +81,66 @@ function displayPayloadLimit(value: number | undefined) {
 
 function displayCaptureOverride(value: boolean | undefined) {
 	return value === undefined ? "inherit" : value ? "on" : "off";
+}
+
+function maskPublicKey(value: string) {
+	if (!value) return "not configured";
+	if (value.length <= 8) return "****";
+	return `${value.slice(0, 4)}…${value.slice(-4)}`;
+}
+
+function formatConfigSource(settings: Partial<SettingsValues>) {
+	return getConfigSources(settings)
+		.map((source) =>
+			source === "settings"
+				? "settings panel"
+				: source === "file"
+					? "pi-langfuse.json"
+					: source,
+		)
+		.join(", ");
+}
+
+function runtimeMode(config: Config) {
+	if (!config.enabled) return "disabled";
+	return canTrace(config) ? "v5-otel" : "unconfigured";
+}
+
+function operatorSafeText(config: Config, value: string) {
+	return truncate(
+		redactString(
+			{
+				redactionEnabled: true,
+				secretKey: config.secretKey,
+				redactionAdditionalSecrets: config.redactionAdditionalSecrets,
+			},
+			value,
+		),
+		500,
+	);
+}
+
+function errorMessage(error: unknown) {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function safeHost(config: Config) {
+	try {
+		const url = new URL(config.host);
+		url.username = "";
+		url.password = "";
+		return operatorSafeText(config, url.toString().replace(/\/$/, ""));
+	} catch {
+		return operatorSafeText(config, config.host);
+	}
+}
+
+function privacyReport(config: Config) {
+	return [
+		`Capture policy: ${config.capturePolicy ?? "full-debug"}`,
+		`Overrides: prompt=${displayCaptureOverride(config.capturePrompt)}, system=${displayCaptureOverride(config.captureSystemPrompt)}, provider=${displayCaptureOverride(config.captureProviderInput)}, assistant=${displayCaptureOverride(config.captureAssistantOutput)}, tool-input=${displayCaptureOverride(config.captureToolInput)}, tool-output=${displayCaptureOverride(config.captureToolOutput)}, metadata=${displayCaptureOverride(config.captureMetadata)}`,
+		`Budgets: string=${displayPayloadLimit(config.payloadMaxStringChars)}, tool=${displayPayloadLimit(config.payloadMaxToolChars)}, depth=${displayPayloadLimit(config.payloadMaxDepth)}, array=${displayPayloadLimit(config.payloadMaxArrayItems)}, object=${displayPayloadLimit(config.payloadMaxObjectKeys)}, nodes=${displayPayloadLimit(config.payloadMaxNodes)}`,
+	].join("\n");
 }
 
 function getLiveSettingsView(
@@ -159,13 +226,56 @@ function updateLangfuseStatusLine(
 	setStatus(LANGFUSE_STATUS_KEY, `Langfuse ${status.icon}`);
 }
 
+async function runConnectivityTest(config: Config) {
+	const controller = new AbortController();
+	let timedOut = false;
+	const timer = setTimeout(() => {
+		timedOut = true;
+		controller.abort();
+	}, LANGFUSE_TEST_TIMEOUT_MS);
+	try {
+		const credentials = Buffer.from(
+			`${config.publicKey}:${config.secretKey}`,
+		).toString("base64");
+		const response = await fetch(
+			`${config.host.replace(/\/$/, "")}/api/public/projects?limit=1`,
+			{
+				headers: {
+					Accept: "application/json",
+					Authorization: `Basic ${credentials}`,
+				},
+				signal: controller.signal,
+			},
+		);
+		if (!response.ok) {
+			throw new Error(`authenticated API returned HTTP ${response.status}`);
+		}
+		await response.body?.cancel();
+		await sendIsolatedTestTrace(config, controller.signal);
+	} catch (error) {
+		if (timedOut) {
+			throw new Error(
+				`authenticated API timed out after ${LANGFUSE_TEST_TIMEOUT_MS}ms`,
+			);
+		}
+		throw error;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 export default async function (pi: ExtensionAPI) {
 	let settings = getStoredSettingsValues(pi);
 	let lastUiContext: LangfuseUiContext | undefined;
+	let commandSettingsOverrides: Partial<SettingsValues> = {};
 	const sessionOwner = new SessionStateOwner<PromptState>();
 
-	const refreshConfig = async () => {
-		settings = getStoredSettingsValues(pi);
+	const refreshConfig = async (clearCommandOverrides = false) => {
+		if (clearCommandOverrides) commandSettingsOverrides = {};
+		settings = {
+			...getStoredSettingsValues(pi),
+			...commandSettingsOverrides,
+		};
 		registerSettings(pi, getLiveSettingsView(settings));
 		const config = resolveConfig(settings);
 		for (const state of sessionOwner.values()) {
@@ -265,10 +375,10 @@ export default async function (pi: ExtensionAPI) {
 	registerSettings(pi, getLiveSettingsView(settings));
 
 	pi.events.on(`pi-extension-settings:${EXTENSION_ID}:changed`, () => {
-		void refreshConfig();
+		void refreshConfig(true);
 	});
 	pi.events.on(`extension:settings:changed:${EXTENSION_ID}`, () => {
-		void refreshConfig();
+		void refreshConfig(true);
 	});
 
 	pi.registerCommand("langfuse-init", {
@@ -301,6 +411,10 @@ export default async function (pi: ExtensionAPI) {
 						? false
 						: !current.enabled;
 
+			commandSettingsOverrides = {
+				...commandSettingsOverrides,
+				enabled: nextEnabled,
+			};
 			setSettingsValues({ enabled: nextEnabled });
 			await refreshConfig();
 
@@ -309,6 +423,99 @@ export default async function (pi: ExtensionAPI) {
 			updateLangfuseStatusLine(ctx, next);
 			const status = next.enabled ? `enabled → ${next.host}` : "disabled";
 			ctx.ui?.notify?.(`Langfuse tracing ${status}`, "info");
+		},
+	});
+
+	pi.registerCommand("langfuse-status", {
+		description:
+			"Show safe Langfuse configuration, capture, runtime, and active-run status",
+		handler: async (_args, ctx) => {
+			const config = resolveConfig(settings);
+			const state = getSessionState(ctx);
+			const activeRun =
+				Boolean(state?.promptState && !state.promptState.finalizing) ||
+				!ctx.isIdle();
+			const runtimeError = getLastRuntimeError();
+			const lastError = runtimeError
+				? `${operatorSafeText(config, runtimeError.message)} (${runtimeError.timestamp})`
+				: "none";
+			const report = [
+				`Langfuse status: ${getLangfuseStatus(config, ctx.sessionManager.getSessionFile()).label}`,
+				`config source: ${formatConfigSource(settings)}`,
+				`host: ${safeHost(config)}`,
+				`public key: ${maskPublicKey(config.publicKey)}`,
+				`capture policy: ${config.capturePolicy ?? "full-debug"}`,
+				`active run: ${activeRun ? "yes" : "no"}`,
+				`config path: ${getConfigFilePath()}`,
+				`runtime mode: ${runtimeMode(config)}`,
+				`last runtime error: ${lastError}`,
+			].join("\n");
+			ctx.ui.notify(report, "info");
+		},
+	});
+
+	pi.registerCommand("langfuse-test", {
+		description:
+			"Check authenticated Langfuse connectivity and send an isolated test trace",
+		handler: async (_args, ctx) => {
+			const config = resolveConfig(settings);
+			if (!canTrace(config)) {
+				recordRuntimeError("Langfuse credentials are not configured");
+				ctx.ui.notify(
+					"Langfuse connectivity test failed: configure public and secret keys first",
+					"error",
+				);
+				return;
+			}
+			try {
+				await runConnectivityTest(config);
+				ctx.ui.notify(
+					"Connectivity test passed: authenticated API and isolated test trace",
+					"info",
+				);
+			} catch (error) {
+				recordRuntimeError(error);
+				const safeError = operatorSafeText(config, errorMessage(error));
+				ctx.ui.notify(
+					`Langfuse connectivity test failed: ${safeError}`,
+					"error",
+				);
+			}
+		},
+	});
+
+	pi.registerCommand("langfuse-privacy", {
+		description:
+			"Inspect or persist a Langfuse capture policy with /langfuse-privacy [policy]",
+		handler: async (args, ctx) => {
+			const requested = args.trim().toLowerCase();
+			if (!requested || requested === "show") {
+				ctx.ui.notify(privacyReport(resolveConfig(settings)), "info");
+				return;
+			}
+			if (!CAPTURE_POLICIES.includes(requested as CapturePolicy)) {
+				ctx.ui.notify(
+					`Usage: /langfuse-privacy [${CAPTURE_POLICIES.join("|")}]`,
+					"warning",
+				);
+				return;
+			}
+			commandSettingsOverrides = {
+				...commandSettingsOverrides,
+				"capture-policy": requested as CapturePolicy,
+			};
+			setSettingsValues({
+				"capture-policy": requested as CapturePolicy,
+			});
+			try {
+				await refreshConfig();
+				ctx.ui.notify(`Capture policy set to ${requested}`, "info");
+			} catch (error) {
+				recordRuntimeError(error);
+				const config = resolveConfig(settings);
+				const safeError = operatorSafeText(config, errorMessage(error));
+				ctx.ui.notify(`Capture policy refresh failed: ${safeError}`, "error");
+			}
 		},
 	});
 

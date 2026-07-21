@@ -186,8 +186,8 @@
 				"Add /langfuse-privacy to inspect or persist capture presets through the existing configuration model.",
 				"Verify /langfuse-init, /langfuse:toggle, /langfuse:export, extension-settings registration and change events, config precedence, local autostart, generated Langfuse Server v3 Compose files, existing files, credentials, and volumes remain unchanged and non-destructive."
 			],
-			"passes": false,
-			"regression_notes": ""
+			"passes": true,
+			"regression_notes": "Added registered-path coverage for safe status fields and secret masking, authenticated success/401/timeout/missing-key connectivity behavior, direct isolated ingestion without shared-runtime flushes, active-run preservation, bridge-stale privacy persistence, effective mixed config provenance, existing commands, settings events, local Server v3 init, export redaction, and packaging. Targeted tests passed with 47 tests across six files; all verification gates passed with 89 tests and one credential-gated E2E skipped. GLM and GPT Sol review findings were all supported and fixed; no second review was launched."
 		},
 		{
 			"category": "release",

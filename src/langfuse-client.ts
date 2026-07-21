@@ -202,6 +202,28 @@ let shutdownStepTimeoutMs = DEFAULT_SHUTDOWN_STEP_TIMEOUT_MS;
 let traceVisibilityTimeoutMs = DEFAULT_TRACE_VISIBILITY_TIMEOUT_MS;
 let traceVisibilityPollIntervalMs = TRACE_VISIBILITY_POLL_INTERVAL_MS;
 
+export interface RuntimeError {
+	message: string;
+	timestamp: string;
+}
+
+let lastRuntimeError: RuntimeError | undefined;
+
+function runtimeErrorMessage(error: unknown) {
+	return error instanceof Error ? error.message : String(error);
+}
+
+export function recordRuntimeError(error: unknown) {
+	lastRuntimeError = {
+		message: runtimeErrorMessage(error),
+		timestamp: new Date().toISOString(),
+	};
+}
+
+export function getLastRuntimeError() {
+	return lastRuntimeError;
+}
+
 export function setRuntimeTimeoutsForTest(timeouts: {
 	shutdownStepMs: number;
 	traceVisibilityMs: number;
@@ -687,6 +709,7 @@ function wrapRuntime(rt: RuntimeState, config: Config): LangfuseRuntime {
 			try {
 				rt.scoreClient.score.create(sanitizeForTelemetry(config, body));
 			} catch (error) {
+				recordRuntimeError(error);
 				console.warn("📊 Langfuse: Failed to send score", error);
 			}
 		},
@@ -740,6 +763,7 @@ async function withTimeout<T>(
 			Promise.resolve(operation),
 			new Promise<undefined>((resolve) => {
 				timer = setTimeout(() => {
+					recordRuntimeError(`${label} timed out after ${timeoutMs}ms`);
 					onTimeout?.();
 					console.warn(`📊 Langfuse: ${label} timed out after ${timeoutMs}ms`);
 					resolve(undefined);
@@ -755,6 +779,7 @@ async function shutdownRuntime(rt: RuntimeState) {
 	try {
 		await withTimeout("OTel force flush", rt.tracerProvider.forceFlush());
 	} catch (error) {
+		recordRuntimeError(error);
 		console.warn("📊 Langfuse: Failed to flush OpenTelemetry spans", error);
 	}
 	try {
@@ -764,21 +789,25 @@ async function shutdownRuntime(rt: RuntimeState) {
 			pollIntervalMs: traceVisibilityPollIntervalMs,
 		});
 	} catch (error) {
+		recordRuntimeError(error);
 		console.warn("📊 Langfuse: Failed REST fallback ingestion", error);
 	}
 	try {
 		await withTimeout("Langfuse score flush", rt.scoreClient.flush());
 	} catch (error) {
+		recordRuntimeError(error);
 		console.warn("📊 Langfuse: Failed to flush Langfuse scores", error);
 	}
 	try {
 		await withTimeout("Langfuse client shutdown", rt.scoreClient.shutdown());
 	} catch (error) {
+		recordRuntimeError(error);
 		console.warn("📊 Langfuse: Failed to shut down Langfuse client", error);
 	}
 	try {
 		await withTimeout("OTel tracer shutdown", rt.tracerProvider.shutdown());
 	} catch (error) {
+		recordRuntimeError(error);
 		console.warn("📊 Langfuse: Failed to shut down OpenTelemetry", error);
 	}
 	setLangfuseTracerProvider(null);
@@ -810,6 +839,7 @@ export function flushClient() {
 				runtime.tracerProvider.forceFlush(),
 			);
 		} catch (error) {
+			recordRuntimeError(error);
 			console.warn("📊 Langfuse: Failed to flush OpenTelemetry spans", error);
 		}
 		try {
@@ -823,11 +853,13 @@ export function flushClient() {
 				},
 			);
 		} catch (error) {
+			recordRuntimeError(error);
 			console.warn("📊 Langfuse: Failed REST fallback ingestion", error);
 		}
 		try {
 			await withTimeout("Langfuse score flush", runtime.scoreClient.flush());
 		} catch (error) {
+			recordRuntimeError(error);
 			console.warn("📊 Langfuse: Failed to flush Langfuse scores", error);
 		}
 	});
@@ -861,18 +893,23 @@ export function getRuntimeRegistrySizeForTest() {
 
 export function getRuntime(config: Config): Promise<LangfuseRuntime> {
 	return withRuntimeTransition(async () => {
-		const key = runtimeKey(config);
-		if (
-			runtime &&
-			runtime.configKey !== key &&
-			runtime.observations.size === 0 &&
-			runtime.traces.size === 0
-		) {
-			const current = runtime;
-			runtime = null;
-			await shutdownRuntime(current);
+		try {
+			const key = runtimeKey(config);
+			if (
+				runtime &&
+				runtime.configKey !== key &&
+				runtime.observations.size === 0 &&
+				runtime.traces.size === 0
+			) {
+				const current = runtime;
+				runtime = null;
+				await shutdownRuntime(current);
+			}
+			if (!runtime) runtime = createRuntime(config);
+			return wrapRuntime(runtime, config);
+		} catch (error) {
+			recordRuntimeError(error);
+			throw error;
 		}
-		if (!runtime) runtime = createRuntime(config);
-		return wrapRuntime(runtime, config);
 	});
 }

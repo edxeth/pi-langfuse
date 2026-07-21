@@ -9,6 +9,12 @@ import { defaultRawTraceDir } from "./raw-trace.js";
 import { DEFAULT_SETTINGS, type SettingsValues } from "./settings.js";
 
 export type RawTraceProviderRequestMode = "summary" | "full" | "off";
+export type ConfigSource =
+	| "settings"
+	| "file"
+	| "environment"
+	| "defaults"
+	| "mixed";
 
 export interface Config {
 	publicKey: string;
@@ -65,7 +71,7 @@ function readConfigJson(path: string): Partial<Config> {
 }
 
 function loadConfigFile(): Partial<Config> {
-	return readConfigJson(join(defaultLocalAutostartDir(), "pi-langfuse.json"));
+	return readConfigJson(getConfigFilePath());
 }
 
 function clampNumber(
@@ -93,6 +99,93 @@ function defaultAgentDir() {
 
 function defaultLocalAutostartDir() {
 	return join(defaultAgentDir(), "langfuse");
+}
+
+export function getConfigFilePath() {
+	return join(defaultLocalAutostartDir(), "pi-langfuse.json");
+}
+
+function hasConfiguredValue(value: unknown) {
+	return typeof value === "string"
+		? value.trim().length > 0
+		: value !== undefined;
+}
+
+function addConfigSource(
+	sources: Set<Exclude<ConfigSource, "mixed">>,
+	settingValue: unknown,
+	fileValue: unknown,
+	environmentValue: unknown,
+) {
+	if (hasConfiguredValue(settingValue)) sources.add("settings");
+	else if (hasConfiguredValue(fileValue)) sources.add("file");
+	else if (hasConfiguredValue(environmentValue)) sources.add("environment");
+	else sources.add("defaults");
+}
+
+export function getConfigSources(
+	settings: Partial<SettingsValues>,
+): Array<Exclude<ConfigSource, "mixed">> {
+	const fileConfig = loadConfigFile() as Partial<Config> &
+		Record<string, unknown>;
+	const sources = new Set<Exclude<ConfigSource, "mixed">>();
+	addConfigSource(sources, settings.enabled, fileConfig.enabled, undefined);
+	addConfigSource(
+		sources,
+		settings["public-key"],
+		fileConfig.publicKey,
+		process.env.LANGFUSE_PUBLIC_KEY,
+	);
+	addConfigSource(
+		sources,
+		settings["secret-key"],
+		fileConfig.secretKey,
+		process.env.LANGFUSE_SECRET_KEY,
+	);
+	addConfigSource(
+		sources,
+		settings["base-url"],
+		fileConfig.host,
+		process.env.LANGFUSE_BASE_URL || process.env.LANGFUSE_HOST,
+	);
+	addConfigSource(
+		sources,
+		settings["user-id"],
+		fileConfig.userId,
+		process.env.PI_LANGFUSE_USER_ID || process.env.LANGFUSE_USER_ID,
+	);
+	addConfigSource(
+		sources,
+		settings["default-tags"],
+		fileConfig.defaultTags,
+		process.env.PI_LANGFUSE_TAGS,
+	);
+	addConfigSource(
+		sources,
+		settings.release,
+		fileConfig.release,
+		process.env.LANGFUSE_RELEASE || process.env.PI_LANGFUSE_RELEASE,
+	);
+	addConfigSource(
+		sources,
+		settings.environment,
+		fileConfig.environment,
+		process.env.LANGFUSE_ENV || process.env.PI_LANGFUSE_ENV,
+	);
+	addConfigSource(
+		sources,
+		settings["capture-policy"],
+		fileConfig.capturePolicy,
+		process.env.PI_LANGFUSE_CAPTURE_POLICY,
+	);
+	return [...sources];
+}
+
+export function getConfigSource(
+	settings: Partial<SettingsValues>,
+): ConfigSource {
+	const sources = getConfigSources(settings);
+	return sources.length === 1 ? sources[0] : "mixed";
 }
 
 function parseList(value: unknown, maxItems: number): string[] {

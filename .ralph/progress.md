@@ -510,3 +510,42 @@ Verification gates:
 Item-specific evidence: The registered compatibility harness drove real Pi handlers against a temporary Git repository with a credentialed remote, normal redaction disabled, unknown provider metadata containing a local path, a failed tool, a streamed assistant update, zero provider costs, and an injected score failure. The source-metadata tests covered non-Git directories, local remotes, credentialed HTTPS and SSH remotes, unknown override keys, POSIX paths, Windows drive paths, UNC paths, and device paths. The interrupted-generation regression verified `session_had_errors = 1` when the root prompt was finalized as abandoned.
 
 Remaining risks: Credentialed external ingestion remains unverified because the E2E test is intentionally skipped without Langfuse credentials. Later Ralph items still own operator commands, release documentation, dependency audit evidence, and credentialed external-ingestion verification. The ignored Ralph loop, plan, and prompt files and generated `dist/` output were not staged.
+
+## Handoff 2026-07-21
+
+Selected item: Users gain safe status, connectivity-test, and privacy commands while every existing command, config source, settings event, and self-hosted workflow remains compatible.
+
+Starting Git HEAD: `9524f491b22dca72eed8ebe61439ed03e53efa29`.
+
+Decision rationale and assumptions: This was the first unfinished item after source and health telemetry in the plan's prioritization order. `/langfuse-test` uses an authenticated projects request and a separate REST ingestion batch for a minimal isolated trace. It does not create observations in or flush the shared active-session runtime. A command settings overlay keeps a persisted privacy choice effective when a live bridge still returns its previous value; the next settings-change event clears that overlay. Status provenance reports the effective sources used by the resolved connection and capture fields. The local HTTP server replaces only the unavailable external Langfuse service.
+
+Changed files:
+- `src/index.ts`: registers status, connectivity-test, and privacy commands; formats redacted status; applies bridge-aware command settings; reports runtime diagnostics; handles bounded connectivity checks.
+- `src/config.ts`: exposes the config path and effective mixed-source provenance.
+- `src/langfuse-client.ts`: records runtime initialization, timeout, flush, score, fallback, and shutdown failures for status reporting.
+- `src/operator-telemetry.ts`: sends a bounded, redaction-safe isolated test trace through the Langfuse ingestion API without the shared runtime.
+- `src/compatibility.test.ts`: adds registered-path status, privacy, authenticated success/401/timeout/missing-key, bridge-stale persistence, active-run, and ingestion assertions.
+- `.ralph/items.json`: marks this item passing and records its regression evidence.
+- `.ralph/progress.md`: records this handoff.
+
+Targeted results:
+- `npm test -- --run src/compatibility.test.ts src/config.test.ts src/settings.test.ts src/local-init.test.ts src/langfuse-client.test.ts src/langfuse-client.integration.test.ts`: passed 47 tests in 6 files.
+- `npm run typecheck`: passed.
+- `npx biome check src/index.ts src/config.ts src/langfuse-client.ts src/operator-telemetry.ts src/compatibility.test.ts`: passed.
+- `git diff --check 9524f491b22dca72eed8ebe61439ed03e53efa29`: passed.
+
+GLM review findings and disposition: The reviewer approved the implementation. Its supported findings were fixed: runtime-boundary failures now populate the status diagnostic, the missing-credentials command guard has a registered-path regression, and config source detection now uses effective field provenance instead of unrelated environment variables. No finding was rejected.
+
+GPT Sol review findings and disposition: All supported findings were fixed. Privacy commands now retain an authoritative local overlay when the live bridge returns stale values, with a bridge-backed regression. Connectivity tests send a separate REST batch and do not flush or lock the shared runtime; the tests cover active-run preservation, failed authentication, stalled requests, and the emitted trace batch. Runtime failures now reach status through the facade diagnostic. Status reports mixed effective provenance. No finding was rejected. No second review was launched.
+
+Verification gates:
+- `node -e "const major = Number(process.versions.node.split('.')[0]); if (major < 22) { console.error('Node.js 22+ required'); process.exit(1); }"`: passed.
+- `npx biome check .`: passed with two existing configuration informational messages and no fixes.
+- `npm run typecheck`: passed.
+- `npm test`: passed with 89 tests and 1 credential-gated E2E test skipped.
+- `npm run build`: passed.
+- `npm pack --dry-run`: passed; the package contained `dist/index.js` and `dist/operator-telemetry.js` among 86 files.
+
+Item-specific evidence: The registered extension harness exercised all six new command paths, existing command registration, settings events, config precedence, local Server v3 Compose generation, export redaction, active prompt state, authenticated local API requests, isolated ingestion, and timeout/error handling. The local server verified Basic authentication, the isolated `pi-langfuse-test` trace payload, and the absence of the secret key from the payload. No dependency audit was required by this item. The credentialed external E2E remained skipped because credentials were unavailable; the local substitute covered the real command and ingestion boundary without paid services.
+
+Remaining risks: Credentialed Langfuse Cloud ingestion remains unverified. The production dependency audit and release documentation remain for the later release item. The ignored Ralph loop, plan, and prompt files and generated `dist/` output were not staged.

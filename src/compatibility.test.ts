@@ -8,6 +8,7 @@ import {
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -1514,6 +1515,9 @@ describe("executable compatibility contract", () => {
 				"langfuse-init",
 				"langfuse:export",
 				"langfuse:toggle",
+				"langfuse-status",
+				"langfuse-test",
+				"langfuse-privacy",
 			]);
 
 			const toggleContext = {
@@ -1587,6 +1591,270 @@ describe("executable compatibility contract", () => {
 		}
 
 		await eventHandler(pi, "session_shutdown")();
+	});
+
+	it("provides safe status, isolated connectivity tests, and persistent privacy presets", async () => {
+		const root = tempRoot("pi-langfuse-operator-command-");
+		process.env.PI_CODING_AGENT_DIR = root;
+		const notifications: Array<{ message: string; type?: string }> = [];
+		const requests: Array<{
+			method: string | undefined;
+			url: string | undefined;
+			authorization: string | undefined;
+		}> = [];
+		const requestBodies: string[] = [];
+		let apiStatus = 200;
+		const server = createServer((request, response) => {
+			requests.push({
+				method: request.method,
+				url: request.url,
+				authorization: request.headers.authorization,
+			});
+			const chunks: Buffer[] = [];
+			request.on("data", (chunk: Buffer) => chunks.push(chunk));
+			request.on("end", () => {
+				requestBodies.push(Buffer.concat(chunks).toString("utf8"));
+				response.writeHead(apiStatus, { "content-type": "application/json" });
+				response.end(JSON.stringify({ data: [] }));
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+		const address = server.address();
+		if (!address || typeof address === "string") {
+			throw new Error("operator command test server did not bind");
+		}
+		const host = `http://127.0.0.1:${address.port}`;
+		mkdirSync(root, { recursive: true });
+		writeFileSync(
+			join(root, "settings.json"),
+			JSON.stringify({
+				"extensions:settings": {
+					"pi-langfuse": {
+						enabled: true,
+						"public-key": "public-key-for-test",
+						"secret-key": "secret-key-for-test",
+						"base-url": host,
+						"capture-policy": "full-debug",
+					},
+				},
+			}),
+		);
+		const bridgeSettings = {
+			enabled: true,
+			"public-key": "public-key-for-test",
+			"secret-key": "secret-key-for-test",
+			"base-url": host,
+			"capture-policy": "full-debug" as const,
+		};
+		const pi = createTestPi(bridgeSettings);
+		await registerExtension(pi as unknown as ExtensionAPI);
+		const commandContext = {
+			ui: {
+				notify: (message: string, type?: string) =>
+					notifications.push({ message, type }),
+			},
+			sessionManager: {
+				getSessionFile: () => join(root, "session.jsonl"),
+			},
+			isIdle: () => false,
+		};
+		try {
+			await commandHandler(pi, "langfuse-privacy")("", commandContext);
+			expect(notifications.at(-1)?.message).toContain(
+				"Capture policy: full-debug",
+			);
+
+			await commandHandler(pi, "langfuse-privacy")(
+				"metadata-only",
+				commandContext,
+			);
+			expect(
+				JSON.parse(readFileSync(join(root, "settings.json"), "utf-8"))[
+					"extensions:settings"
+				]["pi-langfuse"]["capture-policy"],
+			).toBe("metadata-only");
+			expect(bridgeSettings["capture-policy"]).toBe("full-debug");
+			expect(notifications.at(-1)?.message).toContain(
+				"Capture policy set to metadata-only",
+			);
+
+			const sessionContext = {
+				model: { id: "operator-model", provider: "operator-provider" },
+				sessionManager: {
+					getSessionFile: () => join(root, "session.jsonl"),
+				},
+				ui: { setStatus: vi.fn() },
+			};
+			await eventHandler(pi, "session_start")({}, sessionContext);
+			await eventHandler(pi, "before_agent_start")(
+				{
+					prompt: "active operator prompt",
+					systemPrompt: "operator system",
+					systemPromptOptions: { cwd: root },
+				},
+				sessionContext,
+			);
+			const activeTrace = latestRecord(telemetry.state.traces, "pi-agent");
+			const activePrompt = telemetry.state.observations.find(
+				(record) =>
+					record.traceId === activeTrace.id && record.name === "agent.prompt",
+			);
+			expect(activePrompt).toBeDefined();
+
+			await commandHandler(pi, "langfuse-status")("", commandContext);
+			const status = notifications.at(-1)?.message ?? "";
+			expect(status).toContain("config source: settings panel");
+			expect(status).toContain(`host: ${host}`);
+			expect(status).toContain("public key: publ…test");
+			expect(status).not.toContain("secret-key-for-test");
+			expect(status).toContain("capture policy: metadata-only");
+			expect(status).toContain("active run: yes");
+			expect(status).toContain(
+				`config path: ${join(root, "langfuse", "pi-langfuse.json")}`,
+			);
+			expect(status).toContain("runtime mode: v5-otel");
+			expect(status).toContain("last runtime error: none");
+
+			await commandHandler(pi, "langfuse-test")("", commandContext);
+			expect(notifications.at(-1)).toEqual(
+				expect.objectContaining({
+					message: expect.stringContaining("Connectivity test passed"),
+					type: "info",
+				}),
+			);
+			expect(requests).toEqual([
+				{
+					method: "GET",
+					url: "/api/public/projects?limit=1",
+					authorization: `Basic ${Buffer.from("public-key-for-test:secret-key-for-test").toString("base64")}`,
+				},
+				{
+					method: "POST",
+					url: "/api/public/ingestion",
+					authorization: `Basic ${Buffer.from("public-key-for-test:secret-key-for-test").toString("base64")}`,
+				},
+			]);
+			const ingestion = JSON.parse(requestBodies[1] ?? "{}") as {
+				batch?: Array<{ type?: string; body?: Record<string, unknown> }>;
+			};
+			expect(ingestion.batch).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						type: "trace-create",
+						body: expect.objectContaining({
+							name: "pi-langfuse-test",
+							metadata: { command: "langfuse-test", isolated: true },
+						}),
+					}),
+				]),
+			);
+			expect(requestBodies[1]).not.toContain("secret-key-for-test");
+			expect(telemetry.state.flushes).toBe(0);
+			expect(activePrompt?.endCalls).toBeUndefined();
+
+			apiStatus = 401;
+			await commandHandler(pi, "langfuse-test")("", commandContext);
+			expect(notifications.at(-1)).toEqual(
+				expect.objectContaining({
+					message: expect.stringContaining("HTTP 401"),
+					type: "error",
+				}),
+			);
+			await commandHandler(pi, "langfuse-status")("", commandContext);
+			expect(notifications.at(-1)?.message).toContain(
+				"last runtime error: authenticated API returned HTTP 401",
+			);
+			expect(activePrompt?.endCalls).toBeUndefined();
+			expect(requests).toHaveLength(3);
+		} finally {
+			await eventHandler(pi, "session_shutdown")({}, commandContext);
+			await new Promise<void>((resolve, reject) => {
+				server.close((error) => (error ? reject(error) : resolve()));
+			});
+		}
+	});
+
+	it("rejects the connectivity command when credentials are missing", async () => {
+		const root = tempRoot("pi-langfuse-operator-missing-keys-");
+		process.env.PI_CODING_AGENT_DIR = root;
+		const notifications: Array<{ message: string; type?: string }> = [];
+		const pi = createTestPi({ enabled: true });
+		await registerExtension(pi as unknown as ExtensionAPI);
+		await commandHandler(pi, "langfuse-test")("", {
+			ui: {
+				notify: (message: string, type?: string) =>
+					notifications.push({ message, type }),
+			},
+			sessionManager: { getSessionFile: () => join(root, "session.jsonl") },
+			isIdle: () => true,
+		});
+		expect(notifications.at(-1)).toEqual(
+			expect.objectContaining({
+				message: expect.stringContaining("configure public and secret keys"),
+				type: "error",
+			}),
+		);
+	});
+
+	it("bounds a stalled authenticated connectivity check", async () => {
+		const root = tempRoot("pi-langfuse-operator-timeout-");
+		process.env.PI_CODING_AGENT_DIR = root;
+		const notifications: Array<{ message: string; type?: string }> = [];
+		const server = createServer(() => {
+			// Leave the response open so the command must enforce its own timeout.
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+		const address = server.address();
+		if (!address || typeof address === "string") {
+			throw new Error("operator timeout test server did not bind");
+		}
+		const host = `http://127.0.0.1:${address.port}`;
+		mkdirSync(root, { recursive: true });
+		writeFileSync(
+			join(root, "settings.json"),
+			JSON.stringify({
+				"extensions:settings": {
+					"pi-langfuse": {
+						enabled: true,
+						"public-key": "public-key-for-timeout",
+						"secret-key": "secret-key-for-timeout",
+						"base-url": host,
+					},
+				},
+			}),
+		);
+		const pi = createTestPi();
+		await registerExtension(pi as unknown as ExtensionAPI);
+		try {
+			const startedAt = Date.now();
+			await commandHandler(pi, "langfuse-test")("", {
+				ui: {
+					notify: (message: string, type?: string) =>
+						notifications.push({ message, type }),
+				},
+				sessionManager: {
+					getSessionFile: () => join(root, "session.jsonl"),
+				},
+				isIdle: () => true,
+			});
+			expect(Date.now() - startedAt).toBeLessThan(4_000);
+			expect(notifications.at(-1)).toEqual(
+				expect.objectContaining({
+					message: expect.stringContaining("timed out"),
+					type: "error",
+				}),
+			);
+		} finally {
+			await new Promise<void>((resolve, reject) => {
+				server.close((error) => (error ? reject(error) : resolve()));
+			});
+		}
 	});
 
 	it("keeps one correlated generation per model request across response edge cases", async () => {
