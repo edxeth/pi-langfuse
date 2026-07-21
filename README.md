@@ -1,17 +1,14 @@
 # pi-langfuse
 
-## 🌐 **Join the Community**
-
-> [!NOTE]
-> **Building with AI doesn’t have to be a solo grind.**  
-> Join our Discord community to meet other people exploring the latest models, tools, workflows, and ideas: **https://discord.gg/whhrDtCrSS**
->
-> We talk about what’s new, what’s useful, and what’s actually worth paying attention to in AI.  
-> *And if you want more than conversation,* members also get access to **heavily discounted AI products and services** — including deals on tools like **ChatGPT Plus** and more for just a few dollars.
-
-Full-stack Langfuse observability for [Pi Coding Agent](https://github.com/mariozechner/pi-coding-agent) — from live traces to redacted training exports.
+Full-stack Langfuse observability for [Pi Coding Agent](https://github.com/mariozechner/pi-coding-agent). The extension records live traces and redacted training exports.
 
 Every prompt, turn, tool call, and streaming response is traced with cost and token metadata. Secrets and PII are redacted at the extension boundary before anything leaves your machine. An optional append-only JSONL companion stream gives you training-ready, audit-safe data without touching Pi's original session files.
+
+## Node.js 22+ release
+
+Version 2.0.0 requires Node.js 22 or newer. The package keeps `dist/index.js` as its Pi extension entrypoint. Existing trace names, raw-trace records, local Server v3 files, credentials, and volumes remain compatible.
+
+See [Migration to 2.0](./docs/migration.md) before upgrading.
 
 ![Traces in Langfuse UI](./docs/screenshot-trace.png)
 ![Export pipeline output](./docs/screenshot-export.png)
@@ -27,6 +24,8 @@ Every prompt, turn, tool call, and streaming response is traced with cost and to
 - **Local-First Setup**: Local mode creates a self-hosted localhost Langfuse stack with generated secrets.
 - **Autostart**: Once local init is complete, the extension starts Docker Compose on demand when tracing begins.
 - **Raw Traces**: Optional redacted JSONL companion stream for training, distillation, and audit workflows.
+- **Langfuse v5 and OpenTelemetry**: Uses a typed runtime facade with bounded flush and REST fallback when a completed trace is not visible.
+- **Operator Commands**: Inspect status, test connectivity with an isolated trace, and change capture policy without interrupting an active run.
 
 ## Quick Start
 
@@ -76,8 +75,10 @@ You can also configure keys manually via env vars or settings. Configuration pre
 
 1. `/extensions:settings` if the optional settings extension is installed
 2. `$PI_CODING_AGENT_DIR/langfuse/pi-langfuse.json`
-3. `config.json` in this extension
-4. `LANGFUSE_*` environment variables
+3. `LANGFUSE_*` and `PI_LANGFUSE_*` environment variables
+4. Built-in defaults
+
+The extension does not load an extension-local `config.json`. Use `pi-langfuse.json`, the settings panel, or environment variables.
 
 ## Configuration
 
@@ -86,7 +87,7 @@ You can also configure keys manually via env vars or settings. Configuration pre
 | **Enabled** | - | `true` | Global toggle for tracing. |
 | **Public Key** | `LANGFUSE_PUBLIC_KEY` | - | Langfuse project public key. |
 | **Secret Key** | `LANGFUSE_SECRET_KEY` | - | Langfuse project secret key. |
-| **Base URL** | `LANGFUSE_HOST` | `https://cloud.langfuse.com` | API host. Use `http://localhost:3100` for local. |
+| **Base URL** | `LANGFUSE_BASE_URL` / `LANGFUSE_HOST` | `https://cloud.langfuse.com` | API host. Use `http://localhost:3100` for local. |
 | **User ID** | `PI_LANGFUSE_USER_ID` | `$USER` | Associate traces with a specific user. |
 | **Environment** | `PI_LANGFUSE_ENV` | - | Tag traces, e.g. `local`, `staging`, `production`. |
 | **Release** | `PI_LANGFUSE_RELEASE` | - | Tag traces with a version or release ID. |
@@ -98,6 +99,9 @@ You can also configure keys manually via env vars or settings. Configuration pre
 | **Raw Trace Export** | `PI_LANGFUSE_RAW_TRACE` | `false` | Redacted JSONL companion stream for training/distillation data. |
 | **Raw Trace Directory** | `PI_LANGFUSE_RAW_TRACE_DIR` | `$PI_CODING_AGENT_DIR/langfuse/raw-traces` | Root directory for raw trace companion files. |
 | **Raw Provider Request Mode** | `PI_LANGFUSE_RAW_PROVIDER_REQUEST` | `summary` | Controls `provider_request` raw records: `summary` stores bounded request shape, `full` stores the exact redacted message array, `off` skips the record. |
+| **Capture Policy** | `PI_LANGFUSE_CAPTURE_POLICY` | `full-debug` | Select `metadata-only`, `prompts-only`, `conversations`, or `full-debug`. |
+| **Capture Overrides** | `PI_LANGFUSE_CAPTURE_*` | `inherit` | Set field overrides to `on` or `off` for prompt, system prompt, provider input, assistant output, tool input, tool output, or metadata. |
+| **Payload Budgets** | `PI_LANGFUSE_PAYLOAD_MAX_*` | `unlimited` | Bound strings, tool strings, depth, array items, object keys, or total nodes. Use `unlimited` for an explicit unlimited value. |
 
 ## Usage
 
@@ -115,6 +119,17 @@ You can also configure keys manually via env vars or settings. Configuration pre
 /langfuse-init --yes --remote --host https://cloud.langfuse.com --public-key pk-lf-... --secret-key sk-lf-...
 /langfuse-init --dir ~/.pi/agent/langfuse
 ```
+
+### Operator commands
+
+```text
+/langfuse-status
+/langfuse-test
+/langfuse-privacy
+/langfuse-privacy metadata-only
+```
+
+`/langfuse-status` masks the public key and never prints the secret key. `/langfuse-test` makes an authenticated request and sends an isolated test trace with a bounded timeout. `/langfuse-privacy` shows or persists the capture policy.
 
 ## Data flow
 
@@ -205,7 +220,7 @@ Fallback:     <agent-dir>/langfuse/raw-traces/--unknown--/<session>.jsonl
 
 Record types: `session_start`, `agent_prompt_start`, `provider_request`, `tool_call`, `tool_result_first_seen`, `tool_execution_end`, `assistant_output`, `session_compact`, `session_end`.
 
-The key record is `tool_result_first_seen`: it captures a redacted summary of tool output immediately (no truncation — only secrets are redacted), before later extensions can compress or rewrite it. Raw traces continue writing even if Langfuse tracing is disabled or the server is unavailable. Raw trace writes are queued from event handlers and drained synchronously on session shutdown so no data is lost on clean exit. Very large records still require redaction, JSON serialization, and disk I/O, so use full provider-request capture only for controlled debug or data-capture runs.
+The key record is `tool_result_first_seen`: it captures a redacted summary of tool output before later extensions can compress or rewrite it. Configured capture policies and payload budgets shape new records. Raw traces continue writing even if Langfuse tracing is disabled or the server is unavailable. Raw trace writes are queued from event handlers and drained synchronously on session shutdown so no data is lost on clean exit. Very large records still require redaction, JSON serialization, and disk I/O, so use full provider-request capture only for controlled debug or data-capture runs.
 
 `provider_request` records store bounded summaries by default: model, message count, estimated bytes, and redacted message summaries. Set `rawTraceProviderRequestMode` or `PI_LANGFUSE_RAW_PROVIDER_REQUEST=full` to capture the exact full redacted message array sent to the LLM. Set it to `off` to skip `provider_request` records entirely. `PI_LANGFUSE_RAW_PROVIDER_REQUEST` is a per-process override, so `PI_LANGFUSE_RAW_PROVIDER_REQUEST=full pi` can run one controlled exact-capture session without permanently changing the config file. `session_end` marks a clean session shutdown.
 
@@ -346,8 +361,11 @@ Pi sessions + raw traces
 - **Wrong login?** Check the generated `.env` for `LANGFUSE_INIT_USER_EMAIL` and `LANGFUSE_INIT_USER_PASSWORD`.
 - **Incomplete traces?** Ensure your Pi version supports `message_*`, tool, and session lifecycle events.
 - **Cost is zero?** Token usage can be captured even when model pricing is not configured.
-- **Large payloads in Langfuse UI?** Adjust the max-char limits in config/settings.
+- **Large payloads in Langfuse UI?** Select a smaller capture policy or set the payload budgets in config/settings.
 - **No raw trace file?** Check `rawTraceEnabled`, `rawTraceDir`, and that the run uses a persisted session rather than `--no-session`.
+- **Need a safe diagnostic?** Run `/langfuse-status` and `/langfuse-test` before changing the active runtime.
+
+For detailed setup, privacy, troubleshooting, and migration guidance, see [docs/](./docs/).
 
 ## Acknowledgments
 

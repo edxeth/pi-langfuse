@@ -549,3 +549,54 @@ Verification gates:
 Item-specific evidence: The registered extension harness exercised all six new command paths, existing command registration, settings events, config precedence, local Server v3 Compose generation, export redaction, active prompt state, authenticated local API requests, isolated ingestion, and timeout/error handling. The local server verified Basic authentication, the isolated `pi-langfuse-test` trace payload, and the absence of the secret key from the payload. No dependency audit was required by this item. The credentialed external E2E remained skipped because credentials were unavailable; the local substitute covered the real command and ingestion boundary without paid services.
 
 Remaining risks: Credentialed Langfuse Cloud ingestion remains unverified. The production dependency audit and release documentation remain for the later release item. The ignored Ralph loop, plan, and prompt files and generated `dist/` output were not staged.
+
+## Iteration start 2026-07-21
+
+Selected item: The refactor is locally end-to-end verified and packaged as a documented Node.js 22+ major-release candidate without publishing it.
+
+Starting Git HEAD: `3f44b72b906c46e529104941d0764413b4b596a9`.
+
+Assumption: Version 2.0.0 is the major-release candidate requested by the plan. The existing registered extension integration remains the local no-credentials substitute. A temporary package fixture provides only the Pi peer boundary while the real packaged dependencies, compiled `dist/index.js` entrypoint, extension registration, and command registration execute unchanged. Production audit scope excludes dev and host-provided peer dependencies; the Langfuse OpenTelemetry runtime peers are direct dependencies and remain audited. The peer host is not bundled in the published tarball and remains the host project's audit responsibility.
+
+## Handoff 2026-07-21
+
+Selected item: The refactor is locally end-to-end verified and packaged as a documented Node.js 22+ major-release candidate without publishing it.
+
+Decision rationale and assumptions: This was the only unfinished authoritative Ralph item and the final release-readiness step. Version 2.0.0 records the planned Node.js 22+ major release without publishing or tagging it. The local registered extension and ephemeral HTTP tests replace only unavailable credentialed Langfuse services. The package smoke fixture installs the tarball with `--omit=peer`, so the direct Langfuse OpenTelemetry runtime dependencies, compiled entrypoint, registration path, and command setup execute without npm's automatic peer installation. The host-provided Pi peer remains outside the package audit boundary.
+
+Changed files:
+- `.github/workflows/ci.yml`: added production dependency audit and package smoke checks.
+- `README.md`: documented the Node.js 22+ 2.0.0 candidate, actual configuration precedence, capture budgets, operator commands, diagnostics, and documentation links; removed unrelated promotional copy.
+- `docs/architecture.md`: documented the v5/OpenTelemetry facade, session ownership, observation lifecycle, fallback, and privacy boundaries.
+- `docs/extension-settings-best-practices.md`: documented Node.js 22, actual settings precedence, supported settings, and runtime reconfiguration.
+- `docs/migration.md`, `docs/self-hosting.md`, `docs/privacy.md`, `docs/troubleshooting.md`: added migration, local setup, privacy, and troubleshooting guidance.
+- `package.json`: bumped the candidate to 2.0.0, removed unused `@opentelemetry/sdk-node`, declared the Langfuse OpenTelemetry runtime peers directly, and added audit, package smoke, and release verification scripts.
+- `package-lock.json`: regenerated from the package manifest and removed the unused SDK Node dependency tree.
+- `scripts/package-smoke.mjs`: packs the real tarball, installs it with peer installation omitted, loads `dist/index.js`, verifies command registration and bundled documentation, and cleans its temporary fixture.
+- `.ralph/items.json`: marked only the selected item passing and recorded its evidence.
+- `.ralph/progress.md`: recorded this handoff.
+
+Targeted results:
+- `npm test -- --run src/extension-runtime.integration.test.ts src/langfuse-client.integration.test.ts src/compatibility.test.ts`: passed 20 tests in 3 files after review fixes.
+- `npm run package:smoke`: passed with `pi-langfuse-2.0.0.tgz`, peer installation omitted, compiled entrypoint loading, command registration, and six bundled documentation files verified.
+- `npm run audit:production`: passed with 0 vulnerabilities for the bundled runtime dependency tree. The direct OTel exporter, core, API, context manager, and SDK trace packages are included; the host-provided Pi peer is excluded.
+- `npm run typecheck`: passed.
+- `npx biome check .`: passed with two existing informational configuration messages and no fixes.
+- `git diff --check HEAD`: passed.
+- An initial temporary `npm ci` exposed stale lock entries after dependency removal. The lockfile was regenerated from an empty package-only checkout, and the clean install passed on the rerun.
+
+GLM review findings and disposition: GLM approved the change and reported one P2 audit-scope note. The note was addressed by declaring `@opentelemetry/core` and `@opentelemetry/exporter-trace-otlp-http` as direct runtime dependencies, keeping their transitive exporter tree in the audit, and documenting that only the unbundled host Pi peer is outside scope. No material GLM finding remains.
+
+GPT Sol review findings and disposition: All three supported findings were fixed. The runtime peer finding was fixed with direct OTel dependencies, an `--omit=peer` package smoke regression, and a complete bundled-runtime audit. The documentation finding was fixed by including `docs/` in the package and verifying the installed Markdown targets. The self-hosting timeout finding was fixed by documenting the bounded health request and detached Docker Compose behavior without claiming a startup timeout. No findings were rejected, and no second review was launched.
+
+Verification gates:
+- `node -e "const major = Number(process.versions.node.split('.')[0]); if (major < 22) { console.error('Node.js 22+ required'); process.exit(1); }"`: passed.
+- `npx biome check .`: passed with two existing informational configuration messages.
+- `npm run typecheck`: passed.
+- `npm test`: passed with 89 tests and 1 credential-gated E2E test skipped.
+- `npm run build`: passed.
+- `npm pack --dry-run`: passed; the 2.0.0 package contains `dist/index.js`, all compiled runtime files, and the bundled Markdown documentation.
+
+Item-specific evidence: The existing registered extension integration exercised session state, lifecycle handlers, payload policy, v5/OpenTelemetry export, scoring, concurrent tools, raw traces, redaction, local Server v3 initialization, operator commands, and shutdown. The ephemeral local HTTP server covered real OTel export and REST fallback without paid credentials. A clean temporary checkout assembled from the current worktree installed with `npm ci`, ran all six verification gates, and ran `npm run verify:release`; every command passed with 89 tests and one credential-gated E2E skip. The final tarball contained 94 files, loaded through the compiled entrypoint, and included the new documentation. No publish, tag, deployment, production data mutation, or external message occurred.
+
+Remaining risks: Credentialed Langfuse Cloud ingestion remains unverified because the E2E test is skipped without credentials. The host-provided Pi peer owns its own dependency audit. No unfinished Ralph items remain.

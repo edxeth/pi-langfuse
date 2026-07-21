@@ -1,6 +1,6 @@
 # Extension settings integration best practices
 
-This project integrates with `@axnic/pi-extension-settings` using the event protocol directly instead of importing the SDK runtime.
+Version 2.0 requires Node.js 22 or newer. The extension integrates with `@axnic/pi-extension-settings` through its event protocol instead of importing the SDK runtime.
 
 ## Why this approach
 
@@ -55,14 +55,14 @@ That keeps the extension responsive across the original settings panel and bridg
 
 ### 5. Use precedence explicitly
 
-For this extension the recommended precedence is:
+The resolved precedence is:
 
 1. settings panel values
-2. local `config.json`
-3. environment variables
-4. hardcoded defaults
+2. `$PI_CODING_AGENT_DIR/langfuse/pi-langfuse.json`
+3. `LANGFUSE_*` and `PI_LANGFUSE_*` environment variables
+4. built-in defaults
 
-Document this clearly so users know which source wins.
+The extension does not load an extension-local `config.json`.
 
 ### 6. Be careful with secrets
 
@@ -75,18 +75,9 @@ If you expose secrets anyway, document the trade-off plainly.
 
 ## Langfuse-specific recommendations
 
-For this extension, expose only these fields in settings:
+The settings panel exposes connection fields, trace metadata, capture policies, field overrides, payload budgets, redaction, and raw-trace settings. Empty connection fields display the current fallback value.
 
-- `enabled`
-- `public-key`
-- `secret-key`
-- `base-url`
-
-And keep the runtime behavior simple:
-
-- recompute effective config on every relevant change
-- shut down and recreate the Langfuse client when config changes
-- avoid partial mutable config state scattered across files
+On each supported change event the extension recomputes the effective config, finalizes active prompts, flushes pending telemetry, and reconfigures the shared runtime. The runtime remains available to ordinary prompts and shuts down only when no session lease remains.
 
 ## What to avoid
 
@@ -104,4 +95,4 @@ The best practice for this extension is:
 - use the event protocol directly
 - keep install-time dependencies minimal
 - support the settings panel when present
-- keep env/config fallbacks working when it is absent
+- keep file and environment fallbacks working when it is absent

@@ -22,6 +22,9 @@ jobs:
     - name: Install dependencies
       run: npm ci
 
+    - name: Production dependency audit
+      run: npm run audit:production
+
     - name: Biome Check
       run: npx biome check .
 
@@ -42,3 +45,6 @@ jobs:
 
     - name: Package dry-run
       run: npm pack --dry-run
+
+    - name: Package smoke test
+      run: npm run package:smoke

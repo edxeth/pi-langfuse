@@ -4,7 +4,7 @@ This document describes the internal architecture of the Langfuse extension for 
 
 ## Tracing Model
 
-The extension maps Pi's agentic lifecycle to a hierarchical Langfuse model. This allows you to drill down from a high-level user prompt into specific LLM turns and tool executions.
+The extension maps Pi's agent lifecycle to a hierarchical Langfuse model. Langfuse v5 and OpenTelemetry provide the transport through a typed local facade. Lifecycle modules do not import vendor observation types.
 
 ### Hierarchy
 
@@ -24,25 +24,29 @@ Trace (name: "pi-agent")
 
 ## Data Flow
 
-1.  **Initialization**: On `session_start`, we capture the `sessionId` from the Pi session file.
-2.  **Prompt Start**: `before_agent_start` creates the root Langfuse trace.
+1.  **Initialization**: On `session_start`, the extension assigns events to a `SessionStateOwner` keyed by the Pi session context and captures the session filename stem for trace correlation.
+2.  **Prompt Start**: `before_agent_start` creates the `pi-agent` trace and `agent.prompt` root observation.
 3.  **Turn Loop**:
-    - `turn_start` opens an `agent.turn` span.
-    - `message_start` (assistant) opens an `llm-response` generation.
-    - `message_update` appends streaming text/thinking to the generation.
-    - `tool_execution_start` opens a tool span nested under the turn.
-    - `message_end` finalizes the generation with usage data.
+    - `turn_start` opens an `agent.turn` span under the prompt.
+    - `message_start` (assistant) opens an `llm-response` generation under the turn.
+    - `message_update` appends streaming text and thinking to the generation.
+    - `tool_execution_start` or `tool_call` opens one tool span under the active turn.
+    - `tool_result` stores provisional result data; `tool_execution_end` supplies authoritative completion data.
+    - `message_end` finalizes the generation with usage, cost, and provider metadata.
     - `turn_end` closes the turn span.
-4.  **Finalization**: `agent_end` or `finalizePrompt` closes any abandoned spans and updates the trace with aggregate metrics (total tokens, total tool calls).
+4.  **Finalization**: `agent_end`, configuration refresh, session replacement, or `session_shutdown` closes unfinished child observations before the parent and updates trace health and aggregate metrics.
+5.  **Flush and fallback**: A bounded OTel flush runs at prompt completion. If a completed trace is not visible, the facade sends one redacted REST batch attempt and retires the snapshot.
 
 ## State Management
 
-The extension uses an in-memory `promptState` to track active observations. Because Pi can execute tools in parallel or have complex turn logic, we use `Map` structures to correlate events via `turnIndex` or `toolCallId`.
+Each session owns its model, provider, prompt, turn, generation, tool, counter, raw-trace, and finalization state. The owner rejects ambiguous events instead of attaching them to an arbitrary session. A process-wide lease set keeps the shared Langfuse runtime alive while another extension runtime still owns a session.
 
-## Truncation & Privacy
+Maps correlate turns by `turnIndex`, generations by their ordered request state inside a turn, and tools by `toolCallId`. Start, update, end, abandon, and cleanup transitions are idempotent. Late events after cleanup do not create new observations.
 
-To avoid sending massive payloads to Langfuse:
-- User prompts and assistant responses are truncated based on `trace-input-max-chars`.
-- Tool arguments and results are truncated based on `tool-args-max-chars` and `tool-output-max-chars`.
-- Raw `provider_request` records store bounded summaries by default. Set `rawTraceProviderRequestMode: "full"` or `PI_LANGFUSE_RAW_PROVIDER_REQUEST=full` only for controlled runs that need the exact provider message array.
-- Sensitive environment variables are **not** captured by default.
+## Truncation and privacy
+
+Payload policy runs before each Langfuse or raw-trace write. The default `full-debug` policy preserves existing capture behavior. `metadata-only`, `prompts-only`, and `conversations` reduce content capture without changing structural trace identifiers. Fine-grained overrides and payload budgets apply to strings, tool payloads, depth, collections, and total nodes.
+
+Exports force redaction independently of live capture settings. Raw `provider_request` records store bounded summaries by default. Set `rawTraceProviderRequestMode: "full"` or `PI_LANGFUSE_RAW_PROVIDER_REQUEST=full` only for controlled runs that need the exact redacted provider message array.
+
+See [privacy.md](./privacy.md) for the policy matrix and redaction boundary.

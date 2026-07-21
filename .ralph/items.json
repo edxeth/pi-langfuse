@@ -198,8 +198,8 @@
 				"Run a production dependency audit and resolve every high or critical issue introduced by the refactor; do not mask audit failures.",
 				"Update README, architecture, settings, self-hosting, privacy, troubleshooting, and migration documentation for the Node.js 22+ major release; prepare publish workflow checks without publishing, tagging, or creating a release."
 			],
-			"passes": false,
-			"regression_notes": ""
+			"passes": true,
+			"regression_notes": "Added Node.js 22+ 2.0.0 package metadata, direct Langfuse OpenTelemetry runtime peers, clean-install and tarball smoke checks, production audit and CI checks, and bundled migration, architecture, settings, self-hosting, privacy, and troubleshooting docs. The package smoke installs with --omit=peer, loads dist/index.js, registers commands, and verifies bundled docs. Clean temporary checkout and full gates passed with 89 tests and 1 credential-gated E2E skipped; the host-provided Pi peer remains outside the package audit scope."
 		}
 	]
 }

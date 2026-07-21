@@ -1,6 +1,6 @@
 {
 	"name": "pi-langfuse",
-	"version": "1.3.3",
+	"version": "2.0.0",
 	"description": "Production-grade Langfuse observability for Pi. Tracks prompts, turns, tools, and streaming assistant responses with native trace hierarchies, token usage, and cost monitoring.",
 	"type": "module",
 	"main": "dist/index.js",
@@ -9,7 +9,8 @@
 		"pi-langfuse-export": "./dist/export-cli.js"
 	},
 	"files": [
-		"dist"
+		"dist",
+		"docs"
 	],
 	"scripts": {
 		"build": "tsc",
@@ -21,7 +22,10 @@
 		"test:watch": "vitest",
 		"prepare": "husky",
 		"prepack": "npm run build",
-		"release": "release-it"
+		"audit:production": "npm audit --omit=dev --omit=peer --audit-level=high",
+		"package:smoke": "node scripts/package-smoke.mjs",
+		"release": "release-it",
+		"verify:release": "npm run audit:production && npm run package:smoke"
 	},
 	"lint-staged": {
 		"src/**/*.{js,ts,json}": "biome check --write",
@@ -54,7 +58,8 @@
 		"@langfuse/tracing": "^5.9.1",
 		"@opentelemetry/api": "^1.9.1",
 		"@opentelemetry/context-async-hooks": "^2.9.0",
-		"@opentelemetry/sdk-node": "^0.218.0",
+		"@opentelemetry/core": "^2.9.0",
+		"@opentelemetry/exporter-trace-otlp-http": "^0.220.0",
 		"@opentelemetry/sdk-trace-base": "^2.9.0"
 	},
 	"devDependencies": {
