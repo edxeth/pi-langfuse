@@ -234,6 +234,23 @@ describe("langfuse v5 runtime facade", () => {
 			traceId: trace.id,
 		});
 		mediaGeneration.end({ output: mediaOutput });
+		const actualMedia = lf.span({
+			name: "tool:actual-media",
+			traceId: trace.id,
+		});
+		actualMedia.end({ output: "data:image/png;base64,AAAA" });
+		const embeddedMedia = lf.span({
+			name: "tool:embedded-media",
+			traceId: trace.id,
+		});
+		embeddedMedia.end({
+			output: "before data:image/png;base64,AAAA after",
+		});
+		const repeatedPrefixes = lf.span({
+			name: "tool:repeated-prefixes",
+			traceId: trace.id,
+		});
+		repeatedPrefixes.end({ output: "data: first, then data: second" });
 
 		const serialized = JSON.stringify(mocks.records);
 		expect(serialized).not.toContain("sk-lf-test-secret-1234567890");
@@ -251,11 +268,30 @@ describe("langfuse v5 runtime facade", () => {
 			if (!output || output === "undefined") continue;
 			expect(output).not.toMatch(/^data:/);
 			expect(output).toContain('data\\: 0:"Hello! How can I help you today?"');
-			expect(output).toContain('data: d:{"credits_used":0.0046');
+			expect(output).toContain('data\\: d:{"credits_used":0.0046');
 		}
 		expect(serialized).toContain("data\\\\: 0:");
-		expect(serialized).toContain("data: d:");
+		expect(serialized).toContain("data\\\\: d:");
 		expect(serialized).toContain("credits_used");
+		const actualMediaRecord = mocks.records.find(
+			(item) => item.name === "tool:actual-media",
+		);
+		expect(
+			(actualMediaRecord?.end as Record<string, unknown> | undefined)?.output,
+		).toBe("data:image/png;base64,AAAA");
+		const embeddedMediaRecord = mocks.records.find(
+			(item) => item.name === "tool:embedded-media",
+		);
+		expect(
+			(embeddedMediaRecord?.end as Record<string, unknown> | undefined)?.output,
+		).toBe("before data:image/png;base64,AAAA after");
+		const repeatedPrefixesRecord = mocks.records.find(
+			(item) => item.name === "tool:repeated-prefixes",
+		);
+		expect(
+			(repeatedPrefixesRecord?.end as Record<string, unknown> | undefined)
+				?.output,
+		).toBe("data\\: first, then data\\: second");
 		expect(serialized).toContain("[REDACTED:langfuse-secret-key:");
 		expect(serialized).toContain("[REDACTED:github-token:");
 		expect(serialized).toContain("[REDACTED:bearer-token:");

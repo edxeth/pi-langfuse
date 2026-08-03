@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { trace as otelTrace } from "@opentelemetry/api";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "./config.js";
 import {
 	flushClient,
@@ -113,6 +113,67 @@ describe("langfuse v5 local runtime", () => {
 			expect(payloads.join("\n")).toContain("second");
 		} finally {
 			await shutdownClient();
+			await new Promise<void>((resolve, reject) => {
+				server.close((error) => (error ? reject(error) : resolve()));
+			});
+		}
+	});
+
+	it("prevents non-media data prefixes from corrupting later media", async () => {
+		const requests: string[] = [];
+		const consoleError = vi
+			.spyOn(console, "error")
+			.mockImplementation(() => undefined);
+		const server = createServer((request, response) => {
+			requests.push(request.url || "");
+			request.resume();
+			request.on("end", () => {
+				response.statusCode = 200;
+				response.setHeader("content-type", "application/json");
+				response.end("{}");
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", () => resolve());
+		});
+
+		try {
+			const address = server.address() as AddressInfo;
+			const runtime = await getRuntime({
+				...baseConfig,
+				host: `http://127.0.0.1:${address.port}`,
+			});
+			const trace = runtime.trace({
+				name: "embedded-data-prefixes",
+				input: "ordinary prompt",
+			});
+			const generation = runtime.generation({
+				name: "llm-response",
+				traceId: trace.id,
+			});
+			generation.end({
+				output: [
+					'SSE example: data: {"id":"chunk-1","delta":"hello"}',
+					"Terminator example: data: [DONE]",
+					"Image documentation: data:image/png;base64,AAAA",
+				].join("\n"),
+			});
+			await flushClient();
+
+			expect(requests.some((url) => url.includes("/api/public/media"))).toBe(
+				true,
+			);
+			expect(
+				consoleError.mock.calls.some((call) =>
+					call.some((value) =>
+						String(value).includes("Error parsing base64 data URI"),
+					),
+				),
+			).toBe(false);
+		} finally {
+			await shutdownClient();
+			consoleError.mockRestore();
 			await new Promise<void>((resolve, reject) => {
 				server.close((error) => (error ? reject(error) : resolve()));
 			});

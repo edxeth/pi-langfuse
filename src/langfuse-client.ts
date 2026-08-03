@@ -244,19 +244,14 @@ export function setRuntimeTimeoutsForTest(timeouts: {
 	};
 }
 
-function isBase64DataUri(value: string): boolean {
-	return /^data:[^,;]+(?:;[^,;]+)*;base64,[A-Za-z0-9+/=_-]+$/i.test(value);
-}
-
 function neutralizeLangfuseMediaPrefix<T>(
 	value: T,
 	seen = new WeakSet<object>(),
 ): T {
 	if (typeof value === "string") {
-		return (
-			value.startsWith("data:") && !isBase64DataUri(value)
-				? `data\\:${value.slice("data:".length)}`
-				: value
+		return value.replace(
+			/data:(?![^,;]+(?:;[^,;]+)*;base64,[A-Za-z0-9+/=_-]+)/g,
+			"data\\:",
 		) as T;
 	}
 	if (!value || typeof value !== "object") return value;
