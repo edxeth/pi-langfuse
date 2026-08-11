@@ -90,6 +90,7 @@ type RestFallbackEvent = {
 };
 
 const MAX_REST_BATCH_BYTES = 3_500_000;
+const MAX_REPORTED_FAILURE_REASONS = 3;
 const FALLBACK_METADATA = {
 	source: "pi-langfuse",
 	fallback: "rest-ingestion",
@@ -373,11 +374,10 @@ async function withTimeout<T>(
 	try {
 		return await Promise.race([
 			Promise.resolve(operation),
-			new Promise<undefined>((resolve) => {
+			new Promise<never>((_resolve, reject) => {
 				timer = setTimeout(() => {
 					onTimeout();
-					console.warn(`📊 Langfuse: ${label} timed out after ${timeoutMs}ms`);
-					resolve(undefined);
+					reject(new Error(`${label} timed out after ${timeoutMs}ms`));
 				}, timeoutMs);
 			}),
 		]);
@@ -454,27 +454,61 @@ async function sendBatch(
 		metadata: FALLBACK_METADATA,
 	} as unknown as RestIngestionRequest;
 	const controller = new AbortController();
-	try {
-		const response = await withTimeout(
-			"REST fallback ingestion",
-			ingestion.batch(request, {
-				timeoutInSeconds: Math.max(timeoutMs / 1000, 0.001),
-				maxRetries: 0,
-				abortSignal: controller.signal,
-			}),
-			timeoutMs,
-			() => controller.abort(),
+	const response = await withTimeout(
+		"REST fallback ingestion",
+		ingestion.batch(request, {
+			timeoutInSeconds: Math.max(timeoutMs / 1000, 0.001),
+			maxRetries: 0,
+			abortSignal: controller.signal,
+		}),
+		timeoutMs,
+		() => controller.abort(),
+	);
+	const errors = (response as { errors?: unknown[] } | undefined)?.errors;
+	if (Array.isArray(errors) && errors.length > 0) {
+		throw new Error(
+			`REST fallback ingestion reported ${errors.length} error(s); first error: ${ingestionErrorSummary(errors[0])}`,
 		);
-		const errors = (response as { errors?: unknown[] } | undefined)?.errors;
-		if (Array.isArray(errors) && errors.length > 0) {
-			console.warn(
-				"📊 Langfuse: REST fallback ingestion reported errors",
-				errors,
-			);
-		}
-	} catch (error) {
-		console.warn("📊 Langfuse: Failed REST fallback ingestion", error);
 	}
+}
+
+function boundedDiagnostic(value: unknown, maxChars = 500) {
+	let text: string;
+	if (typeof value === "string") {
+		text = value;
+	} else {
+		try {
+			// JSON.stringify returns undefined for undefined, functions, and symbols.
+			text = JSON.stringify(value) ?? String(value);
+		} catch {
+			text = String(value);
+		}
+	}
+	const singleLine = text.replace(/\s+/g, " ").trim();
+	return singleLine.length > maxChars
+		? `${singleLine.slice(0, maxChars - 1)}…`
+		: singleLine;
+}
+
+function ingestionErrorSummary(value: unknown) {
+	if (!value || typeof value !== "object") return boundedDiagnostic(value);
+	const error = value as Record<string, unknown>;
+	const details: string[] = [];
+	if (typeof error.id === "string") {
+		details.push(`id=${boundedDiagnostic(error.id, 120)}`);
+	}
+	if (typeof error.status === "number") details.push(`status=${error.status}`);
+	if (typeof error.message === "string") {
+		details.push(`message=${boundedDiagnostic(error.message)}`);
+	}
+	if (error.error !== undefined) {
+		details.push(`error=${boundedDiagnostic(error.error)}`);
+	}
+	return details.length > 0 ? details.join(", ") : boundedDiagnostic(value);
+}
+
+function fallbackFailureMessage(reason: unknown) {
+	return boundedDiagnostic(reason instanceof Error ? reason.message : reason);
 }
 
 function retireTrace(store: RestFallbackStore, trace: RestFallbackTrace) {
@@ -510,11 +544,28 @@ export async function drainCompletedRestFallback(
 			.map(({ trace }) => trace);
 		if (missing.length === 0) return;
 		const batches = buildBatches(missing);
-		await Promise.all(
+		const results = await Promise.allSettled(
 			batches.map((events) =>
 				sendBatch(client, events, options.requestTimeoutMs),
 			),
 		);
+		const failures = results.filter(
+			(result): result is PromiseRejectedResult => result.status === "rejected",
+		);
+		if (failures.length > 0) {
+			const reasons = Array.from(
+				new Set(
+					failures.map((failure) => fallbackFailureMessage(failure.reason)),
+				),
+			);
+			// Cap the joined reasons so one terminal line stays constant-bounded even
+			// when every batch fails for a different reason.
+			const shown = reasons.slice(0, MAX_REPORTED_FAILURE_REASONS);
+			const omitted = reasons.length - shown.length;
+			throw new Error(
+				`REST fallback ingestion failed for ${failures.length}/${batches.length} batch(es): ${shown.join("; ")}${omitted > 0 ? ` (+${omitted} more)` : ""}`,
+			);
+		}
 	} finally {
 		for (const trace of candidates) retireTrace(store, trace);
 	}

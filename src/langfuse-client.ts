@@ -819,7 +819,7 @@ async function shutdownRuntime(rt: RuntimeState) {
 		});
 	} catch (error) {
 		recordRuntimeError(error);
-		console.warn("📊 Langfuse: Failed REST fallback ingestion", error);
+		console.warn(`📊 Langfuse: ${runtimeErrorMessage(error)}`);
 	}
 	try {
 		await withTimeout("Langfuse score flush", rt.scoreClient.flush());
@@ -883,7 +883,7 @@ export function flushClient() {
 			);
 		} catch (error) {
 			recordRuntimeError(error);
-			console.warn("📊 Langfuse: Failed REST fallback ingestion", error);
+			console.warn(`📊 Langfuse: ${runtimeErrorMessage(error)}`);
 		}
 		try {
 			await withTimeout("Langfuse score flush", runtime.scoreClient.flush());

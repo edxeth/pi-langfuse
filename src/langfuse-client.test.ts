@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "./config.js";
 import {
 	flushClient,
+	getLastRuntimeError,
 	getRuntime,
 	getRuntimeRegistrySizeForTest,
 	setRuntimeTimeoutsForTest,
@@ -57,7 +58,12 @@ const mocks = vi.hoisted(() => {
 	}
 
 	const traceGet = vi.fn(async () => ({ id: "visible-trace" }));
-	const ingestionBatch = vi.fn(async () => ({ successes: [], errors: [] }));
+	const ingestionBatch = vi.fn(
+		async (): Promise<{ successes: unknown[]; errors: unknown[] }> => ({
+			successes: [],
+			errors: [],
+		}),
+	);
 	const client = {
 		api: {
 			trace: { get: traceGet },
@@ -616,6 +622,225 @@ describe("langfuse v5 runtime facade", () => {
 			await shutdownClient();
 			expect(mocks.ingestionBatch).toHaveBeenCalledTimes(calls.length);
 		} finally {
+			restoreTimeouts();
+		}
+	});
+
+	it("reports one diagnostic when multiple fallback batches time out", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 20,
+			traceVisibilityMs: 10,
+			pollIntervalMs: 1,
+		});
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			const payload = "x ".repeat(1_100_000);
+			mocks.traceGet.mockReset().mockRejectedValue(new Error("not visible"));
+			mocks.ingestionBatch
+				.mockReset()
+				.mockImplementation(() => new Promise<never>(() => {}));
+			const fallbackConfig = {
+				...config,
+				payloadMaxStringChars: Infinity,
+				payloadMaxToolChars: Infinity,
+				payloadMaxDepth: Infinity,
+				payloadMaxArrayItems: Infinity,
+				payloadMaxObjectKeys: Infinity,
+				payloadMaxNodes: Infinity,
+			};
+			const lf = await getRuntime(fallbackConfig);
+			for (const id of ["e".repeat(32), "f".repeat(32)]) {
+				const trace = lf.trace({ id, name: "pi-agent", input: payload });
+				const prompt = lf.span({ name: "agent.prompt", traceId: trace.id });
+				prompt.end({ output: "done" });
+			}
+
+			await flushClient();
+
+			expect(mocks.ingestionBatch.mock.calls.length).toBeGreaterThan(1);
+			const fallbackWarnings = warn.mock.calls.filter(([message]) =>
+				String(message).includes("REST fallback ingestion"),
+			);
+			expect(fallbackWarnings).toHaveLength(1);
+			expect(fallbackWarnings[0]).toHaveLength(1);
+			expect(String(fallbackWarnings[0]?.[0])).not.toContain("\n");
+			expect(getLastRuntimeError()?.message).toContain(
+				"REST fallback ingestion",
+			);
+		} finally {
+			mocks.ingestionBatch.mockResolvedValue({ successes: [], errors: [] });
+			warn.mockRestore();
+			restoreTimeouts();
+		}
+	});
+
+	it("preserves bounded REST ingestion error details", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 20,
+			traceVisibilityMs: 10,
+			pollIntervalMs: 1,
+		});
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			mocks.traceGet.mockReset().mockRejectedValue(new Error("not visible"));
+			mocks.ingestionBatch.mockReset().mockResolvedValue({
+				successes: [],
+				errors: [
+					{
+						id: "event-1",
+						status: 400,
+						message: "invalid observation",
+					},
+				],
+			});
+			const lf = await getRuntime(config);
+			const trace = lf.trace({ name: "pi-agent", input: "prompt" });
+			const prompt = lf.span({ name: "agent.prompt", traceId: trace.id });
+			prompt.end({ output: "done" });
+
+			await flushClient();
+
+			const fallbackWarning = warn.mock.calls.find(([message]) =>
+				String(message).includes("REST fallback ingestion"),
+			);
+			expect(fallbackWarning).toHaveLength(1);
+			expect(String(fallbackWarning?.[0])).toContain("event-1");
+			expect(String(fallbackWarning?.[0])).toContain("invalid observation");
+			expect(getLastRuntimeError()?.message).toContain("invalid observation");
+		} finally {
+			mocks.ingestionBatch.mockResolvedValue({ successes: [], errors: [] });
+			warn.mockRestore();
+			restoreTimeouts();
+		}
+	});
+
+	it("bounds multiline REST request failures to one warning line", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 20,
+			traceVisibilityMs: 10,
+			pollIntervalMs: 1,
+		});
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			mocks.traceGet.mockReset().mockRejectedValue(new Error("not visible"));
+			mocks.ingestionBatch
+				.mockReset()
+				.mockRejectedValue(
+					new Error(
+						`HTTP 413\n{\n  "message": "payload too large"\n}\n${"body ".repeat(300)}`,
+					),
+				);
+			const lf = await getRuntime(config);
+			const trace = lf.trace({ name: "pi-agent", input: "prompt" });
+			const prompt = lf.span({ name: "agent.prompt", traceId: trace.id });
+			prompt.end({ output: "done" });
+
+			await flushClient();
+
+			const fallbackWarning = warn.mock.calls.find(([message]) =>
+				String(message).includes("REST fallback ingestion"),
+			);
+			expect(fallbackWarning).toHaveLength(1);
+			const warningText = String(fallbackWarning?.[0]);
+			expect(warningText).toContain("HTTP 413");
+			expect(warningText).not.toContain("\n");
+			expect(warningText.length).toBeLessThan(700);
+		} finally {
+			mocks.ingestionBatch.mockResolvedValue({ successes: [], errors: [] });
+			warn.mockRestore();
+			restoreTimeouts();
+		}
+	});
+
+	it("still reports one diagnostic when a batch rejects without an Error", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 20,
+			traceVisibilityMs: 10,
+			pollIntervalMs: 1,
+		});
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			mocks.traceGet.mockReset().mockRejectedValue(new Error("not visible"));
+			mocks.ingestionBatch.mockReset().mockRejectedValue(undefined);
+			const lf = await getRuntime(config);
+			const trace = lf.trace({ name: "pi-agent", input: "prompt" });
+			const prompt = lf.span({ name: "agent.prompt", traceId: trace.id });
+			prompt.end({ output: "done" });
+
+			await flushClient();
+
+			const fallbackWarning = warn.mock.calls.find(([message]) =>
+				String(message).includes("REST fallback ingestion"),
+			);
+			expect(fallbackWarning).toHaveLength(1);
+			expect(String(fallbackWarning?.[0])).not.toContain("\n");
+			expect(getLastRuntimeError()?.message).toContain(
+				"REST fallback ingestion",
+			);
+		} finally {
+			mocks.ingestionBatch.mockResolvedValue({ successes: [], errors: [] });
+			warn.mockRestore();
+			restoreTimeouts();
+		}
+	});
+
+	it("caps the joined reasons when every batch fails differently", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 20,
+			traceVisibilityMs: 10,
+			pollIntervalMs: 1,
+		});
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			const payload = "x ".repeat(1_000_000);
+			mocks.traceGet.mockReset().mockRejectedValue(new Error("not visible"));
+			let call = 0;
+			mocks.ingestionBatch.mockReset().mockImplementation(async () => {
+				call += 1;
+				return {
+					successes: [],
+					errors: [
+						{
+							id: `event-${call}`,
+							status: 400,
+							message: `distinct failure ${call}`,
+						},
+					],
+				};
+			});
+			const fallbackConfig = {
+				...config,
+				payloadMaxStringChars: Infinity,
+				payloadMaxToolChars: Infinity,
+				payloadMaxDepth: Infinity,
+				payloadMaxArrayItems: Infinity,
+				payloadMaxObjectKeys: Infinity,
+				payloadMaxNodes: Infinity,
+			};
+			const lf = await getRuntime(fallbackConfig);
+			for (const id of ["1", "2", "3", "4"].map((n) => n.repeat(32))) {
+				const trace = lf.trace({ id, name: "pi-agent", input: payload });
+				const prompt = lf.span({ name: "agent.prompt", traceId: trace.id });
+				prompt.end({ output: "done" });
+			}
+
+			await flushClient();
+
+			expect(mocks.ingestionBatch.mock.calls.length).toBeGreaterThan(3);
+			const fallbackWarnings = warn.mock.calls.filter(([message]) =>
+				String(message).includes("REST fallback ingestion"),
+			);
+			expect(fallbackWarnings).toHaveLength(1);
+			const warningText = String(fallbackWarnings[0]?.[0]);
+			expect(warningText).toContain("more)");
+			expect(warningText).not.toContain("\n");
+			expect(warningText.length).toBeLessThan(1_800);
+		} finally {
+			mocks.ingestionBatch.mockReset().mockResolvedValue({
+				successes: [],
+				errors: [],
+			});
+			warn.mockRestore();
 			restoreTimeouts();
 		}
 	});
