@@ -103,7 +103,7 @@ The extension does not load an extension-local `config.json`. Use `pi-langfuse.j
 | **Additional Redaction Secrets** | `PI_LANGFUSE_REDACTION_SECRETS` | - | Comma-separated literal secrets to redact in addition to env/config secrets. |
 | **Raw Trace Export** | `PI_LANGFUSE_RAW_TRACE` | `false` | Redacted JSONL companion stream for training/distillation data. |
 | **Raw Trace Directory** | `PI_LANGFUSE_RAW_TRACE_DIR` | `$PI_CODING_AGENT_DIR/langfuse/raw-traces` | Root directory for raw trace companion files. |
-| **Raw Provider Request Mode** | `PI_LANGFUSE_RAW_PROVIDER_REQUEST` | `summary` | Controls `provider_request` raw records: `summary` stores bounded request shape, `full` stores the exact redacted message array, `off` skips the record. |
+| **Raw Provider Request Mode** | `PI_LANGFUSE_RAW_PROVIDER_REQUEST` | `summary` | Controls `provider_request` raw records: `summary` stores bounded request shape, `full` stores the exact redacted request contents, `off` skips the record. |
 | **Capture Policy** | `PI_LANGFUSE_CAPTURE_POLICY` | `full-debug` | Select `metadata-only`, `prompts-only`, `conversations`, or `full-debug`. |
 | **Capture Overrides** | `PI_LANGFUSE_CAPTURE_*` | `inherit` | Set field overrides to `on` or `off` for prompt, system prompt, provider input, assistant output, tool input, tool output, or metadata. |
 | **Payload Budgets** | `PI_LANGFUSE_PAYLOAD_MAX_*` | `unlimited` | Bound strings, tool strings, depth, array items, object keys, or total nodes. Use `unlimited` for an explicit unlimited value. |
@@ -266,10 +266,11 @@ Enable in config:
 ```json
 {
   "rawTraceEnabled": true,
-  "rawTraceDir": "$PI_CODING_AGENT_DIR/langfuse/raw-traces",
   "rawTraceProviderRequestMode": "summary"
 }
 ```
+
+Omit `rawTraceDir` to use the default `<agent-dir>/langfuse/raw-traces`, where `<agent-dir>` is the Pi agent directory (`$PI_CODING_AGENT_DIR`). Configuration values are not variable-expanded: a literal `$PI_CODING_AGENT_DIR` inside the JSON would create a directory with that literal name under the current project. To override the directory, set `PI_LANGFUSE_RAW_TRACE_DIR` or write a real absolute path.
 
 Raw traces mirror Pi's session layout under `raw-traces/`:
 
@@ -283,7 +284,7 @@ Record types: `session_start`, `agent_prompt_start`, `provider_request`, `tool_c
 
 The key record is `tool_result_first_seen`: it captures a redacted summary of tool output before later extensions can compress or rewrite it. Configured capture policies and payload budgets shape new records. Raw traces continue writing even if Langfuse tracing is disabled or the server is unavailable. Raw trace writes are queued from event handlers and drained synchronously on session shutdown so no data is lost on clean exit. Very large records still require redaction, JSON serialization, and disk I/O, so use full provider-request capture only for controlled debug or data-capture runs.
 
-`provider_request` records store bounded summaries by default: model, message count, estimated bytes, and redacted message summaries. Set `rawTraceProviderRequestMode` or `PI_LANGFUSE_RAW_PROVIDER_REQUEST=full` to capture the exact full redacted message array sent to the LLM. Set it to `off` to skip `provider_request` records entirely. `PI_LANGFUSE_RAW_PROVIDER_REQUEST` is a per-process override, so `PI_LANGFUSE_RAW_PROVIDER_REQUEST=full pi` can run one controlled exact-capture session without permanently changing the config file. `session_end` marks a clean session shutdown.
+`provider_request` records store bounded summaries by default: model, request source, item count, estimated bytes, and redacted message summaries. Recognized request shapes include Chat Completions `messages`, Responses `input`, Google `contents` (with `config.systemInstruction` recorded as the system prompt field), and pi-protocol `context.messages`. Set `rawTraceProviderRequestMode` or `PI_LANGFUSE_RAW_PROVIDER_REQUEST=full` to capture the exact full redacted request contents sent to the LLM. Set it to `off` to skip `provider_request` records entirely. `PI_LANGFUSE_RAW_PROVIDER_REQUEST` is a per-process override, so `PI_LANGFUSE_RAW_PROVIDER_REQUEST=full pi` can run one controlled exact-capture session without permanently changing the config file. `session_end` marks a clean session shutdown.
 
 #### Session lifecycle
 

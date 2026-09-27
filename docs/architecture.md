@@ -47,6 +47,6 @@ Maps correlate turns by `turnIndex`, generations by their ordered request state 
 
 Payload policy runs before each Langfuse or raw-trace write. The default `full-debug` policy preserves existing capture behavior. `metadata-only`, `prompts-only`, and `conversations` reduce content capture without changing structural trace identifiers. Fine-grained overrides and payload budgets apply to strings, tool payloads, depth, collections, and total nodes.
 
-Exports force redaction independently of live capture settings. Raw `provider_request` records store bounded summaries by default. Set `rawTraceProviderRequestMode: "full"` or `PI_LANGFUSE_RAW_PROVIDER_REQUEST=full` only for controlled runs that need the exact redacted provider message array.
+Exports force redaction independently of live capture settings. Raw `provider_request` records store bounded summaries by default. Set `rawTraceProviderRequestMode: "full"` or `PI_LANGFUSE_RAW_PROVIDER_REQUEST=full` only for controlled runs that need the exact redacted provider request contents.
 
 See [privacy.md](./privacy.md) for the policy matrix and redaction boundary.
