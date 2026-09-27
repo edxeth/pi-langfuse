@@ -50,7 +50,14 @@ const report = exportRedactedData(resolveConfig({}), args, {
 		process.stderr.write(`${progressLine(progress)}\n`);
 	},
 });
-const status = report.summary.rejected === 0 ? "approved" : "rejected";
+if (report.error) {
+	process.stderr.write(`Export failed: ${report.error.message}\n`);
+}
+const status = report.error
+	? "failed"
+	: report.summary.rejected === 0
+		? "approved"
+		: "rejected";
 console.log(
 	JSON.stringify(
 		{
@@ -58,10 +65,11 @@ console.log(
 			outDir: report.outDir,
 			summary: report.summary,
 			trufflehog: report.trufflehog,
+			error: report.error,
 		},
 		null,
 		2,
 	),
 );
 
-if (report.summary.rejected > 0) process.exitCode = 2;
+if (report.error || report.summary.rejected > 0) process.exitCode = 2;

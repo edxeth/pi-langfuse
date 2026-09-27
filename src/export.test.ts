@@ -176,6 +176,70 @@ describe("redacted export", () => {
 		expect(report.outDir).toBe(resolve(join(root, "my export")));
 	});
 
+	it("rejects a nonempty export destination without writing or deleting anything", () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-langfuse-export-dest-test-"));
+		const sessions = join(root, "sessions");
+		const out = join(root, "export");
+		mkdirSync(sessions, { recursive: true });
+		mkdirSync(out, { recursive: true });
+		const staleFile = join(out, "stale-previous-run.jsonl");
+		writeFileSync(staleFile, "UNREDACTED_MARKER_77\n");
+		writeFileSync(
+			join(sessions, "session.jsonl"),
+			'{"type":"message","content":"safe content"}\n',
+		);
+
+		const report = exportRedactedData(
+			baseConfig,
+			`--sessions-only --sessions-dir ${sessions} --out ${out} --no-trufflehog`,
+		);
+
+		// The stale user file survives untouched and no export artifacts appear.
+		expect(readFileSync(staleFile, "utf-8")).toBe("UNREDACTED_MARKER_77\n");
+		expect(existsSync(join(out, "report.json"))).toBe(false);
+		expect(existsSync(join(out, "sessions"))).toBe(false);
+		expect(report.error).toBeDefined();
+		expect(report.error?.code).toBe("destination-not-empty");
+		expect(report.files).toHaveLength(0);
+	});
+
+	it("allows re-export into an empty existing destination", () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-langfuse-export-empty-test-"));
+		const sessions = join(root, "sessions");
+		const out = join(root, "export");
+		mkdirSync(sessions, { recursive: true });
+		mkdirSync(out, { recursive: true });
+		writeFileSync(
+			join(sessions, "session.jsonl"),
+			'{"type":"message","content":"safe content"}\n',
+		);
+
+		const report = exportRedactedData(
+			baseConfig,
+			`--sessions-only --sessions-dir ${sessions} --out ${out} --no-trufflehog`,
+		);
+
+		expect(report.error).toBeUndefined();
+		expect(report.summary).toMatchObject({ files: 1, approved: 1 });
+		expect(existsSync(join(out, "report.json"))).toBe(true);
+	});
+
+	it("rejects a destination path that is an existing file", () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-langfuse-export-file-test-"));
+		const sessions = join(root, "sessions");
+		const out = join(root, "occupied");
+		mkdirSync(sessions, { recursive: true });
+		writeFileSync(out, "not a directory\n");
+
+		const report = exportRedactedData(
+			baseConfig,
+			`--sessions-only --sessions-dir ${sessions} --out ${out} --no-trufflehog`,
+		);
+
+		expect(readFileSync(out, "utf-8")).toBe("not a directory\n");
+		expect(report.error?.code).toBe("destination-not-a-directory");
+	});
+
 	it("rejects exports when TruffleHog scan fails", () => {
 		const root = mkdtempSync(join(tmpdir(), "pi-langfuse-export-test-"));
 		const bin = join(root, "bin");

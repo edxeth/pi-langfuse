@@ -36,6 +36,11 @@ interface ExportFileResult {
 	residualFindings: RedactionFinding[];
 }
 
+interface ExportDestinationError {
+	code: "destination-not-empty" | "destination-not-a-directory";
+	message: string;
+}
+
 interface ExportReport {
 	createdAt: string;
 	outDir: string;
@@ -45,6 +50,8 @@ interface ExportReport {
 		rejected: number;
 		files: number;
 	};
+	/** Set when the export aborted before writing anything. */
+	error?: ExportDestinationError;
 	trufflehog?: {
 		enabled: boolean;
 		required: boolean;
@@ -70,6 +77,32 @@ type CommandContext = {
 		notify?: (message: string, type?: "info" | "warning" | "error") => unknown;
 	};
 };
+
+/**
+ * Refuse destinations the export must not touch: a nonempty directory may
+ * hold unrelated user files (reusing a directory must never delete or mix
+ * with them), and a non-directory cannot receive the export tree.
+ * Returns undefined when the destination is usable.
+ */
+function checkExportDestination(
+	outDir: string,
+): ExportDestinationError | undefined {
+	const existing = statSync(outDir, { throwIfNoEntry: false });
+	if (!existing) return undefined;
+	if (!existing.isDirectory()) {
+		return {
+			code: "destination-not-a-directory",
+			message: `export destination exists and is not a directory: ${outDir}`,
+		};
+	}
+	if (readdirSync(outDir).length > 0) {
+		return {
+			code: "destination-not-empty",
+			message: `export destination is not empty: ${outDir}; choose another --out or empty the directory, existing files are never deleted`,
+		};
+	}
+	return undefined;
+}
 
 function defaultAgentDir() {
 	return (
@@ -296,8 +329,19 @@ export function exportRedactedData(
 	const exportConfig: Config = { ...config, redactionEnabled: true };
 	const options = parseArgs(args, exportConfig);
 	const outDir = resolve(options.outDir || "");
-	mkdirSync(outDir, { recursive: true });
 	const onProgress = ctx?.onProgress;
+	const destinationError = checkExportDestination(outDir);
+	if (destinationError) {
+		ctx?.ui?.notify?.(destinationError.message, "error");
+		return {
+			createdAt: new Date().toISOString(),
+			outDir,
+			files: [],
+			summary: { approved: 0, rejected: 0, files: 0 },
+			error: destinationError,
+		};
+	}
+	mkdirSync(outDir, { recursive: true });
 	onProgress?.({ phase: "discover", message: "discovering JSONL files" });
 
 	const sessionInputs = options.includeSessions
