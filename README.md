@@ -47,8 +47,10 @@ This creates a private Docker Compose stack with generated secrets. Defaults:
 URL:      http://localhost:3100/auth/sign-in
 Email:    local@example.test
 Name:     Local User
-Password: local-langfuse
+Password: unique per install; generated and shown once by /langfuse-init
 ```
+
+The generated login password is displayed only in the init output. Store it when you run the command, or pass `--password` yourself.
 
 Files are written to `$PI_CODING_AGENT_DIR/langfuse/`. Init refuses to run in a non-empty directory.
 
@@ -137,7 +139,7 @@ Flags:
 | `--mode local\|remote` | Setup type. `--local`, `--remote`, and `--cloud` select the same modes. |
 | `--dir <path>` | Target directory. Default `$PI_CODING_AGENT_DIR/langfuse`. |
 | `--host <url>` | Langfuse API host. Defaults to `http://localhost:3100` (local) or `https://cloud.langfuse.com` (remote). |
-| `--email`, `--name`, `--password` | Local Langfuse login. |
+| `--email`, `--name`, `--password` | Local Langfuse login. A unique password is generated when `--password` is omitted. |
 | `--public-key`, `--secret-key` | Remote project keys. Also read from `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY`. |
 | `--yes`, `-y` | Skip interactive prompts. |
 | `--no-start` | Write files without running Docker Compose. |

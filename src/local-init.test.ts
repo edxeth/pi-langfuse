@@ -58,7 +58,7 @@ describe("/langfuse-init", () => {
 		await expect(
 			readFile(join(agentDir, "langfuse", "docker-compose.yml"), "utf-8"),
 		).resolves.toContain("langfuse-web");
-		expect(notifications.at(-1)?.message).toContain(
+		expect(notifications.map((n) => n.message).join("\n")).toContain(
 			"Local Langfuse initialized",
 		);
 	});
@@ -90,6 +90,74 @@ describe("/langfuse-init", () => {
 			(await stat(join(agentDir, "langfuse", "pi-langfuse.json"))).mode & 0o777;
 		expect(configMode & 0o077).toBe(0);
 	});
+
+	function envPassword(dir: string) {
+		return readFile(join(dir, ".env"), "utf-8").then((content) =>
+			content
+				.split("\n")
+				.find((line) => line.startsWith("LANGFUSE_INIT_USER_PASSWORD="))
+				?.slice("LANGFUSE_INIT_USER_PASSWORD=".length),
+		);
+	}
+
+	it("generates a unique login password when none is provided", async () => {
+		const notifications: Notification[] = [];
+
+		await runLangfuseInit("--yes --no-start", createContext(notifications));
+		const first = await envPassword(join(agentDir, "langfuse"));
+
+		expect(first).toBeTruthy();
+		expect(first).not.toBe("local-langfuse");
+		expect(first?.length).toBeGreaterThanOrEqual(12);
+		expect(notifications.map((n) => n.message).join("\n")).toContain(first);
+
+		const secondAgentDir = `${agentDir}-second`;
+		process.env.PI_CODING_AGENT_DIR = secondAgentDir;
+		try {
+			await runLangfuseInit("--yes --no-start", createContext([]));
+		} finally {
+			process.env.PI_CODING_AGENT_DIR = agentDir;
+		}
+		const second = await envPassword(join(secondAgentDir, "langfuse"));
+		await rm(secondAgentDir, { recursive: true, force: true });
+		expect(second).toBeTruthy();
+		expect(second).not.toBe(first);
+	});
+
+	it("keeps an explicitly provided login password", async () => {
+		const notifications: Notification[] = [];
+
+		await runLangfuseInit(
+			"--yes --no-start --password correct-horse-battery",
+			createContext(notifications),
+		);
+
+		await expect(envPassword(join(agentDir, "langfuse"))).resolves.toBe(
+			"correct-horse-battery",
+		);
+		expect(notifications.at(-1)?.message).toContain("correct-horse-battery");
+	});
+
+	it("tells the user how to recover the generated password when Compose start fails", async () => {
+		const notifications: Notification[] = [];
+		const realPath = process.env.PATH;
+		// Hidden PATH makes execFile("docker") fail with ENOENT; no real Docker runs.
+		process.env.PATH = "";
+		try {
+			await runLangfuseInit("--yes", createContext(notifications));
+		} finally {
+			process.env.PATH = realPath;
+		}
+
+		const messages = notifications.map((n) => n.message).join("\n");
+		expect(notifications.some((n) => n.type === "error")).toBe(true);
+		expect(messages).toContain("docker compose up -d");
+		expect(messages).toContain("LANGFUSE_INIT_USER_PASSWORD");
+		expect(messages).toContain(join(agentDir, "langfuse", ".env"));
+		// The generated credentials were still written for later recovery.
+		const env = await readFile(join(agentDir, "langfuse", ".env"), "utf-8");
+		expect(env).toMatch(/LANGFUSE_INIT_USER_PASSWORD=.+/);
+	}, 15000);
 
 	it("lets the interactive wizard choose remote setup", async () => {
 		const notifications: Notification[] = [];

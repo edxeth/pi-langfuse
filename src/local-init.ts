@@ -13,7 +13,6 @@ const DEFAULT_LOCAL_HOST = "http://localhost:3100";
 const DEFAULT_REMOTE_HOST = "https://cloud.langfuse.com";
 const DEFAULT_EMAIL = "local@example.test";
 const DEFAULT_NAME = "Local User";
-const DEFAULT_PASSWORD = "local-langfuse";
 
 type InitMode = "local" | "remote";
 
@@ -26,6 +25,7 @@ type InitOptions = {
 	email: string;
 	name: string;
 	password: string;
+	passwordGenerated: boolean;
 	publicKey: string;
 	secretKey: string;
 };
@@ -123,7 +123,9 @@ function parseOptions(args: string): InitOptions {
 		host,
 		email: readOption(tokens, "--email") || DEFAULT_EMAIL,
 		name: readOption(tokens, "--name") || DEFAULT_NAME,
-		password: readOption(tokens, "--password") || DEFAULT_PASSWORD,
+		password:
+			readOption(tokens, "--password") || (mode === "local" ? token(12) : ""),
+		passwordGenerated: mode === "local" && !readOption(tokens, "--password"),
 		publicKey:
 			readOption(tokens, "--public-key") ||
 			process.env.LANGFUSE_PUBLIC_KEY ||
@@ -428,7 +430,9 @@ export async function runLangfuseInit(
 				name: await promptValue(ctx, "Langfuse display name", options.name),
 				password: await promptValue(
 					ctx,
-					"Langfuse password (visible while typing)",
+					options.passwordGenerated
+						? "Langfuse password (generated, visible while typing)"
+						: "Langfuse password (visible while typing)",
 					options.password,
 				),
 			};
@@ -511,9 +515,15 @@ export async function runLangfuseInit(
 			});
 		} catch (error) {
 			ctx.ui.notify(
-				`Langfuse files created, but Docker Compose failed: ${String(error)}`,
+				`Langfuse files created in ${options.dir}, but Docker Compose failed: ${String(error)}. Run \`docker compose up -d\` in ${options.dir} once Docker works.`,
 				"error",
 			);
+			if (options.passwordGenerated) {
+				ctx.ui.notify(
+					`The generated login password was not displayed because the start failed. Recover it from ${join(options.dir, ".env")} (LANGFUSE_INIT_USER_PASSWORD); login email: ${options.email}.`,
+					"warning",
+				);
+			}
 			return;
 		}
 	}
@@ -524,4 +534,10 @@ export async function runLangfuseInit(
 			: `Remote Langfuse configured at ${options.host}`,
 		"info",
 	);
+	if (options.mode === "local" && options.passwordGenerated) {
+		ctx.ui.notify(
+			"The local login password was generated for this install and is shown only in this message. Store it now.",
+			"warning",
+		);
+	}
 }
