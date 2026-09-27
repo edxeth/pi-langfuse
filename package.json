@@ -52,7 +52,7 @@
 		"extensions": [
 			"./src/index.ts"
 		],
-		"image": "https://raw.githubusercontent.com/edxeth/pi-langfuse/main/docs/screenshot.jpg"
+		"image": "https://raw.githubusercontent.com/edxeth/pi-langfuse/main/docs/screenshot-trace.png"
 	},
 	"dependencies": {
 		"@langfuse/client": "^5.9.1",
