@@ -43,7 +43,9 @@ function progressLine(progress: ExportProgress) {
 	return `[${new Date().toISOString()}] ${progress.phase}${count}${layer}${path} - ${progress.message}`;
 }
 
-const report = exportRedactedData(resolveConfig({}), args.join(" "), {
+// Pass argv through as an array: joining would re-tokenize paths that
+// contain spaces and split them into separate arguments.
+const report = exportRedactedData(resolveConfig({}), args, {
 	onProgress: (progress) => {
 		process.stderr.write(`${progressLine(progress)}\n`);
 	},

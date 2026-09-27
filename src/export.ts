@@ -82,9 +82,14 @@ function timestampSlug(date = new Date()) {
 	return date.toISOString().replace(/[:.]/g, "-");
 }
 
-function parseArgs(args: string, config: Config): ExportArgs {
-	const tokens = args.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
-	const clean = tokens.map((token) => token.replace(/^['"]|['"]$/g, ""));
+function parseArgs(args: string | string[], config: Config): ExportArgs {
+	// Array arguments (CLI argv) are already tokenized; re-splitting them would
+	// destroy boundaries for paths containing spaces.
+	const clean = Array.isArray(args)
+		? args
+		: (args.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? []).map((token) =>
+				token.replace(/^['"]|['"]$/g, ""),
+			);
 	const parsed: ExportArgs = {
 		includeSessions: true,
 		includeRawTraces: true,
@@ -283,7 +288,7 @@ function runTrufflehog(
 
 export function exportRedactedData(
 	config: Config,
-	args = "",
+	args: string | string[] = "",
 	ctx?: CommandContext,
 ): ExportReport {
 	// Export always redacts regardless of live telemetry settings.
@@ -377,7 +382,7 @@ export function exportRedactedData(
 
 	const report: ExportReport = {
 		createdAt: new Date().toISOString(),
-		outDir: ".",
+		outDir,
 		files,
 		summary: {
 			approved: files.filter((file) => file.status === "approved").length,
@@ -388,9 +393,12 @@ export function exportRedactedData(
 	};
 
 	onProgress?.({ phase: "write", message: "writing export reports" });
+	// The written report ships inside the shareable bundle, so it keeps the
+	// destination scrubbed ("." = this directory); callers and CLI output get
+	// the real destination from the returned report.
 	writeFileSync(
 		join(outDir, "report.json"),
-		`${JSON.stringify(report, null, 2)}\n`,
+		`${JSON.stringify({ ...report, outDir: "." }, null, 2)}\n`,
 	);
 	writeFileSync(
 		join(outDir, "manifest.jsonl"),

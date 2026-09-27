@@ -1,12 +1,13 @@
 import {
 	chmodSync,
+	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { Config } from "./config.js";
 import { exportRedactedData } from "./export.js";
@@ -94,6 +95,85 @@ describe("redacted export", () => {
 		expect(readFileSync(join(out, "training-index.jsonl"), "utf-8")).toContain(
 			'"format":"redacted-jsonl-derivative"',
 		);
+	});
+
+	it("redacts JSON-quoted passwords so approval stays truthful", () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-langfuse-export-json-test-"));
+		const sessions = join(root, "sessions");
+		const out = join(root, "export");
+		mkdirSync(sessions, { recursive: true });
+		writeFileSync(
+			join(sessions, "session.jsonl"),
+			`${JSON.stringify({
+				type: "message",
+				content: 'deploy ok {"password":"SuperSecret9"} done',
+			})}\n`,
+		);
+
+		const report = exportRedactedData(
+			baseConfig,
+			`--sessions-only --sessions-dir ${join(root, "sessions")} --out ${out} --no-trufflehog`,
+		);
+
+		const exported = readFileSync(
+			join(out, "sessions", "session.jsonl"),
+			"utf-8",
+		);
+		expect(exported).not.toContain("SuperSecret9");
+		expect(exported).toContain("[REDACTED:password:");
+		// Redaction cleaned the value, so the derivative is genuinely approvable.
+		expect(report.summary).toMatchObject({
+			files: 1,
+			approved: 1,
+			rejected: 0,
+		});
+	});
+
+	it("keeps argv array boundaries so output directories may contain spaces", () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-langfuse-export-argv-test-"));
+		const sessions = join(root, "sessions");
+		const out = join(root, "my export");
+		mkdirSync(sessions, { recursive: true });
+		writeFileSync(
+			join(sessions, "session.jsonl"),
+			'{"type":"message","content":"safe content"}\n',
+		);
+
+		const report = exportRedactedData(baseConfig, [
+			"--sessions-only",
+			"--sessions-dir",
+			join(root, "sessions"),
+			"--out",
+			out,
+			"--no-trufflehog",
+		]);
+
+		// The space-separated directory must stay one destination.
+		expect(existsSync(join(root, "my"))).toBe(false);
+		expect(existsSync(join(out, "sessions", "session.jsonl"))).toBe(true);
+		// The returned report names the real destination, not ".".
+		expect(report.outDir).toBe(resolve(out));
+		expect(report.summary).toMatchObject({ files: 1, approved: 1 });
+	});
+
+	it("honors quoted string arguments with spaces", () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-langfuse-export-quoted-test-"));
+		const sessions = join(root, "sessions");
+		mkdirSync(sessions, { recursive: true });
+		writeFileSync(
+			join(sessions, "session.jsonl"),
+			'{"type":"message","content":"safe content"}\n',
+		);
+
+		const report = exportRedactedData(
+			baseConfig,
+			`--sessions-only --sessions-dir ${sessions} --out '${join(root, "my export")}' --no-trufflehog`,
+		);
+
+		expect(
+			existsSync(join(root, "my export", "sessions", "session.jsonl")),
+		).toBe(true);
+		expect(report.outDir).toBe(resolve(join(root, "my export")));
 	});
 
 	it("rejects exports when TruffleHog scan fails", () => {
