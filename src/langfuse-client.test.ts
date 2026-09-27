@@ -46,6 +46,7 @@ const mocks = vi.hoisted(() => {
 				record.end = record.lastUpdate;
 			}),
 			setTraceIO: vi.fn(),
+			setTraceAsPublic: vi.fn(),
 			startObservation: vi.fn(
 				(
 					childName: string,
@@ -57,22 +58,29 @@ const mocks = vi.hoisted(() => {
 		return raw;
 	}
 
-	const traceGet = vi.fn(
-		async (): Promise<{ id: string; observations?: Array<{ id: string }> }> => ({
-			id: "visible-trace",
-		}),
-	);
-	const ingestionBatch = vi.fn(
-		async (): Promise<{ successes: unknown[]; errors: unknown[] }> => ({
-			successes: [],
-			errors: [],
-		}),
+	const exportedSpans: Array<Array<Record<string, unknown>>> = [];
+	let exportResult: { code: number; error?: Error } | "hang" = { code: 0 };
+	const OTLPTraceExporter = vi.fn(() => ({
+		export: vi.fn(
+			(
+				spans: Array<Record<string, unknown>>,
+				callback: (result: { code: number; error?: Error }) => void,
+			) => {
+				// "hang" never calls back so the drain's outer timeout fires.
+				if (exportResult === "hang") return;
+				exportedSpans.push(spans);
+				callback(exportResult);
+			},
+		),
+	}));
+	const observationsGetMany = vi.fn(
+		async (): Promise<{
+			data?: Array<{ id: string }>;
+			meta?: { cursor?: string };
+		}> => ({ data: [], meta: {} }),
 	);
 	const client = {
-		api: {
-			trace: { get: traceGet },
-			ingestion: { batch: ingestionBatch },
-		},
+		api: { observations: { getMany: observationsGetMany } },
 		score: {
 			create: vi.fn(),
 			flush: vi.fn(async () => undefined),
@@ -151,8 +159,12 @@ const mocks = vi.hoisted(() => {
 		LangfuseSpanProcessor,
 		BasicTracerProvider,
 		AsyncHooksContextManager,
-		traceGet,
-		ingestionBatch,
+		OTLPTraceExporter,
+		observationsGetMany,
+		exportedSpans,
+		setExportResult(result: { code: number; error?: Error } | "hang") {
+			exportResult = result;
+		},
 		tracerProviders,
 		context,
 		trace,
@@ -168,12 +180,28 @@ vi.mock("@langfuse/tracing", () => mocks.tracing);
 vi.mock("@opentelemetry/api", () => ({
 	context: mocks.context,
 	trace: mocks.trace,
+	SpanKind: { INTERNAL: 0 },
+	SpanStatusCode: { UNSET: 0, ERROR: 2 },
+	TraceFlags: { SAMPLED: 1, NONE: 0 },
 }));
 vi.mock("@opentelemetry/context-async-hooks", () => ({
 	AsyncHooksContextManager: mocks.AsyncHooksContextManager,
 }));
 vi.mock("@opentelemetry/sdk-trace-base", () => ({
 	BasicTracerProvider: mocks.BasicTracerProvider,
+}));
+vi.mock("@opentelemetry/exporter-trace-otlp-http", () => ({
+	OTLPTraceExporter: mocks.OTLPTraceExporter,
+}));
+vi.mock("@opentelemetry/core", () => ({
+	ExportResultCode: { SUCCESS: 0, FAILED: 1 },
+	timeInputToHrTime: (input: Date | number): [number, number] => {
+		const date = input instanceof Date ? input : new Date(input);
+		return [
+			Math.floor(date.getTime() / 1000),
+			(date.getTime() % 1000) * 1_000_000,
+		];
+	},
 }));
 
 const config: Config = {
@@ -210,8 +238,29 @@ describe("langfuse v5 runtime facade", () => {
 		await shutdownClient();
 		vi.clearAllMocks();
 		mocks.records.length = 0;
+		mocks.exportedSpans.length = 0;
+		mocks.setExportResult({ code: 0 });
 		mocks.tracerProviders.length = 0;
 	});
+
+	type ExportedSpan = {
+		name: string;
+		spanContext(): { traceId: string; spanId: string };
+		parentSpanContext?: { spanId: string };
+		attributes: Record<string, unknown>;
+	};
+
+	const allExportedSpans = () =>
+		mocks.exportedSpans.flat() as unknown as ExportedSpan[];
+
+	const exportedSpan = (name: string, id: string) => {
+		const span = allExportedSpans().find(
+			(candidate) =>
+				candidate.name === name && candidate.spanContext().spanId === id,
+		);
+		if (!span) throw new Error(`exported span ${name}/${id} was not found`);
+		return span;
+	};
 
 	it("sanitizes trace, span, generation, and update/end payloads before OTel calls", async () => {
 		const lf = await getRuntime(config);
@@ -445,10 +494,9 @@ describe("langfuse v5 runtime facade", () => {
 			]) {
 				mocks.client.flush.mockReset().mockResolvedValue(undefined);
 				mocks.client.shutdown.mockReset().mockResolvedValue(undefined);
-				mocks.traceGet.mockReset().mockResolvedValue({ id: "visible-trace" });
-				mocks.ingestionBatch
+				mocks.observationsGetMany
 					.mockReset()
-					.mockResolvedValue({ successes: [], errors: [] });
+					.mockResolvedValue({ data: [], meta: {} });
 				const lf = await getRuntime(config);
 				const trace = lf.trace({ name: "pi-agent" });
 				const prompt = lf.span({ name: "agent.prompt", traceId: trace.id });
@@ -486,18 +534,18 @@ describe("langfuse v5 runtime facade", () => {
 		}
 	});
 
-	it("falls back once with redacted trace and observation facts", async () => {
+	it("replays an unconfirmed trace once with redacted trace and observation facts", async () => {
 		const restoreTimeouts = setRuntimeTimeoutsForTest({
 			shutdownStepMs: 20,
 			traceVisibilityMs: 10,
 			pollIntervalMs: 1,
 		});
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 		try {
 			const secret = "sk-lf-test-secret-1234567890";
-			mocks.traceGet.mockReset().mockRejectedValue(new Error("not visible"));
-			mocks.ingestionBatch
+			mocks.observationsGetMany
 				.mockReset()
-				.mockResolvedValue({ successes: [], errors: [] });
+				.mockResolvedValue({ data: [], meta: {} });
 			const lf = await getRuntime(config);
 			const trace = lf.trace({
 				id: "a".repeat(32),
@@ -543,93 +591,67 @@ describe("langfuse v5 runtime facade", () => {
 
 			await flushClient();
 			expect(mocks.client.shutdown).not.toHaveBeenCalled();
-			await shutdownClient();
-			await shutdownClient();
 
-			expect(mocks.ingestionBatch).toHaveBeenCalledTimes(1);
-			const requestValue = (
-				mocks.ingestionBatch.mock.calls as unknown as Array<[unknown]>
-			)[0]?.[0];
-			if (!requestValue) throw new Error("fallback request was not captured");
-			const request = requestValue as {
-				batch: Array<{
-					type: string;
-					timestamp: string;
-					body: Record<string, unknown>;
-				}>;
-			};
-			const traceEvent = request.batch.find(
-				(event) => event.type === "trace-create",
-			);
-			const generationEvent = request.batch.find(
-				(event) => event.type === "generation-create",
-			);
-			const toolEvent = request.batch.find(
-				(event) => event.type === "span-create" && event.body.id === tool.id,
-			);
-			const turnEvent = request.batch.find(
-				(event) => event.type === "span-create" && event.body.id === turn.id,
-			);
-			const promptEvent = request.batch.find(
-				(event) => event.type === "span-create" && event.body.id === prompt.id,
-			);
-			if (
-				!traceEvent ||
-				!promptEvent ||
-				!turnEvent ||
-				!generationEvent ||
-				!toolEvent
-			) {
-				throw new Error("fallback batch is missing a trace observation");
+			const spans = allExportedSpans();
+			expect(spans.map((span) => span.name)).toEqual([
+				"agent.prompt",
+				"agent.turn",
+				"llm-response",
+				"tool:bash",
+			]);
+			for (const span of spans) {
+				expect(span.spanContext().traceId).toBe(trace.id);
 			}
-			expect(traceEvent.body).toMatchObject({
-				id: trace.id,
-				name: "pi-agent",
-				output: "final answer",
-				sessionId: "fallback-session",
-			});
-			expect(String(traceEvent.body.input)).toContain("[REDACTED:");
-			expect(promptEvent.body.traceId).toBe(trace.id);
-			expect(promptEvent.body.parentObservationId).toBeUndefined();
-			expect(turnEvent.body.parentObservationId).toBe(prompt.id);
-			expect(generationEvent.body).toMatchObject({
-				traceId: trace.id,
-				parentObservationId: turn.id,
-				model: "fallback-model",
-				usageDetails: { input: 4, output: 6, total: 10 },
-				costDetails: { total: 0.1 },
-			});
-			expect(toolEvent.body).toMatchObject({
-				traceId: trace.id,
-				parentObservationId: turn.id,
-				level: "ERROR",
-				statusMessage: "tool failed",
-			});
-			for (const event of request.batch) {
-				expect(event.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
-				if (event.type !== "trace-create") {
-					expect(event.body.startTime).toMatch(/^\d{4}-\d{2}-\d{2}T/);
-					expect(event.body.endTime).toMatch(/^\d{4}-\d{2}-\d{2}T/);
-				}
-			}
-			expect(JSON.stringify(request)).not.toContain(secret);
+			const root = exportedSpan("agent.prompt", prompt.id);
+			expect(root.parentSpanContext).toBeUndefined();
+			expect(root.attributes["langfuse.trace.name"]).toBe("pi-agent");
+			expect(root.attributes["session.id"]).toBe("fallback-session");
+			expect(String(root.attributes["langfuse.trace.input"])).toContain(
+				"[REDACTED:",
+			);
+			expect(root.attributes["langfuse.trace.output"]).toBe("final answer");
+			expect(
+				exportedSpan("agent.turn", turn.id).parentSpanContext?.spanId,
+			).toBe(prompt.id);
+			const generationSpan = exportedSpan("llm-response", generation.id);
+			expect(generationSpan.parentSpanContext?.spanId).toBe(turn.id);
+			expect(generationSpan.attributes["langfuse.observation.model.name"]).toBe(
+				"fallback-model",
+			);
+			expect(
+				JSON.parse(
+					String(generationSpan.attributes["langfuse.observation.usage_details"]),
+				),
+			).toEqual({ input: 4, output: 6, total: 10 });
+			expect(
+				JSON.parse(
+					String(generationSpan.attributes["langfuse.observation.cost_details"]),
+				),
+			).toEqual({ total: 0.1 });
+			const toolSpan = exportedSpan("tool:bash", tool.id);
+			expect(toolSpan.parentSpanContext?.spanId).toBe(turn.id);
+			expect(toolSpan.attributes["langfuse.observation.level"]).toBe("ERROR");
+			expect(toolSpan.attributes["langfuse.observation.status_message"]).toBe(
+				"tool failed",
+			);
+			expect(JSON.stringify(spans)).not.toContain(secret);
 		} finally {
+			warn.mockRestore();
 			restoreTimeouts();
 		}
 	});
 
-	it("chunks oversized fallback batches and retires drained traces", async () => {
+	it("chunks oversized replay spans across bounded export calls", async () => {
 		const restoreTimeouts = setRuntimeTimeoutsForTest({
 			shutdownStepMs: 20,
 			traceVisibilityMs: 10,
 			pollIntervalMs: 1,
 		});
 		try {
-			const payload = "x ".repeat(1_100_000);
-			mocks.traceGet.mockReset().mockRejectedValue(new Error("not visible"));
-			mocks.ingestionBatch
+			const payload = "x ".repeat(800_000);
+			mocks.observationsGetMany
 				.mockReset()
-				.mockResolvedValue({ successes: [], errors: [] });
+				.mockResolvedValue({ data: [], meta: {} });
 			const fallbackConfig = {
 				...config,
 				payloadMaxStringChars: Infinity,
@@ -640,25 +662,24 @@ describe("langfuse v5 runtime facade", () => {
 				payloadMaxNodes: Infinity,
 			};
 			const lf = await getRuntime(fallbackConfig);
-			for (const id of ["c".repeat(32), "d".repeat(32)]) {
+			for (const id of ["c".repeat(32), "d".repeat(32), "e".repeat(32)]) {
 				const trace = lf.trace({ id, name: "pi-agent", input: payload });
 				const prompt = lf.span({ name: "agent.prompt", traceId: trace.id });
 				prompt.end({ output: "done" });
 			}
 
 			await flushClient();
-			const calls = mocks.ingestionBatch.mock.calls as unknown as Array<
-				[unknown]
-			>;
+			const calls = mocks.exportedSpans;
 
 			expect(calls.length).toBeGreaterThan(1);
-			for (const [request] of calls) {
+			for (const spans of calls) {
 				expect(
-					Buffer.byteLength(JSON.stringify(request), "utf8"),
+					Buffer.byteLength(JSON.stringify(spans), "utf8"),
 				).toBeLessThanOrEqual(3_500_000);
 			}
 			await shutdownClient();
-			expect(mocks.ingestionBatch).toHaveBeenCalledTimes(calls.length);
+			const callsAfterShutdown = mocks.exportedSpans.length;
+			expect(callsAfterShutdown).toBe(calls.length);
 		} finally {
 			restoreTimeouts();
 		}
@@ -672,9 +693,9 @@ describe("langfuse v5 runtime facade", () => {
 		});
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 		try {
-			mocks.ingestionBatch
+			mocks.observationsGetMany
 				.mockReset()
-				.mockResolvedValue({ successes: [], errors: [] });
+				.mockResolvedValue({ data: [], meta: {} });
 			const lf = await getRuntime(config);
 			const trace = lf.trace({ id: "a".repeat(32), name: "pi-agent" });
 			const prompt = lf.span({ name: "agent.prompt", traceId: trace.id });
@@ -686,36 +707,32 @@ describe("langfuse v5 runtime facade", () => {
 			turn.end({ output: "turn done" });
 			prompt.end({ output: "done" });
 
-			// The server knows the trace and its root, but the child span was
-			// lost by a failed export batch. Existence alone must not skip the
-			// fallback replay for the missing observation.
-			mocks.traceGet.mockReset().mockResolvedValue({
-				id: "visible-trace",
-				observations: [{ id: prompt.id }],
+			// The server knows only the root observation; the child span was
+			// lost by a failed export batch. Partial visibility must not skip
+			// the fallback replay for the missing observation.
+			mocks.observationsGetMany.mockResolvedValue({
+				data: [{ id: prompt.id }],
+				meta: {},
 			});
 
 			await flushClient();
 
-			expect(mocks.ingestionBatch).toHaveBeenCalledTimes(1);
-			const [request] = (mocks.ingestionBatch.mock.calls as unknown as Array<[
-				unknown,
-			]>)[0] ?? [];
-			if (!request) throw new Error("fallback request was not captured");
-			const sent = JSON.stringify(request);
-			expect(sent).toContain(turn.id);
-			// A successful replay of the missing child reports no failure.
+			const replayed = allExportedSpans().find(
+				(span) => span.name === "agent.turn",
+			);
+			if (!replayed) throw new Error("missing observation was not replayed");
+			expect(replayed.spanContext().spanId).toBe(turn.id);
 			const fallbackWarning = warn.mock.calls.find(([message]) =>
 				String(message).includes("REST fallback"),
 			);
 			expect(fallbackWarning).toBeUndefined();
 		} finally {
-			mocks.ingestionBatch.mockResolvedValue({ successes: [], errors: [] });
 			warn.mockRestore();
 			restoreTimeouts();
 		}
 	});
 
-	it("retains failed fallback traces and retries with stable event identities", async () => {
+	it("retains failed replay traces and retries with stable span identities", async () => {
 		const restoreTimeouts = setRuntimeTimeoutsForTest({
 			shutdownStepMs: 20,
 			traceVisibilityMs: 10,
@@ -723,12 +740,12 @@ describe("langfuse v5 runtime facade", () => {
 		});
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 		try {
-			mocks.traceGet.mockReset().mockRejectedValue(new Error("not visible"));
-			let deliveries = 0;
-			mocks.ingestionBatch.mockReset().mockImplementation(async () => {
-				deliveries += 1;
-				if (deliveries === 1) throw new Error("HTTP 503");
-				return { successes: [], errors: [] };
+			mocks.observationsGetMany
+				.mockReset()
+				.mockResolvedValue({ data: [], meta: {} });
+			mocks.setExportResult({
+				code: 1,
+				error: new Error("HTTP 503 unavailable"),
 			});
 			const lf = await getRuntime(config);
 			const trace = lf.trace({
@@ -740,37 +757,33 @@ describe("langfuse v5 runtime facade", () => {
 			prompt.end({ output: "done" });
 
 			await flushClient();
-			expect(mocks.ingestionBatch).toHaveBeenCalledTimes(1);
+			expect(mocks.exportedSpans.length).toBe(1);
 
+			mocks.setExportResult({ code: 0 });
 			await flushClient();
-			expect(mocks.ingestionBatch).toHaveBeenCalledTimes(2);
+			expect(mocks.exportedSpans.length).toBe(2);
 
-			const callIds = (index: number) => {
-				const [request] = (mocks.ingestionBatch.mock.calls as unknown as Array<[
-					unknown,
-				]>)[index] ?? [];
-				if (!request) throw new Error("fallback request was not captured");
-				const batch = (request as { batch: Array<{ id: string }> }).batch;
-				return batch.map((event) => event.id).sort();
-			};
-			// The retry must reuse the original envelope event ids so the server
-			// can deduplicate an ambiguous first delivery.
-			expect(callIds(1)).toEqual(callIds(0));
-			expect(JSON.stringify((mocks.ingestionBatch.mock.calls as unknown as Array<[unknown]>)[1]?.[0])).toContain(
-				"retry prompt",
-			);
+			const identity = (round: number) =>
+				(mocks.exportedSpans[round] as unknown as ExportedSpan[])
+					.map((span) => `${span.spanContext().traceId}:${span.spanContext().spanId}`)
+					.sort();
+			// The retry must reuse the original trace and span ids so the
+			// server can deduplicate an ambiguous first delivery.
+			expect(identity(1)).toEqual(identity(0));
+			expect(
+				JSON.stringify(mocks.exportedSpans[1]),
+			).toContain("retry prompt");
 
-			mocks.ingestionBatch.mockClear();
+			const sendsAfterRecovery = mocks.OTLPTraceExporter.mock.calls.length;
 			await flushClient();
-			expect(mocks.ingestionBatch).toHaveBeenCalledTimes(0);
+			expect(mocks.OTLPTraceExporter.mock.calls.length).toBe(sendsAfterRecovery);
 		} finally {
-			mocks.ingestionBatch.mockResolvedValue({ successes: [], errors: [] });
 			warn.mockRestore();
 			restoreTimeouts();
 		}
 	});
 
-	it("discards fallback traces with an explicit diagnostic once the retry budget is spent", async () => {
+	it("discards replay traces with an explicit diagnostic once the retry budget is spent", async () => {
 		const restoreTimeouts = setRuntimeTimeoutsForTest({
 			shutdownStepMs: 20,
 			traceVisibilityMs: 10,
@@ -778,10 +791,13 @@ describe("langfuse v5 runtime facade", () => {
 		});
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 		try {
-			mocks.traceGet.mockReset().mockRejectedValue(new Error("not visible"));
-			mocks.ingestionBatch
+			mocks.observationsGetMany
 				.mockReset()
-				.mockRejectedValue(new Error("HTTP 503 unavailable"));
+				.mockResolvedValue({ data: [], meta: {} });
+			mocks.setExportResult({
+				code: 1,
+				error: new Error("HTTP 503 unavailable"),
+			});
 			const lf = await getRuntime(config);
 			const trace = lf.trace({
 				id: "b".repeat(32),
@@ -794,7 +810,8 @@ describe("langfuse v5 runtime facade", () => {
 			await flushClient();
 			await flushClient();
 			await flushClient();
-			expect(mocks.ingestionBatch).toHaveBeenCalledTimes(3);
+			const sendsAfterBudget = mocks.OTLPTraceExporter.mock.calls.length;
+			expect(sendsAfterBudget).toBe(3);
 			const discardWarning = warn.mock.calls.find(([message]) =>
 				String(message).includes("discarded"),
 			);
@@ -802,17 +819,15 @@ describe("langfuse v5 runtime facade", () => {
 			expect(String(discardWarning?.[0])).toContain(trace.id);
 			expect(String(discardWarning?.[0])).toContain("3 failed");
 
-			mocks.ingestionBatch.mockClear();
 			await flushClient();
-			expect(mocks.ingestionBatch).toHaveBeenCalledTimes(0);
+			expect(mocks.OTLPTraceExporter.mock.calls.length).toBe(sendsAfterBudget);
 		} finally {
-			mocks.ingestionBatch.mockResolvedValue({ successes: [], errors: [] });
 			warn.mockRestore();
 			restoreTimeouts();
 		}
 	});
 
-	it("drops single fallback events that exceed the ingestion byte limit", async () => {
+	it("drops single replay spans that exceed the ingestion byte limit", async () => {
 		const restoreTimeouts = setRuntimeTimeoutsForTest({
 			shutdownStepMs: 20,
 			traceVisibilityMs: 10,
@@ -820,10 +835,9 @@ describe("langfuse v5 runtime facade", () => {
 		});
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 		try {
-			mocks.traceGet.mockReset().mockRejectedValue(new Error("not visible"));
-			mocks.ingestionBatch
+			mocks.observationsGetMany
 				.mockReset()
-				.mockResolvedValue({ successes: [], errors: [] });
+				.mockResolvedValue({ data: [], meta: {} });
 			const fallbackConfig = {
 				...config,
 				payloadMaxStringChars: Infinity,
@@ -858,16 +872,8 @@ describe("langfuse v5 runtime facade", () => {
 
 			await flushClient();
 
-			const calls = mocks.ingestionBatch.mock.calls as unknown as Array<
-				[unknown]
-			>;
-			expect(calls.length).toBeGreaterThan(0);
-			for (const [request] of calls) {
-				expect(
-					Buffer.byteLength(JSON.stringify(request), "utf8"),
-				).toBeLessThanOrEqual(3_500_000);
-			}
-			const sent = JSON.stringify(calls.map(([request]) => request));
+			expect(mocks.exportedSpans.length).toBeGreaterThan(0);
+			const sent = JSON.stringify(mocks.exportedSpans);
 			expect(sent).not.toContain("x".repeat(1_000));
 			expect(sent).toContain("healthy prompt");
 			expect(sent).toContain("healthy answer");
@@ -877,13 +883,12 @@ describe("langfuse v5 runtime facade", () => {
 			);
 			expect(String(fallbackWarning?.[0])).toContain("oversized");
 		} finally {
-			mocks.ingestionBatch.mockResolvedValue({ successes: [], errors: [] });
 			warn.mockRestore();
 			restoreTimeouts();
 		}
 	});
 
-	it("reports one diagnostic when multiple fallback batches time out", async () => {
+	it("reports one diagnostic when multiple replay chunks time out", async () => {
 		const restoreTimeouts = setRuntimeTimeoutsForTest({
 			shutdownStepMs: 20,
 			traceVisibilityMs: 10,
@@ -891,11 +896,11 @@ describe("langfuse v5 runtime facade", () => {
 		});
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 		try {
-			const payload = "x ".repeat(1_100_000);
-			mocks.traceGet.mockReset().mockRejectedValue(new Error("not visible"));
-			mocks.ingestionBatch
+			const payload = "x ".repeat(800_000);
+			mocks.observationsGetMany
 				.mockReset()
-				.mockImplementation(() => new Promise<never>(() => {}));
+				.mockResolvedValue({ data: [], meta: {} });
+			mocks.setExportResult("hang");
 			const fallbackConfig = {
 				...config,
 				payloadMaxStringChars: Infinity,
@@ -914,7 +919,7 @@ describe("langfuse v5 runtime facade", () => {
 
 			await flushClient();
 
-			expect(mocks.ingestionBatch.mock.calls.length).toBeGreaterThan(1);
+			expect(mocks.exportedSpans.length).toBe(0);
 			const fallbackWarnings = warn.mock.calls.filter(([message]) =>
 				String(message).includes("REST fallback ingestion"),
 			);
@@ -925,13 +930,13 @@ describe("langfuse v5 runtime facade", () => {
 				"REST fallback ingestion",
 			);
 		} finally {
-			mocks.ingestionBatch.mockResolvedValue({ successes: [], errors: [] });
+			mocks.setExportResult({ code: 0 });
 			warn.mockRestore();
 			restoreTimeouts();
 		}
 	});
 
-	it("preserves bounded REST ingestion error details", async () => {
+	it("preserves bounded replay failure details", async () => {
 		const restoreTimeouts = setRuntimeTimeoutsForTest({
 			shutdownStepMs: 20,
 			traceVisibilityMs: 10,
@@ -939,16 +944,14 @@ describe("langfuse v5 runtime facade", () => {
 		});
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 		try {
-			mocks.traceGet.mockReset().mockRejectedValue(new Error("not visible"));
-			mocks.ingestionBatch.mockReset().mockResolvedValue({
-				successes: [],
-				errors: [
-					{
-						id: "event-1",
-						status: 400,
-						message: "invalid observation",
-					},
-				],
+			mocks.observationsGetMany
+				.mockReset()
+				.mockResolvedValue({ data: [], meta: {} });
+			mocks.setExportResult({
+				code: 1,
+				error: new Error(
+					'HTTP 400 {"message": "invalid observation", "id": "event-1"}',
+				),
 			});
 			const lf = await getRuntime(config);
 			const trace = lf.trace({ name: "pi-agent", input: "prompt" });
@@ -961,17 +964,16 @@ describe("langfuse v5 runtime facade", () => {
 				String(message).includes("REST fallback ingestion"),
 			);
 			expect(fallbackWarning).toHaveLength(1);
-			expect(String(fallbackWarning?.[0])).toContain("event-1");
 			expect(String(fallbackWarning?.[0])).toContain("invalid observation");
 			expect(getLastRuntimeError()?.message).toContain("invalid observation");
 		} finally {
-			mocks.ingestionBatch.mockResolvedValue({ successes: [], errors: [] });
+			mocks.setExportResult({ code: 0 });
 			warn.mockRestore();
 			restoreTimeouts();
 		}
 	});
 
-	it("bounds multiline REST request failures to one warning line", async () => {
+	it("bounds multiline replay failures to one warning line", async () => {
 		const restoreTimeouts = setRuntimeTimeoutsForTest({
 			shutdownStepMs: 20,
 			traceVisibilityMs: 10,
@@ -979,14 +981,15 @@ describe("langfuse v5 runtime facade", () => {
 		});
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 		try {
-			mocks.traceGet.mockReset().mockRejectedValue(new Error("not visible"));
-			mocks.ingestionBatch
+			mocks.observationsGetMany
 				.mockReset()
-				.mockRejectedValue(
-					new Error(
-						`HTTP 413\n{\n  "message": "payload too large"\n}\n${"body ".repeat(300)}`,
-					),
-				);
+				.mockResolvedValue({ data: [], meta: {} });
+			mocks.setExportResult({
+				code: 1,
+				error: new Error(
+					`HTTP 413\n{\n  "message": "payload too large"\n}\n${"body ".repeat(300)}`,
+				),
+			});
 			const lf = await getRuntime(config);
 			const trace = lf.trace({ name: "pi-agent", input: "prompt" });
 			const prompt = lf.span({ name: "agent.prompt", traceId: trace.id });
@@ -1003,13 +1006,13 @@ describe("langfuse v5 runtime facade", () => {
 			expect(warningText).not.toContain("\n");
 			expect(warningText.length).toBeLessThan(700);
 		} finally {
-			mocks.ingestionBatch.mockResolvedValue({ successes: [], errors: [] });
+			mocks.setExportResult({ code: 0 });
 			warn.mockRestore();
 			restoreTimeouts();
 		}
 	});
 
-	it("still reports one diagnostic when a batch rejects without an Error", async () => {
+	it("still reports one diagnostic when a replay rejects without an Error", async () => {
 		const restoreTimeouts = setRuntimeTimeoutsForTest({
 			shutdownStepMs: 20,
 			traceVisibilityMs: 10,
@@ -1017,8 +1020,10 @@ describe("langfuse v5 runtime facade", () => {
 		});
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 		try {
-			mocks.traceGet.mockReset().mockRejectedValue(new Error("not visible"));
-			mocks.ingestionBatch.mockReset().mockRejectedValue(undefined);
+			mocks.observationsGetMany
+				.mockReset()
+				.mockResolvedValue({ data: [], meta: {} });
+			mocks.setExportResult({ code: 1 });
 			const lf = await getRuntime(config);
 			const trace = lf.trace({ name: "pi-agent", input: "prompt" });
 			const prompt = lf.span({ name: "agent.prompt", traceId: trace.id });
@@ -1035,13 +1040,13 @@ describe("langfuse v5 runtime facade", () => {
 				"REST fallback ingestion",
 			);
 		} finally {
-			mocks.ingestionBatch.mockResolvedValue({ successes: [], errors: [] });
+			mocks.setExportResult({ code: 0 });
 			warn.mockRestore();
 			restoreTimeouts();
 		}
 	});
 
-	it("caps the joined reasons when every batch fails differently", async () => {
+	it("caps the joined reasons when every replay chunk fails differently", async () => {
 		const restoreTimeouts = setRuntimeTimeoutsForTest({
 			shutdownStepMs: 20,
 			traceVisibilityMs: 10,
@@ -1049,22 +1054,28 @@ describe("langfuse v5 runtime facade", () => {
 		});
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 		try {
-			const payload = "x ".repeat(1_000_000);
-			mocks.traceGet.mockReset().mockRejectedValue(new Error("not visible"));
+			const payload = "x ".repeat(800_000);
+			mocks.observationsGetMany
+				.mockReset()
+				.mockResolvedValue({ data: [], meta: {} });
 			let call = 0;
-			mocks.ingestionBatch.mockReset().mockImplementation(async () => {
-				call += 1;
-				return {
-					successes: [],
-					errors: [
-						{
-							id: `event-${call}`,
-							status: 400,
-							message: `distinct failure ${call}`,
-						},
-					],
-				};
-			});
+			const OTLPTraceExporter = mocks.OTLPTraceExporter as unknown as {
+				mockImplementation: (impl: () => unknown) => void;
+			};
+			OTLPTraceExporter.mockImplementation(() => ({
+				export: vi.fn(
+					(
+						_spans: Array<Record<string, unknown>>,
+						callback: (result: { code: number; error?: Error }) => void,
+					) => {
+						call += 1;
+						callback({
+							code: 1,
+							error: new Error(`distinct failure ${call}`),
+						});
+					},
+				),
+			}));
 			const fallbackConfig = {
 				...config,
 				payloadMaxStringChars: Infinity,
@@ -1083,7 +1094,6 @@ describe("langfuse v5 runtime facade", () => {
 
 			await flushClient();
 
-			expect(mocks.ingestionBatch.mock.calls.length).toBeGreaterThan(3);
 			const fallbackWarnings = warn.mock.calls.filter(([message]) =>
 				String(message).includes("REST fallback ingestion"),
 			);
@@ -1093,10 +1103,6 @@ describe("langfuse v5 runtime facade", () => {
 			expect(warningText).not.toContain("\n");
 			expect(warningText.length).toBeLessThan(1_800);
 		} finally {
-			mocks.ingestionBatch.mockReset().mockResolvedValue({
-				successes: [],
-				errors: [],
-			});
 			warn.mockRestore();
 			restoreTimeouts();
 		}

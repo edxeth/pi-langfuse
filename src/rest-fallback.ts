@@ -1,4 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { ExportResultCode, timeInputToHrTime } from "@opentelemetry/core";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
+import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
+import {
+	SpanKind,
+	SpanStatusCode,
+	TraceFlags,
+} from "@opentelemetry/api";
 import type { LangfuseClient } from "@langfuse/client";
 
 export type RestFallbackMetadata = Record<string, unknown>;
@@ -72,12 +79,6 @@ export interface RestFallbackTrace {
 	completed: boolean;
 	/** Drain rounds that attempted replay without full delivery. */
 	attempts: number;
-	/**
-	 * Events built for replay, cached so every attempt reuses identical
-	 * envelope event ids; the ingestion API deduplicates by event id, so a
-	 * regenerated id would defeat recovery of an ambiguous delivery.
-	 */
-	pendingEvents?: RestFallbackEvent[];
 }
 
 export interface RestFallbackStore {
@@ -85,29 +86,79 @@ export interface RestFallbackStore {
 	readonly observations: Map<string, RestFallbackObservation>;
 }
 
-type RestIngestionRequest = Parameters<
-	LangfuseClient["api"]["ingestion"]["batch"]
->[0];
+/**
+ * Connection facts for the supported OTLP ingestion endpoint. The legacy
+ * `/api/public/ingestion` and trace read APIs are unavailable on Langfuse
+ * server v4, so both the replay and the completeness check use the
+ * OTLP/v2 surface that exists on v3 and v4 alike.
+ */
+export interface RestFallbackConnection {
+	host: string;
+	publicKey: string;
+	secretKey: string;
+}
 
-type RestFallbackEvent = {
-	type: "trace-create" | "span-create" | "generation-create";
-	id: string;
-	timestamp: string;
-	body: Record<string, unknown>;
-};
+export interface FallbackReplayTransport {
+	sendSpans(spans: ReadableSpan[], timeoutMs: number): Promise<void>;
+}
+
+export interface RestFallbackDeps {
+	client: LangfuseClient;
+	transport: FallbackReplayTransport;
+}
 
 const MAX_REST_BATCH_BYTES = 3_500_000;
 const MAX_REPORTED_FAILURE_REASONS = 3;
-const FALLBACK_METADATA = {
-	source: "pi-langfuse",
-	fallback: "rest-ingestion",
-	reason: "otel-trace-incomplete-after-flush",
+const MAX_FALLBACK_ATTEMPTS = 3;
+const MAX_RETAINED_FALLBACK_BYTES = 32_000_000;
+const MAX_VISIBILITY_PAGES = 5;
+const FALLBACK_RESOURCE = { attributes: { "service.name": "pi-langfuse" } };
+const FALLBACK_SCOPE = {
+	name: "pi-langfuse-rest-fallback",
+	version: undefined,
+	schemaUrl: undefined,
 };
 
 export function createRestFallbackStore(): RestFallbackStore {
 	return {
 		traces: new Map(),
 		observations: new Map(),
+	};
+}
+
+/**
+ * Builds a replay sender over the standard OTLP trace exporter, the same
+ * serialization the normal export path uses. A fresh exporter per send keeps
+ * the timeout bound aligned with the current drain options.
+ */
+export function createOtlpFallbackTransport(
+	connection: RestFallbackConnection,
+): FallbackReplayTransport {
+	return {
+		sendSpans(spans, timeoutMs) {
+			const exporter = new OTLPTraceExporter({
+				url: `${connection.host.replace(/\/$/, "")}/api/public/otel/v1/traces`,
+				headers: {
+					Authorization: `Basic ${Buffer.from(
+						`${connection.publicKey}:${connection.secretKey}`,
+					).toString("base64")}`,
+					"x-langfuse-public-key": connection.publicKey,
+				},
+				timeoutMillis: Math.max(timeoutMs, 1),
+			});
+			return new Promise((resolve, reject) => {
+				exporter.export(spans, (result) => {
+					if (result.code === ExportResultCode.SUCCESS) {
+						resolve();
+						return;
+					}
+					reject(
+						result.error ??
+							new Error("OTLP fallback export failed without a reason"),
+					);
+				});
+			});
+		},
 	};
 }
 
@@ -259,85 +310,165 @@ export function completeTrace(store: RestFallbackStore, traceId: string) {
 	if (trace) trace.completed = true;
 }
 
-function eventTimestamp(record: {
-	endTime?: string;
-	startTime?: string;
-	timestamp?: string;
-}) {
-	return (
-		record.endTime ??
-		record.startTime ??
-		record.timestamp ??
-		new Date().toISOString()
-	);
+function serializeAttributeValue(value: unknown): string | undefined {
+	if (typeof value === "string") return value;
+	if (value === undefined) return undefined;
+	try {
+		return JSON.stringify(value) ?? String(value);
+	} catch {
+		return String(value);
+	}
 }
 
-function fallbackTraceEvent(trace: RestFallbackTrace): RestFallbackEvent {
-	return {
-		type: "trace-create",
-		id: randomUUID(),
-		timestamp: eventTimestamp(trace),
-		body: {
-			id: trace.id,
-			timestamp: trace.timestamp,
-			name: trace.name,
-			input: trace.input,
-			output: trace.output,
-			metadata: trace.metadata,
-			sessionId: trace.sessionId,
-			userId: trace.userId,
-			tags: trace.tags,
-			release: trace.release,
-			version: trace.version,
-			environment: trace.environment,
-			public: trace.public,
-		},
-	};
+function setFlattenedMetadata(
+	attributes: Record<string, unknown>,
+	prefix: string,
+	metadata: RestFallbackMetadata | undefined,
+) {
+	if (!metadata) return;
+	for (const [key, value] of Object.entries(metadata)) {
+		const serialized = serializeAttributeValue(value);
+		if (serialized !== undefined) attributes[`${prefix}.${key}`] = serialized;
+	}
 }
 
-function fallbackObservationEvent(
+/**
+ * Converts one recorded observation into the span shape the normal OTel
+ * export path produces, mirroring the installed SDK's attribute vocabulary so
+ * the server reconstructs identical traces and observations from a replay.
+ * Span identity is the recorded trace and observation id, so repeated replays
+ * of the same record upsert instead of duplicating.
+ */
+function replaySpan(
+	trace: RestFallbackTrace,
 	observation: RestFallbackObservation,
-): RestFallbackEvent {
-	const body: Record<string, unknown> = {
-		id: observation.id,
-		traceId: observation.traceId,
-		name: observation.name,
-		startTime: observation.startTime,
-		parentObservationId: observation.parentObservationId,
-		input: observation.input,
-		output: observation.output,
-		metadata: observation.metadata,
-		level: observation.level,
-		statusMessage: observation.statusMessage,
+	isTraceRoot: boolean,
+): ReadableSpan {
+	const attributes: Record<string, unknown> = {
+		"langfuse.observation.type":
+			observation.type === "GENERATION" ? "generation" : "span",
 	};
-	if (observation.completionStartTime) {
-		body.completionStartTime = observation.completionStartTime;
+	if (observation.level === "ERROR") {
+		attributes["langfuse.observation.level"] = "ERROR";
 	}
-	if (observation.endTime) body.endTime = observation.endTime;
-	if (observation.type === "GENERATION") {
-		body.model = observation.model;
-		body.modelParameters = observation.modelParameters;
-		body.usageDetails = observation.usageDetails;
-		body.costDetails = observation.costDetails;
+	if (observation.statusMessage !== undefined) {
+		attributes["langfuse.observation.status_message"] =
+			observation.statusMessage;
 	}
+	const input = serializeAttributeValue(observation.input);
+	if (input !== undefined) attributes["langfuse.observation.input"] = input;
+	const output = serializeAttributeValue(observation.output);
+	if (output !== undefined) {
+		attributes["langfuse.observation.output"] = output;
+	}
+	setFlattenedMetadata(
+		attributes,
+		"langfuse.observation.metadata",
+		observation.metadata,
+	);
+	if (observation.model !== undefined) {
+		attributes["langfuse.observation.model.name"] = observation.model;
+	}
+	const modelParameters = serializeAttributeValue(observation.modelParameters);
+	if (modelParameters !== undefined) {
+		attributes["langfuse.observation.model.parameters"] = modelParameters;
+	}
+	const usageDetails = serializeAttributeValue(observation.usageDetails);
+	if (usageDetails !== undefined) {
+		attributes["langfuse.observation.usage_details"] = usageDetails;
+	}
+	const costDetails = serializeAttributeValue(observation.costDetails);
+	if (costDetails !== undefined) {
+		attributes["langfuse.observation.cost_details"] = costDetails;
+	}
+	if (observation.completionStartTime !== undefined) {
+		attributes["langfuse.observation.completion_start_time"] =
+			observation.completionStartTime;
+	}
+	if (trace.environment) attributes["langfuse.environment"] = trace.environment;
+	if (trace.release) attributes["langfuse.release"] = trace.release;
+	if (isTraceRoot) {
+		attributes["langfuse.trace.name"] = trace.name;
+		if (trace.sessionId !== undefined) {
+			attributes["session.id"] = trace.sessionId;
+		}
+		if (trace.userId !== undefined) attributes["user.id"] = trace.userId;
+		if (trace.tags && trace.tags.length > 0) {
+			attributes["langfuse.trace.tags"] = [...trace.tags];
+		}
+		const traceInput = serializeAttributeValue(trace.input);
+		if (traceInput !== undefined) {
+			attributes["langfuse.trace.input"] = traceInput;
+		}
+		const traceOutput = serializeAttributeValue(trace.output);
+		if (traceOutput !== undefined) {
+			attributes["langfuse.trace.output"] = traceOutput;
+		}
+		setFlattenedMetadata(
+			attributes,
+			"langfuse.trace.metadata",
+			trace.metadata,
+		);
+		if (trace.public) attributes["langfuse.trace.public"] = true;
+	}
+	const startTime = timeInputToHrTime(new Date(observation.startTime));
+	const endTime = timeInputToHrTime(
+		new Date(observation.endTime ?? observation.startTime),
+	);
+	const spanContext = {
+		traceId: trace.id,
+		spanId: observation.id,
+		traceFlags: TraceFlags.SAMPLED,
+		isRemote: false,
+	};
+	const parentSpanContext = observation.parentObservationId
+		? {
+				...spanContext,
+				spanId: observation.parentObservationId,
+			}
+		: undefined;
 	return {
-		type:
-			observation.type === "GENERATION" ? "generation-create" : "span-create",
-		id: randomUUID(),
-		timestamp: eventTimestamp(observation),
-		body,
+		name: observation.name,
+		kind: SpanKind.INTERNAL,
+		spanContext: () => spanContext,
+		parentSpanContext,
+		startTime,
+		endTime,
+		status:
+			observation.level === "ERROR"
+				? {
+						code: SpanStatusCode.ERROR,
+						message: observation.statusMessage,
+					}
+				: { code: SpanStatusCode.UNSET },
+		attributes: attributes as ReadableSpan["attributes"],
+		links: [],
+		events: [],
+		duration: [0, 0],
+		ended: true,
+		resource: FALLBACK_RESOURCE as unknown as ReadableSpan["resource"],
+		instrumentationScope: FALLBACK_SCOPE,
+		droppedAttributesCount: 0,
+		droppedEventsCount: 0,
+		droppedLinksCount: 0,
 	};
 }
 
-function batchSize(events: RestFallbackEvent[]) {
-	return Buffer.byteLength(
-		JSON.stringify({ batch: events, metadata: FALLBACK_METADATA }),
-		"utf8",
+function buildReplaySpans(trace: RestFallbackTrace): ReadableSpan[] {
+	// Trace-level fields ride the root observation's span, matching how the
+	// normal path propagates them onto the prompt root.
+	const rootId = trace.observations.find(
+		(observation) => !observation.parentObservationId,
+	)?.id;
+	return trace.observations.map((observation) =>
+		replaySpan(trace, observation, observation.id === rootId),
 	);
 }
 
-function eventBytes(event: RestFallbackEvent) {
-	return Buffer.byteLength(JSON.stringify(event), "utf8");
+function replaySpanBytes(span: ReadableSpan) {
+	// Approximation: the exporter's protobuf frame adds negligible overhead
+	// against a 3.5 MB budget, and the attribute payload dominates.
+	return Buffer.byteLength(JSON.stringify(span), "utf8");
 }
 
 function boundedEventList(ids: string[], max = MAX_REPORTED_FAILURE_REASONS) {
@@ -346,108 +477,72 @@ function boundedEventList(ids: string[], max = MAX_REPORTED_FAILURE_REASONS) {
 	return `${shown.join(", ")}${omitted > 0 ? ` (+${omitted} more)` : ""}`;
 }
 
-const MAX_FALLBACK_ATTEMPTS = 3;
-const MAX_RETAINED_FALLBACK_BYTES = 32_000_000;
-
-function pendingEventsForTrace(trace: RestFallbackTrace): RestFallbackEvent[] {
-	// Rebuilds may pick up observations added after the first attempt, but
-	// every event already built keeps its original envelope id and body.
-	const known = new Map<string, RestFallbackEvent>();
-	for (const event of trace.pendingEvents ?? []) {
-		known.set(`${event.type}:${String(event.body.id)}`, event);
-	}
-	const events = [
-		fallbackTraceEvent(trace),
-		...trace.observations.map(fallbackObservationEvent),
-	];
-	trace.pendingEvents = events.map((event) => {
-		const key = `${event.type}:${String(event.body.id)}`;
-		return known.get(key) ?? event;
-	});
-	return trace.pendingEvents;
-}
-
-function retainedTraceBytes(trace: RestFallbackTrace) {
-	return (trace.pendingEvents ?? []).reduce(
-		(sum, event) => sum + eventBytes(event),
-		0,
-	);
-}
-
 function enforceRetentionBound(
 	store: RestFallbackStore,
-	candidates: RestFallbackTrace[],
+	built: Array<{ trace: RestFallbackTrace; spans: ReadableSpan[] }>,
 ): string[] {
+	const bytesOf = (entry: { spans: ReadableSpan[] }) =>
+		entry.spans.reduce((sum, span) => sum + replaySpanBytes(span), 0);
 	let total = 0;
-	for (const trace of candidates) total += retainedTraceBytes(trace);
+	for (const entry of built) total += bytesOf(entry);
 	const discarded: string[] = [];
 	// FIFO: the store Map preserves insertion order, so the oldest completed
 	// traces give up their recovery copies first when the budget is exceeded.
-	for (const trace of candidates) {
+	for (const entry of built) {
 		if (total <= MAX_RETAINED_FALLBACK_BYTES) break;
-		total -= retainedTraceBytes(trace);
-		discarded.push(trace.id);
-		retireTrace(store, trace);
+		total -= bytesOf(entry);
+		discarded.push(entry.trace.id);
+		retireTrace(store, entry.trace);
 	}
 	return discarded;
 }
 
-export interface BuiltFallbackBatches {
-	batches: RestFallbackEvent[][];
-	oversizedEventLabels: string[];
-	/** Trace ids carried by each batch, aligned with `batches`. */
-	batchTraceIds: Array<Set<string>>;
+export interface BuiltReplayChunks {
+	chunks: ReadableSpan[][];
+	oversizedSpanLabels: string[];
+	/** Trace ids carried by each chunk, aligned with `chunks`. */
+	chunkTraceIds: Array<Set<string>>;
 }
 
-function buildBatches(traces: RestFallbackTrace[]): BuiltFallbackBatches {
-	const batches: RestFallbackEvent[][] = [];
-	const oversizedEventLabels: string[] = [];
-	const batchTraceIds: Array<Set<string>> = [];
-	let current: RestFallbackEvent[] = [];
+function buildReplayChunks(
+	entries: Array<{ trace: RestFallbackTrace; spans: ReadableSpan[] }>,
+): BuiltReplayChunks {
+	const chunks: ReadableSpan[][] = [];
+	const oversizedSpanLabels: string[] = [];
+	const chunkTraceIds: Array<Set<string>> = [];
+	let current: ReadableSpan[] = [];
+	let currentBytes = 0;
 	let currentOwners = new Set<string>();
 	const closeCurrent = () => {
 		if (current.length === 0) return;
-		batches.push(current);
-		batchTraceIds.push(currentOwners);
+		chunks.push(current);
+		chunkTraceIds.push(currentOwners);
 		current = [];
+		currentBytes = 0;
 		currentOwners = new Set();
 	};
-	for (const trace of traces) {
-		// One event above the server's per-request limit cannot be delivered by
-		// any batching, so it is dropped and reported instead of poisoning the
-		// whole batch that carries it.
-		const sendable = pendingEventsForTrace(trace).filter((event) => {
-			if (eventBytes(event) <= MAX_REST_BATCH_BYTES) return true;
-			oversizedEventLabels.push(
-				`${event.type} ${String(event.body.id ?? trace.id)} (${eventBytes(event)} bytes)`,
-			);
-			return false;
-		});
-		if (sendable.length === 0) continue;
-		if (
-			current.length > 0 &&
-			batchSize([...current, ...sendable]) > MAX_REST_BATCH_BYTES
-		) {
-			closeCurrent();
-		}
-		if (batchSize(sendable) <= MAX_REST_BATCH_BYTES) {
-			current.push(...sendable);
-			currentOwners.add(trace.id);
-			continue;
-		}
-		for (const event of sendable) {
-			if (
-				current.length > 0 &&
-				batchSize([...current, event]) > MAX_REST_BATCH_BYTES
-			) {
+	for (const { trace, spans } of entries) {
+		for (const span of spans) {
+			const bytes = replaySpanBytes(span);
+			// One span above the request limit cannot be delivered by any
+			// chunking, so it is dropped and reported instead of poisoning the
+			// whole chunk that carries it.
+			if (bytes > MAX_REST_BATCH_BYTES) {
+				oversizedSpanLabels.push(
+					`span ${span.spanContext().spanId} (${bytes} bytes)`,
+				);
+				continue;
+			}
+			if (currentBytes + bytes > MAX_REST_BATCH_BYTES) {
 				closeCurrent();
 			}
-			current.push(event);
+			current.push(span);
+			currentBytes += bytes;
 			currentOwners.add(trace.id);
 		}
 	}
 	closeCurrent();
-	return { batches, oversizedEventLabels, batchTraceIds };
+	return { chunks, oversizedSpanLabels, chunkTraceIds };
 }
 
 async function withTimeout<T>(
@@ -477,44 +572,66 @@ function delay(ms: number) {
 	return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Reads the observation ids the server reports for a trace through the
+ * supported v2 observations endpoint. `undefined` means the check could not
+ * produce an answer (endpoint missing, HTTP error, timeout).
+ */
 async function serverObservationIds(
 	client: LangfuseClient,
 	traceId: string,
+	expectedCount: number,
 	timeoutMs: number,
 ): Promise<Set<string> | undefined> {
-	const traceApi = client.api?.trace;
-	if (!traceApi?.get) return undefined;
-	const controller = new AbortController();
-	try {
-		const response = await withTimeout(
-			"Trace visibility check",
-			traceApi.get(traceId, undefined, {
-				timeoutInSeconds: Math.max(timeoutMs / 1000, 0.001),
-				maxRetries: 0,
-				abortSignal: controller.signal,
-			}),
-			timeoutMs,
-			() => controller.abort(),
-		);
-		const ids = new Set<string>();
-		for (const observation of response?.observations ?? []) {
-			if (typeof observation?.id === "string") ids.add(observation.id);
+	const observationsApi = client.api?.observations;
+	if (!observationsApi?.getMany) return undefined;
+	const ids = new Set<string>();
+	let cursor: string | undefined;
+	for (let page = 0; page < MAX_VISIBILITY_PAGES; page += 1) {
+		const controller = new AbortController();
+		try {
+			const response = await withTimeout(
+				"Trace visibility check",
+				observationsApi.getMany(
+					{
+						traceId,
+						fields: "core",
+						limit: 1000,
+						...(cursor ? { cursor } : {}),
+					},
+					{
+						timeoutInSeconds: Math.max(timeoutMs / 1000, 0.001),
+						maxRetries: 0,
+						abortSignal: controller.signal,
+					},
+				),
+				timeoutMs,
+				() => controller.abort(),
+			);
+			for (const observation of response?.data ?? []) {
+				if (typeof observation?.id === "string") ids.add(observation.id);
+			}
+			if (ids.size >= expectedCount) return ids;
+			cursor = response?.meta?.cursor;
+			if (!cursor) return ids;
+		} catch {
+			return undefined;
 		}
-		return ids;
-	} catch {
-		return undefined;
 	}
+	return ids;
 }
 
 /**
  * A trace only counts as delivered when every recorded observation is
- * confirmed on the server. Existence of the trace row alone is not enough:
- * the exporter can split one trace across batches and reject some of them.
- * A failed or unavailable check is reported as unconfirmed so the replay
- * path re-sends with stable identities instead of silently skipping.
+ * confirmed on the server through the v2 observations endpoint. Existence of
+ * the trace row alone is not enough: the exporter can split one trace across
+ * batches and reject some of them. A failed or unavailable check is reported
+ * as unconfirmed so the replay path re-sends with stable identities instead
+ * of silently skipping; replays are idempotent because they carry the
+ * original trace and span ids.
  */
 async function traceIsCompleteOnServer(
-	client: LangfuseClient,
+	deps: RestFallbackDeps,
 	trace: RestFallbackTrace,
 	options: {
 		requestTimeoutMs: number;
@@ -522,7 +639,7 @@ async function traceIsCompleteOnServer(
 		pollIntervalMs: number;
 	},
 ) {
-	if (!client.api?.trace?.get) {
+	if (!deps.client.api?.observations?.getMany) {
 		// The check cannot run at all; polling would only stall the drain.
 		return false;
 	}
@@ -531,8 +648,9 @@ async function traceIsCompleteOnServer(
 	while (Date.now() < deadline) {
 		const remaining = deadline - Date.now();
 		const serverIds = await serverObservationIds(
-			client,
+			deps.client,
 			trace.id,
+			expected.length,
 			Math.min(options.requestTimeoutMs, remaining),
 		);
 		if (serverIds !== undefined) {
@@ -546,36 +664,6 @@ async function traceIsCompleteOnServer(
 		await delay(sleepMs);
 	}
 	return false;
-}
-
-async function sendBatch(
-	client: LangfuseClient,
-	events: RestFallbackEvent[],
-	timeoutMs: number,
-) {
-	const ingestion = client.api?.ingestion;
-	if (!ingestion?.batch) return;
-	const request = {
-		batch: events,
-		metadata: FALLBACK_METADATA,
-	} as unknown as RestIngestionRequest;
-	const controller = new AbortController();
-	const response = await withTimeout(
-		"REST fallback ingestion",
-		ingestion.batch(request, {
-			timeoutInSeconds: Math.max(timeoutMs / 1000, 0.001),
-			maxRetries: 0,
-			abortSignal: controller.signal,
-		}),
-		timeoutMs,
-		() => controller.abort(),
-	);
-	const errors = (response as { errors?: unknown[] } | undefined)?.errors;
-	if (Array.isArray(errors) && errors.length > 0) {
-		throw new Error(
-			`REST fallback ingestion reported ${errors.length} error(s); first error: ${ingestionErrorSummary(errors[0])}`,
-		);
-	}
 }
 
 function boundedDiagnostic(value: unknown, maxChars = 500) {
@@ -596,23 +684,6 @@ function boundedDiagnostic(value: unknown, maxChars = 500) {
 		: singleLine;
 }
 
-function ingestionErrorSummary(value: unknown) {
-	if (!value || typeof value !== "object") return boundedDiagnostic(value);
-	const error = value as Record<string, unknown>;
-	const details: string[] = [];
-	if (typeof error.id === "string") {
-		details.push(`id=${boundedDiagnostic(error.id, 120)}`);
-	}
-	if (typeof error.status === "number") details.push(`status=${error.status}`);
-	if (typeof error.message === "string") {
-		details.push(`message=${boundedDiagnostic(error.message)}`);
-	}
-	if (error.error !== undefined) {
-		details.push(`error=${boundedDiagnostic(error.error)}`);
-	}
-	return details.length > 0 ? details.join(", ") : boundedDiagnostic(value);
-}
-
 function fallbackFailureMessage(reason: unknown) {
 	return boundedDiagnostic(reason instanceof Error ? reason.message : reason);
 }
@@ -626,7 +697,7 @@ function retireTrace(store: RestFallbackStore, trace: RestFallbackTrace) {
 
 export async function drainCompletedRestFallback(
 	store: RestFallbackStore,
-	client: LangfuseClient,
+	deps: RestFallbackDeps,
 	options: {
 		requestTimeoutMs: number;
 		visibilityTimeoutMs: number;
@@ -637,42 +708,53 @@ export async function drainCompletedRestFallback(
 		(trace) => trace.completed,
 	);
 	if (candidates.length === 0) return;
+	const built = candidates.map((trace) => ({
+		trace,
+		spans: buildReplaySpans(trace),
+	}));
 
 	const problems: string[] = [];
-	const evicted = enforceRetentionBound(store, candidates);
+	const evicted = enforceRetentionBound(store, built);
 	if (evicted.length > 0) {
 		problems.push(
 			`REST fallback discarded ${evicted.length} trace(s) beyond the ${MAX_RETAINED_FALLBACK_BYTES}-byte retention budget: ${boundedEventList(evicted)}`,
 		);
 	}
-	const retained = candidates.filter((trace) => store.traces.has(trace.id));
+	const retained = built.filter((entry) =>
+		store.traces.has(entry.trace.id),
+	);
 	if (retained.length === 0) {
 		if (problems.length > 0) throw new Error(problems.join("; "));
 		return;
 	}
 
 	const checked = await Promise.all(
-		retained.map(async (trace) => ({
-			trace,
-			complete: await traceIsCompleteOnServer(client, trace, options),
+		retained.map(async (entry) => ({
+			entry,
+			complete: await traceIsCompleteOnServer(deps, entry.trace, options),
 		})),
 	);
-	for (const { trace, complete } of checked) {
-		if (complete) retireTrace(store, trace);
+	for (const { entry, complete } of checked) {
+		if (complete) retireTrace(store, entry.trace);
 	}
 	const replay = checked
 		.filter(({ complete }) => !complete)
-		.map(({ trace }) => trace);
+		.map(({ entry }) => entry);
 	if (replay.length === 0) {
 		if (problems.length > 0) throw new Error(problems.join("; "));
 		return;
 	}
 
-	const { batches, oversizedEventLabels, batchTraceIds } =
-		buildBatches(replay);
+	const { chunks, oversizedSpanLabels, chunkTraceIds } =
+		buildReplayChunks(replay);
 	const results = await Promise.allSettled(
-		batches.map((events) =>
-			sendBatch(client, events, options.requestTimeoutMs),
+		chunks.map((spans) =>
+			withTimeout(
+				"REST fallback ingestion",
+				deps.transport.sendSpans(spans, options.requestTimeoutMs),
+				options.requestTimeoutMs,
+				() => {},
+			),
 		),
 	);
 	const failedTraceIds = new Set<string>();
@@ -680,7 +762,7 @@ export async function drainCompletedRestFallback(
 	results.forEach((result, index) => {
 		if (result.status !== "rejected") return;
 		failures.push(result);
-		for (const id of batchTraceIds[index] ?? []) failedTraceIds.add(id);
+		for (const id of chunkTraceIds[index] ?? []) failedTraceIds.add(id);
 	});
 
 	if (failures.length > 0) {
@@ -688,20 +770,21 @@ export async function drainCompletedRestFallback(
 			new Set(failures.map((failure) => fallbackFailureMessage(failure.reason))),
 		);
 		// Cap the joined reasons so one terminal line stays constant-bounded even
-		// when every batch fails for a different reason.
+		// when every chunk fails for a different reason.
 		const shown = reasons.slice(0, MAX_REPORTED_FAILURE_REASONS);
 		const omitted = reasons.length - shown.length;
 		const keptForRetry = replay.filter(
-			(trace) =>
-				failedTraceIds.has(trace.id) && trace.attempts + 1 < MAX_FALLBACK_ATTEMPTS,
+			(entry) =>
+				failedTraceIds.has(entry.trace.id) &&
+				entry.trace.attempts + 1 < MAX_FALLBACK_ATTEMPTS,
 		).length;
 		problems.push(
-			`REST fallback ingestion failed for ${failures.length}/${batches.length} batch(es): ${shown.join("; ")}${omitted > 0 ? ` (+${omitted} more)` : ""}${keptForRetry > 0 ? `; retaining ${keptForRetry} trace(s) for a later drain` : ""}`,
+			`REST fallback ingestion failed for ${failures.length}/${chunks.length} batch(es): ${shown.join("; ")}${omitted > 0 ? ` (+${omitted} more)` : ""}${keptForRetry > 0 ? `; retaining ${keptForRetry} trace(s) for a later drain` : ""}`,
 		);
 	}
-	if (oversizedEventLabels.length > 0) {
+	if (oversizedSpanLabels.length > 0) {
 		problems.push(
-			`REST fallback ingestion dropped ${oversizedEventLabels.length} oversized event(s) beyond the ${MAX_REST_BATCH_BYTES}-byte limit: ${boundedEventList(oversizedEventLabels)}`,
+			`REST fallback ingestion dropped ${oversizedSpanLabels.length} oversized span(s) beyond the ${MAX_REST_BATCH_BYTES}-byte limit: ${boundedEventList(oversizedSpanLabels)}`,
 		);
 	}
 
@@ -709,7 +792,7 @@ export async function drainCompletedRestFallback(
 	// consume one attempt and are either kept for a later drain or discarded
 	// with an explicit loss diagnostic once the retry budget is spent.
 	const exhausted: string[] = [];
-	for (const trace of replay) {
+	for (const { trace } of replay) {
 		if (!failedTraceIds.has(trace.id)) {
 			retireTrace(store, trace);
 			continue;

@@ -20,9 +20,11 @@ import {
 import { sanitizeForTelemetry } from "./redaction.js";
 import {
 	completeTrace,
+	createOtlpFallbackTransport,
 	createRestFallbackStore,
 	drainCompletedRestFallback,
 	endObservation,
+	type FallbackReplayTransport,
 	type RestFallbackObservationBody,
 	type RestFallbackStore,
 	recordObservation,
@@ -170,6 +172,7 @@ interface RuntimeState {
 	readonly observations: Map<string, VendorObservation>;
 	readonly traces: Map<string, RuntimeTrace>;
 	readonly fallbackStore: RestFallbackStore;
+	readonly fallbackTransport: FallbackReplayTransport;
 }
 
 class RuntimeIdGenerator {
@@ -780,6 +783,11 @@ function createRuntime(config: Config): RuntimeState {
 		observations: new Map(),
 		traces: new Map(),
 		fallbackStore: createRestFallbackStore(),
+		fallbackTransport: createOtlpFallbackTransport({
+			host: config.host,
+			publicKey: config.publicKey,
+			secretKey: config.secretKey,
+		}),
 	};
 }
 
@@ -817,11 +825,15 @@ async function shutdownRuntime(rt: RuntimeState) {
 		console.warn("📊 Langfuse: Failed to flush OpenTelemetry spans", error);
 	}
 	try {
-		await drainCompletedRestFallback(rt.fallbackStore, rt.scoreClient, {
-			requestTimeoutMs: shutdownStepTimeoutMs,
-			visibilityTimeoutMs: traceVisibilityTimeoutMs,
-			pollIntervalMs: traceVisibilityPollIntervalMs,
-		});
+		await drainCompletedRestFallback(
+			rt.fallbackStore,
+			{ client: rt.scoreClient, transport: rt.fallbackTransport },
+			{
+				requestTimeoutMs: shutdownStepTimeoutMs,
+				visibilityTimeoutMs: traceVisibilityTimeoutMs,
+				pollIntervalMs: traceVisibilityPollIntervalMs,
+			},
+		);
 	} catch (error) {
 		recordRuntimeError(error);
 		console.warn(`📊 Langfuse: ${runtimeErrorMessage(error)}`);
@@ -879,7 +891,7 @@ export function flushClient() {
 		try {
 			await drainCompletedRestFallback(
 				runtime.fallbackStore,
-				runtime.scoreClient,
+				{ client: runtime.scoreClient, transport: runtime.fallbackTransport },
 				{
 					requestTimeoutMs: shutdownStepTimeoutMs,
 					visibilityTimeoutMs: traceVisibilityTimeoutMs,

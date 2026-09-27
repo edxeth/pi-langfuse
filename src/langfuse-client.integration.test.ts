@@ -72,25 +72,53 @@ function exportedSpans(bodies: string[]): ExportedOtlpSpan[] {
 	return spans;
 }
 
+/**
+ * Local fake of the supported server surface: OTLP ingestion plus the v2
+ * observations query the fallback uses for completeness. Spans posted to the
+ * OTLP route become queryable, so a healthy export satisfies the fallback
+ * check the way a real server would.
+ */
+function createCollectingTraceServer() {
+	const requests: Array<{ url: string; body: string }> = [];
+	const receivedSpans: ExportedOtlpSpan[] = [];
+	const server = createServer((request, response) => {
+		const chunks: Buffer[] = [];
+		request.on("data", (chunk: Buffer) => chunks.push(chunk));
+		request.on("end", () => {
+			const body = Buffer.concat(chunks).toString("utf8");
+			requests.push({ url: request.url || "", body });
+			if (request.url?.includes("/api/public/otel/v1/traces")) {
+				receivedSpans.push(...exportedSpans([body]));
+			}
+			if (request.url?.includes("/api/public/v2/observations")) {
+				const traceId =
+					new URL(request.url, "http://localhost").searchParams.get(
+						"traceId",
+					) || "";
+				const data = receivedSpans
+					.filter((span) => span.traceId === traceId)
+					.map((span) => ({ id: span.spanId }));
+				response.statusCode = 200;
+				response.setHeader("content-type", "application/json");
+				response.end(JSON.stringify({ data, meta: {} }));
+				return;
+			}
+			response.statusCode = 200;
+			response.setHeader("content-type", "application/json");
+			response.end("{}");
+		});
+	});
+	return { server, requests, receivedSpans };
+}
+
 describe("langfuse v5 local runtime", () => {
 	afterEach(async () => {
 		await shutdownClient();
 	});
 
 	it("propagates real OTel context and exports to an ephemeral local endpoint", async () => {
-		const requests: string[] = [];
-		const payloads: string[] = [];
-		const server = createServer((request, response) => {
-			requests.push(request.url || "");
-			const chunks: Buffer[] = [];
-			request.on("data", (chunk: Buffer) => chunks.push(chunk));
-			request.on("end", () => {
-				payloads.push(Buffer.concat(chunks).toString("utf8"));
-				response.statusCode = 200;
-				response.setHeader("content-type", "application/json");
-				response.end("{}");
-			});
-		});
+		const { server, requests } = createCollectingTraceServer();
+		const payloads = () => requests.map(({ body }) => body);
 		await new Promise<void>((resolve, reject) => {
 			server.once("error", reject);
 			server.listen(0, "127.0.0.1", () => resolve());
@@ -140,11 +168,14 @@ describe("langfuse v5 local runtime", () => {
 			expect(trace.id).toBe("a".repeat(32));
 			expect(activeTraceId).toBe(trace.id);
 			expect(requests.length).toBeGreaterThan(0);
-			expect(requests.some((url) => url.includes("otel"))).toBe(true);
-			expect(payloads.join("\n")).toContain("local answer");
-			expect(payloads.join("\n")).toContain("agent.prompt");
-			expect(payloads.join("\n")).toContain("first");
-			expect(payloads.join("\n")).toContain("second");
+			expect(
+				requests.some(({ url }) => url.includes("otel")),
+			).toBe(true);
+			const exported = payloads().join("\n");
+			expect(exported).toContain("local answer");
+			expect(exported).toContain("agent.prompt");
+			expect(exported).toContain("first");
+			expect(exported).toContain("second");
 		} finally {
 			await shutdownClient();
 			await new Promise<void>((resolve, reject) => {
@@ -214,22 +245,21 @@ describe("langfuse v5 local runtime", () => {
 		}
 	});
 
-	it("ingests an invisible completed trace through the REST fallback", async () => {
+		it("replays an unconfirmed trace over the OTLP ingestion endpoint", async () => {
 		const requests: Array<{ url: string; body: string }> = [];
 		const server = createServer((request, response) => {
 			const chunks: Buffer[] = [];
 			request.on("data", (chunk: Buffer) => chunks.push(chunk));
 			request.on("end", () => {
-				const body = Buffer.concat(chunks).toString("utf8");
-				requests.push({ url: request.url || "", body });
-				if (request.url?.includes("/api/public/traces/")) {
-					response.statusCode = 404;
-					response.end("not found");
-					return;
-				}
+				requests.push({
+					url: request.url || "",
+					body: Buffer.concat(chunks).toString("utf8"),
+				});
+				// The server never reports observations, so the fallback cannot
+				// confirm delivery and must replay over OTLP.
 				response.statusCode = 200;
 				response.setHeader("content-type", "application/json");
-				response.end(JSON.stringify({ successes: [], errors: [] }));
+				response.end("{}");
 			});
 		});
 		await new Promise<void>((resolve, reject) => {
@@ -241,6 +271,35 @@ describe("langfuse v5 local runtime", () => {
 			traceVisibilityMs: 25,
 			pollIntervalMs: 1,
 		});
+
+		type ReplayAttribute = { key: string; value?: { stringValue?: string; boolValue?: boolean } };
+		type ReplaySpan = {
+			traceId: string;
+			spanId: string;
+			parentSpanId?: string;
+			name: string;
+			attributes?: ReplayAttribute[];
+		};
+		const parseReplaySpans = (bodies: string[]): ReplaySpan[] =>
+			bodies.flatMap((body) => {
+				try {
+					const payload = JSON.parse(body) as {
+						resourceSpans?: Array<{
+							scopeSpans?: Array<{ spans?: ReplaySpan[] }>;
+						}>;
+					};
+					return (
+						payload.resourceSpans?.flatMap((resource) =>
+							(resource.scopeSpans ?? []).flatMap((scope) => scope.spans ?? []),
+						) ?? []
+					);
+				} catch {
+					return [];
+				}
+			});
+		const attributeOf = (span: ReplaySpan, key: string) =>
+			span.attributes?.find((attribute) => attribute.key === key)?.value
+				?.stringValue;
 
 		try {
 			const address = server.address() as AddressInfo;
@@ -286,82 +345,56 @@ describe("langfuse v5 local runtime", () => {
 
 			await shutdownClient();
 
-			const fallbackRequest = requests
-				.map(({ body }) => {
-					try {
-						return JSON.parse(body) as {
-							metadata?: Record<string, unknown>;
-							batch?: Array<{
-								type: string;
-								body: Record<string, unknown>;
-							}>;
-						};
-					} catch {
-						return undefined;
-					}
-				})
-				.find((payload) => payload?.metadata?.fallback === "rest-ingestion");
-			if (!fallbackRequest?.batch) {
-				throw new Error("REST fallback request was not received");
+			const replayBodies = requests
+				.filter(({ url }) => url.includes("/api/public/otel/v1/traces"))
+				.map(({ body }) => body);
+			if (replayBodies.length === 0) {
+				throw new Error("OTLP fallback replay was not received");
 			}
-			const traceEvent = fallbackRequest.batch.find(
-				(event) => event.type === "trace-create",
-			);
-			const generationEvent = fallbackRequest.batch.find(
-				(event) => event.type === "generation-create",
-			);
-			const toolEvent = fallbackRequest.batch.find(
-				(event) => event.type === "span-create" && event.body.id === tool.id,
-			);
-			expect(fallbackRequest.metadata).toMatchObject({
-				fallback: "rest-ingestion",
-				reason: "otel-trace-incomplete-after-flush",
-			});
-			expect(fallbackRequest.batch).toEqual(
+			const spans = parseReplaySpans(replayBodies);
+			expect(spans.map((span) => span.name)).toEqual(
 				expect.arrayContaining([
-					expect.objectContaining({
-						type: "trace-create",
-						body: expect.objectContaining({
-							id: trace.id,
-							output: "final answer",
-							sessionId: "rest-fallback-session",
-						}),
-					}),
-					expect.objectContaining({
-						type: "span-create",
-						body: expect.objectContaining({
-							id: turn.id,
-							parentObservationId: prompt.id,
-						}),
-					}),
+					"agent.prompt",
+					"agent.turn",
+					"llm-response",
+					"tool:bash",
 				]),
 			);
-			if (!traceEvent || !generationEvent || !toolEvent) {
-				throw new Error("REST fallback observations are incomplete");
+			for (const span of spans) {
+				expect(span.traceId).toBe(trace.id);
 			}
-			expect(traceEvent.body).toMatchObject({
-				name: "pi-agent",
-				input: expect.stringContaining("[REDACTED:"),
-			});
-			expect(generationEvent.body).toMatchObject({
-				id: generation.id,
-				traceId: trace.id,
-				parentObservationId: turn.id,
-				model: "fallback-model",
-				usageDetails: { input: 4, output: 6, total: 10 },
-			});
-			expect(toolEvent.body).toMatchObject({
-				traceId: trace.id,
-				parentObservationId: turn.id,
-				level: "ERROR",
-				statusMessage: "tool failed",
-			});
-			for (const event of fallbackRequest.batch) {
-				if (event.type === "trace-create") continue;
-				expect(event.body.startTime).toMatch(/^\d{4}-\d{2}-\d{2}T/);
-				expect(event.body.endTime).toMatch(/^\d{4}-\d{2}-\d{2}T/);
-			}
-			expect(JSON.stringify(fallbackRequest)).not.toContain("sk-local-test");
+			const root = spans.find((span) => span.name === "agent.prompt");
+			if (!root) throw new Error("replay is missing the prompt root");
+			expect(root.parentSpanId).toBeUndefined();
+			expect(
+				spans.find((span) => span.name === "agent.turn")?.parentSpanId,
+			).toBe(prompt.id);
+			expect(attributeOf(root, "langfuse.trace.name")).toBe("pi-agent");
+			expect(attributeOf(root, "session.id")).toBe("rest-fallback-session");
+			expect(attributeOf(root, "langfuse.trace.input")).toContain("[REDACTED:");
+			expect(attributeOf(root, "langfuse.trace.output")).toBe("final answer");
+			const generationSpan = spans.find((span) => span.name === "llm-response");
+			if (!generationSpan) throw new Error("replay is missing the generation");
+			expect(attributeOf(generationSpan, "langfuse.observation.model.name")).toBe(
+				"fallback-model",
+			);
+			expect(
+				attributeOf(generationSpan, "langfuse.observation.usage_details"),
+			).toBe(JSON.stringify({ input: 4, output: 6, total: 10 }));
+			const toolSpan = spans.find((span) => span.name === "tool:bash");
+			if (!toolSpan) throw new Error("replay is missing the tool span");
+			expect(attributeOf(toolSpan, "langfuse.observation.level")).toBe("ERROR");
+			expect(attributeOf(toolSpan, "langfuse.observation.status_message")).toBe(
+				"tool failed",
+			);
+			// The replay must be visible to the same v2 observations endpoint the
+			// fallback checks for completeness.
+			expect(
+				requests.some(({ url }) =>
+					url.includes("/api/public/v2/observations"),
+				),
+			).toBe(true);
+			expect(JSON.stringify(spans)).not.toContain("sk-local-test");
 		} finally {
 			restoreTimeouts();
 			await shutdownClient();
@@ -371,7 +404,7 @@ describe("langfuse v5 local runtime", () => {
 		}
 	});
 
-	it("stamps trace identity on child spans before the prompt root exports", async () => {
+it("stamps trace identity on child spans before the prompt root exports", async () => {
 		const requests: Array<{ url: string; body: string }> = [];
 		const server = createServer((request, response) => {
 			const chunks: Buffer[] = [];
@@ -436,25 +469,7 @@ describe("langfuse v5 local runtime", () => {
 	});
 
 	it("exports an open prompt root on controlled shutdown", async () => {
-		const requests: Array<{ url: string; body: string }> = [];
-		const server = createServer((request, response) => {
-			const chunks: Buffer[] = [];
-			request.on("data", (chunk: Buffer) => chunks.push(chunk));
-			request.on("end", () => {
-				requests.push({
-					url: request.url || "",
-					body: Buffer.concat(chunks).toString("utf8"),
-				});
-				if (request.url?.includes("/api/public/traces/")) {
-					response.statusCode = 404;
-					response.end("not found");
-					return;
-				}
-				response.statusCode = 200;
-				response.setHeader("content-type", "application/json");
-				response.end(JSON.stringify({ successes: [], errors: [] }));
-			});
-		});
+		const { server, requests } = createCollectingTraceServer();
 		await new Promise<void>((resolve, reject) => {
 			server.once("error", reject);
 			server.listen(0, "127.0.0.1", () => resolve());
@@ -504,20 +519,7 @@ describe("langfuse v5 local runtime", () => {
 	});
 
 	it("starts prompt roots independently of an active external OTel parent", async () => {
-		const requests: Array<{ url: string; body: string }> = [];
-		const server = createServer((request, response) => {
-			const chunks: Buffer[] = [];
-			request.on("data", (chunk: Buffer) => chunks.push(chunk));
-			request.on("end", () => {
-				requests.push({
-					url: request.url || "",
-					body: Buffer.concat(chunks).toString("utf8"),
-				});
-				response.statusCode = 200;
-				response.setHeader("content-type", "application/json");
-				response.end("{}");
-			});
-		});
+		const { server, requests } = createCollectingTraceServer();
 		await new Promise<void>((resolve, reject) => {
 			server.once("error", reject);
 			server.listen(0, "127.0.0.1", () => resolve());

@@ -229,11 +229,38 @@ describe("registered Langfuse v5 runtime path", () => {
 		process.env.PI_LANGFUSE_RAW_TRACE_DIR = rawTraceDir;
 
 		const bodies: string[] = [];
+		const receivedSpans: OtlpSpan[] = [];
 		const server = createServer((request, response) => {
 			const chunks: Buffer[] = [];
 			request.on("data", (chunk: Buffer) => chunks.push(chunk));
 			request.on("end", () => {
-				bodies.push(Buffer.concat(chunks).toString("utf8"));
+				const body = Buffer.concat(chunks).toString("utf8");
+				bodies.push(body);
+				// Answer the v2 observations query from received OTLP spans so the
+				// fallback completeness check behaves like a real server.
+				if (request.url?.includes("/api/public/otel/v1/traces")) {
+					const payload = parsePayload(body);
+					if (payload?.resourceSpans) {
+						for (const resource of payload.resourceSpans) {
+							for (const scope of resource.scopeSpans ?? []) {
+								receivedSpans.push(...(scope.spans ?? []));
+							}
+						}
+					}
+				}
+				if (request.url?.includes("/api/public/v2/observations")) {
+					const traceId =
+						new URL(request.url, "http://localhost").searchParams.get(
+							"traceId",
+						) || "";
+					const data = receivedSpans
+						.filter((span) => span.traceId === traceId)
+						.map((span) => ({ id: span.spanId }));
+					response.statusCode = 200;
+					response.setHeader("content-type", "application/json");
+					response.end(JSON.stringify({ data, meta: {} }));
+					return;
+				}
 				response.statusCode = 200;
 				response.setHeader("content-type", "application/json");
 				response.end("{}");

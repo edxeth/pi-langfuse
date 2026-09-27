@@ -300,12 +300,27 @@ vi.mock("@langfuse/tracing", () => telemetry.tracing);
 vi.mock("@opentelemetry/api", () => ({
 	context: telemetry.context,
 	trace: telemetry.trace,
+	// OTel enum constants used by the fallback replay span builder.
+	SpanKind: { INTERNAL: 0 },
+	SpanStatusCode: { UNSET: 0, ERROR: 2 },
+	TraceFlags: { SAMPLED: 1, NONE: 0 },
 }));
 vi.mock("@opentelemetry/context-async-hooks", () => ({
 	AsyncHooksContextManager: telemetry.AsyncHooksContextManager,
 }));
 vi.mock("@opentelemetry/sdk-trace-base", () => ({
 	BasicTracerProvider: telemetry.BasicTracerProvider,
+}));
+// The fallback replay exporter must stay inert in this fake-SDK environment
+// instead of dialing the scenarios' unresolvable fake hosts.
+vi.mock("@opentelemetry/exporter-trace-otlp-http", () => ({
+	OTLPTraceExporter: vi.fn(() => ({
+		export: vi.fn(
+			(_spans: unknown, callback: (result: { code: number }) => void) => {
+				callback({ code: 0 });
+			},
+		),
+	})),
 }));
 
 type EventHandler = (event?: unknown, ctx?: unknown) => Promise<void> | void;
@@ -1759,24 +1774,39 @@ describe("executable compatibility contract", () => {
 				},
 				{
 					method: "POST",
-					url: "/api/public/ingestion",
+					url: "/api/public/otel/v1/traces",
 					authorization: `Basic ${Buffer.from("public-key-for-test:secret-key-for-test").toString("base64")}`,
 				},
 			]);
-			const ingestion = JSON.parse(requestBodies[1] ?? "{}") as {
-				batch?: Array<{ type?: string; body?: Record<string, unknown> }>;
+			const probePayload = JSON.parse(requestBodies[1] ?? "{}") as {
+				resourceSpans?: Array<{
+					scopeSpans?: Array<{
+						spans?: Array<{
+							name?: string;
+							attributes?: Array<{
+								key?: string;
+								value?: { stringValue?: string };
+							}>;
+						}>;
+					}>;
+				}>;
 			};
-			expect(ingestion.batch).toEqual(
-				expect.arrayContaining([
-					expect.objectContaining({
-						type: "trace-create",
-						body: expect.objectContaining({
-							name: "pi-langfuse-test",
-							metadata: { command: "langfuse-test", isolated: true },
-						}),
-					}),
-				]),
+			const probeSpans =
+				probePayload.resourceSpans?.flatMap(
+					(resource) =>
+						resource.scopeSpans?.flatMap((scope) => scope.spans ?? []) ?? [],
+				) ?? [];
+			const probeSpan = probeSpans.at(-1);
+			if (!probeSpan) throw new Error("probe span was not received");
+			expect(probeSpan.name).toBe("pi-langfuse-test");
+			const probeAttribute = (key: string) =>
+				probeSpan.attributes?.find((attribute) => attribute.key === key)?.value
+					?.stringValue;
+			expect(probeAttribute("langfuse.trace.name")).toBe("pi-langfuse-test");
+			expect(probeAttribute("langfuse.trace.metadata.command")).toBe(
+				"langfuse-test",
 			);
+			expect(probeAttribute("langfuse.trace.metadata.isolated")).toBe("true");
 			expect(requestBodies[1]).not.toContain("secret-key-for-test");
 			expect(telemetry.state.flushes).toBe(0);
 			expect(activePrompt?.endCalls).toBeUndefined();
