@@ -437,6 +437,7 @@ beforeEach(() => {
 	delete process.env.PI_LANGFUSE_RAW_TRACE;
 	delete process.env.PI_LANGFUSE_RAW_TRACE_DIR;
 	delete process.env.PI_LANGFUSE_SKIP_UNPERSISTED;
+	delete process.env.PI_LANGFUSE_CAPTURE_PROVIDER_PAYLOAD;
 	delete process.env.PI_CODING_AGENT_DIR;
 });
 
@@ -2235,6 +2236,1349 @@ describe("executable compatibility contract", () => {
 			]),
 		);
 
+		await handler("session_shutdown")({}, context);
+	});
+
+	it("distinguishes distinct same-turn Responses requests, reuses identical ones, and never mutates payloads", async () => {
+		const agentDir = tempRoot("pi-langfuse-responses-agent-");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "responses-public",
+			"secret-key": "responses-secret",
+			"base-url": "http://responses-host",
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+
+		const context = {
+			model: { id: "grok-4.7", provider: "xai" },
+			sessionManager: {
+				getSessionFile: () =>
+					"/tmp/pi-agent/sessions/--responses--/responses-session.jsonl",
+				getSessionId: () => "responses-session",
+			},
+		};
+		const handler = (name: string) => eventHandler(pi, name);
+
+		await handler("session_start")({ reason: "startup" }, context);
+		await handler("model_select")(
+			{ model: { id: "grok-4.7", provider: "xai" } },
+			context,
+		);
+		await handler("before_agent_start")(
+			{
+				prompt: "responses prompt",
+				systemPrompt: "responses system",
+				systemPromptOptions: { cwd: "/tmp/responses" },
+			},
+			context,
+		);
+		await handler("agent_start")({}, context);
+		await handler("turn_start")({ turnIndex: 0 }, context);
+		await handler("context")(
+			{ messages: [{ role: "user", content: "CTX-context view" }] },
+			context,
+		);
+
+		// Responses payloads carry `input`; each distinct request must be
+		// identifiable, while an identical retry reuses the same generation.
+		const buildPayload = (marker: string) => ({
+			model: "grok-4.7",
+			input: [
+				{
+					role: "user",
+					content: [{ type: "input_text", text: `INPUT-${marker}` }],
+				},
+			],
+			stream: true,
+			store: false,
+			max_output_tokens: 2048,
+			temperature: 0.7,
+			reasoning: { effort: "low" },
+			prompt_cache_key: "pck-session",
+		});
+
+		const firstPayload = buildPayload("first");
+		const firstSnapshot = structuredClone(firstPayload);
+		await handler("before_provider_request")(
+			{ payload: firstPayload },
+			context,
+		);
+		// A failed response materializes the first generation.
+		await handler("after_provider_response")(
+			{ status: 429, headers: {} },
+			context,
+		);
+		// Provider retries resend an identical payload and must reuse the
+		// generation instead of opening a new one.
+		await handler("before_provider_request")(
+			{ payload: buildPayload("first") },
+			context,
+		);
+
+		// A retry with different contents is a distinct request and must get
+		// its own generation.
+		const secondPayload = buildPayload("second");
+		const secondSnapshot = structuredClone(secondPayload);
+		await handler("before_provider_request")(
+			{ payload: secondPayload },
+			context,
+		);
+
+		await handler("message_start")({ message: { role: "assistant" } }, context);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					usage: { input: 2, output: 1, totalTokens: 3 },
+				},
+			},
+			context,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			context,
+		);
+		await handler("agent_end")({ messages: [] }, context);
+
+		// The hook is observation-only: payloads must survive untouched.
+		expect(firstPayload).toEqual(firstSnapshot);
+		expect(secondPayload).toEqual(secondSnapshot);
+
+		const generations = telemetry.state.observations.filter(
+			(record) => record.name === "llm-response",
+		);
+		expect(generations).toHaveLength(2);
+		// Creation order follows observation creation, not request order.
+		expect(
+			generations
+				.map(
+					(generation) =>
+						(generation.metadata as { requestKey?: string }).requestKey,
+				)
+				.sort(),
+		).toEqual(["turn:0:request:0", "turn:0:request:1"]);
+		// Message events flow to the newest request's generation; the superseded
+		// first request is closed by turn cleanup as abandoned.
+		const byRequestKey = new Map(
+			generations.map((generation) => [
+				(generation.metadata as { requestKey?: string }).requestKey,
+				generation,
+			]),
+		);
+		expect(byRequestKey.get("turn:0:request:1")?.end).toMatchObject({
+			output: "done",
+		});
+		expect(byRequestKey.get("turn:0:request:0")?.end).toMatchObject({
+			isError: true,
+			statusMessage: expect.stringContaining("abandoned"),
+		});
+		expect(byRequestKey.get("turn:0:request:0")?.metadata).toMatchObject({
+			providerResponseStatuses: [429],
+		});
+		// Responses-specific parameters survive into the generation record.
+		expect(byRequestKey.get("turn:0:request:0")?.modelParameters).toEqual({
+			temperature: 0.7,
+			max_output_tokens: 2048,
+			reasoning_effort: "low",
+		});
+		await handler("session_shutdown")({}, context);
+	});
+
+	it("attaches message events to the newest request when a superseded request produced no events", async () => {
+		const agentDir = tempRoot("pi-langfuse-responses-superseded-agent-");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "superseded-public",
+			"secret-key": "superseded-secret",
+			"base-url": "http://superseded-host",
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+
+		const context = {
+			model: { id: "grok-4.7", provider: "xai" },
+			sessionManager: {
+				getSessionFile: () =>
+					"/tmp/pi-agent/sessions/--superseded--/superseded-session.jsonl",
+				getSessionId: () => "superseded-session",
+			},
+		};
+		const handler = (name: string) => eventHandler(pi, name);
+
+		await handler("session_start")({ reason: "startup" }, context);
+		await handler("model_select")(
+			{ model: { id: "grok-4.7", provider: "xai" } },
+			context,
+		);
+		await handler("before_agent_start")(
+			{
+				prompt: "superseded prompt",
+				systemPrompt: "superseded system",
+				systemPromptOptions: { cwd: "/tmp/superseded" },
+			},
+			context,
+		);
+		await handler("agent_start")({}, context);
+		await handler("turn_start")({ turnIndex: 0 }, context);
+		await handler("context")(
+			{ messages: [{ role: "user", content: "CTX-context view" }] },
+			context,
+		);
+
+		// First request never sees a response (network failure), then a retry
+		// with different contents is sent. The stream must not be attributed to
+		// the superseded request.
+		await handler("before_provider_request")(
+			{
+				payload: {
+					model: "grok-4.7",
+					input: [
+						{
+							role: "user",
+							content: [{ type: "input_text", text: "INPUT-first" }],
+						},
+					],
+				},
+			},
+			context,
+		);
+		await handler("before_provider_request")(
+			{
+				payload: {
+					model: "grok-4.7",
+					input: [
+						{
+							role: "user",
+							content: [{ type: "input_text", text: "INPUT-second" }],
+						},
+					],
+				},
+			},
+			context,
+		);
+		await handler("message_start")({ message: { role: "assistant" } }, context);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					usage: { input: 2, output: 1, totalTokens: 3 },
+				},
+			},
+			context,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			context,
+		);
+		await handler("agent_end")({ messages: [] }, context);
+
+		const generations = telemetry.state.observations.filter(
+			(record) => record.name === "llm-response",
+		);
+		// The superseded request never materialized (no response events), so the
+		// stream lands on exactly one generation: the newest request's.
+		expect(generations).toHaveLength(1);
+		const newestGeneration = generations[0];
+		if (!newestGeneration) throw new Error("newest request generation missing");
+		expect(
+			(newestGeneration.metadata as { requestKey?: string }).requestKey,
+		).toBe("turn:0:request:1");
+		expect(newestGeneration.end).toMatchObject({ output: "done" });
+		await handler("session_shutdown")({}, context);
+	});
+
+	it("keeps distinct generations for same-turn requests whose display summaries collide", async () => {
+		const agentDir = tempRoot("pi-langfuse-responses-collision-agent-");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "collision-public",
+			"secret-key": "collision-secret",
+			"base-url": "http://collision-host",
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+
+		const context = {
+			model: { id: "grok-4.7", provider: "xai" },
+			sessionManager: {
+				getSessionFile: () =>
+					"/tmp/pi-agent/sessions/--collision--/collision-session.jsonl",
+				getSessionId: () => "collision-session",
+			},
+		};
+		const handler = (name: string) => eventHandler(pi, name);
+
+		await handler("session_start")({ reason: "startup" }, context);
+		await handler("model_select")(
+			{ model: { id: "grok-4.7", provider: "xai" } },
+			context,
+		);
+		await handler("before_agent_start")(
+			{
+				prompt: "collision prompt",
+				systemPrompt: "collision system",
+				systemPromptOptions: { cwd: "/tmp/collision" },
+			},
+			context,
+		);
+		await handler("agent_start")({}, context);
+		await handler("turn_start")({ turnIndex: 0 }, context);
+
+		// Both requests share their last 40 input items, so the bounded display
+		// summary is identical; only the earliest item differs. Request identity
+		// must come from the complete payload, not the display summary.
+		const buildPayload = (firstMarker: string) => ({
+			model: "grok-4.7",
+			input: Array.from({ length: 45 }, (_, index) =>
+				index === 0
+					? {
+							role: "user",
+							content: [{ type: "input_text", text: `INPUT-${firstMarker}` }],
+						}
+					: {
+							role: "user",
+							content: [
+								{
+									type: "input_text",
+									text: `INPUT-shared-${index}`,
+								},
+							],
+						},
+			),
+		});
+		await handler("before_provider_request")(
+			{ payload: buildPayload("first") },
+			context,
+		);
+		await handler("before_provider_request")(
+			{ payload: buildPayload("second") },
+			context,
+		);
+		await handler("message_start")({ message: { role: "assistant" } }, context);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					usage: { input: 2, output: 1, totalTokens: 3 },
+				},
+			},
+			context,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			context,
+		);
+		await handler("agent_end")({ messages: [] }, context);
+
+		// The identical display summaries must not merge the two requests into
+		// one generation keyed to the first request.
+		const generations = telemetry.state.observations.filter(
+			(record) => record.name === "llm-response",
+		);
+		expect(generations).toHaveLength(1);
+		const collisionGeneration = generations[0];
+		if (!collisionGeneration) {
+			throw new Error("newest request generation missing");
+		}
+		expect(
+			(collisionGeneration.metadata as { requestKey?: string }).requestKey,
+		).toBe("turn:0:request:1");
+		await handler("session_shutdown")({}, context);
+	});
+
+	it("pins generations to explicit request ids and reuses them across retries", async () => {
+		const agentDir = tempRoot("pi-langfuse-explicit-key-agent-");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "explicit-public",
+			"secret-key": "explicit-secret",
+			"base-url": "http://explicit-host",
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+
+		const context = {
+			model: { id: "explicit-model", provider: "explicit-provider" },
+			sessionManager: {
+				getSessionFile: () =>
+					"/tmp/pi-agent/sessions/--explicit--/explicit-session.jsonl",
+				getSessionId: () => "explicit-session",
+			},
+		};
+		const handler = (name: string) => eventHandler(pi, name);
+
+		await handler("session_start")({ reason: "startup" }, context);
+		await handler("model_select")(
+			{ model: { id: "explicit-model", provider: "explicit-provider" } },
+			context,
+		);
+		await handler("before_agent_start")(
+			{
+				prompt: "explicit prompt",
+				systemPrompt: "explicit system",
+				systemPromptOptions: { cwd: "/tmp/explicit" },
+			},
+			context,
+		);
+		await handler("agent_start")({}, context);
+		await handler("turn_start")({ turnIndex: 0 }, context);
+
+		const buildPayload = (marker: string) => ({
+			model: "explicit-model",
+			messages: [{ role: "user", content: `REQ-${marker}` }],
+		});
+
+		// An event carrying an explicit request id pins its generation to that
+		// id: a retry reuses the same generation, a different id opens another.
+		await handler("before_provider_request")(
+			{ requestId: "provider-req-1", payload: buildPayload("first") },
+			context,
+		);
+		await handler("after_provider_response")(
+			{ requestId: "provider-req-1", status: 429, headers: {} },
+			context,
+		);
+		await handler("before_provider_request")(
+			{ requestId: "provider-req-1", payload: buildPayload("first") },
+			context,
+		);
+		await handler("before_provider_request")(
+			{ requestId: "provider-req-2", payload: buildPayload("second") },
+			context,
+		);
+
+		await handler("message_start")({ message: { role: "assistant" } }, context);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					usage: { input: 2, output: 1, totalTokens: 3 },
+				},
+			},
+			context,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			context,
+		);
+		await handler("agent_end")({ messages: [] }, context);
+
+		const generations = telemetry.state.observations.filter(
+			(record) => record.name === "llm-response",
+		);
+		expect(generations).toHaveLength(2);
+		expect(
+			generations.map(
+				(generation) =>
+					(generation.metadata as { requestKey?: string }).requestKey,
+			),
+		).toEqual(["provider-req-1", "provider-req-2"]);
+		await handler("session_shutdown")({}, context);
+	});
+
+	it("opens a generation from message events when no provider request was seen", async () => {
+		const agentDir = tempRoot("pi-langfuse-message-only-agent-");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "message-only-public",
+			"secret-key": "message-only-secret",
+			"base-url": "http://message-only-host",
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+
+		const context = {
+			model: { id: "message-only-model", provider: "message-only-provider" },
+			sessionManager: {
+				getSessionFile: () =>
+					"/tmp/pi-agent/sessions/--message-only--/message-only-session.jsonl",
+				getSessionId: () => "message-only-session",
+			},
+		};
+		const handler = (name: string) => eventHandler(pi, name);
+
+		await handler("session_start")({ reason: "startup" }, context);
+		await handler("model_select")(
+			{
+				model: {
+					id: "message-only-model",
+					provider: "message-only-provider",
+				},
+			},
+			context,
+		);
+		await handler("before_agent_start")(
+			{
+				prompt: "message-only prompt",
+				systemPrompt: "message-only system",
+				systemPromptOptions: { cwd: "/tmp/message-only" },
+			},
+			context,
+		);
+		await handler("agent_start")({}, context);
+		await handler("turn_start")({ turnIndex: 0 }, context);
+
+		// Providers that emit no before_provider_request still get one
+		// generation carrying the streamed assistant message.
+		await handler("message_start")({ message: { role: "assistant" } }, context);
+		await handler("message_update")(
+			{
+				message: { role: "assistant" },
+				assistantMessageEvent: { type: "text_delta", delta: "streamed" },
+			},
+			context,
+		);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "streamed" }],
+					usage: { input: 1, output: 1, totalTokens: 2 },
+				},
+			},
+			context,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			context,
+		);
+		await handler("agent_end")({ messages: [] }, context);
+
+		const generations = telemetry.state.observations.filter(
+			(record) => record.name === "llm-response",
+		);
+		expect(generations).toHaveLength(1);
+		const generation = generations[0];
+		if (!generation) throw new Error("message-only generation missing");
+		expect((generation.metadata as { requestKey?: string }).requestKey).toBe(
+			"turn:0:request:0",
+		);
+		expect(generation.end).toMatchObject({
+			output: "streamed",
+			usage: { input: 1, output: 1, total: 2 },
+		});
+		await handler("session_shutdown")({}, context);
+	});
+
+	it("does not open a second generation when a late message event follows a completed one", async () => {
+		const agentDir = tempRoot("pi-langfuse-late-message-agent-");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "late-public",
+			"secret-key": "late-secret",
+			"base-url": "http://late-host",
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+
+		const context = {
+			model: { id: "late-model", provider: "late-provider" },
+			sessionManager: {
+				getSessionFile: () =>
+					"/tmp/pi-agent/sessions/--late--/late-session.jsonl",
+				getSessionId: () => "late-session",
+			},
+		};
+		const handler = (name: string) => eventHandler(pi, name);
+
+		await handler("session_start")({ reason: "startup" }, context);
+		await handler("model_select")(
+			{ model: { id: "late-model", provider: "late-provider" } },
+			context,
+		);
+		await handler("before_agent_start")(
+			{
+				prompt: "late prompt",
+				systemPrompt: "late system",
+				systemPromptOptions: { cwd: "/tmp/late" },
+			},
+			context,
+		);
+		await handler("agent_start")({}, context);
+		await handler("turn_start")({ turnIndex: 0 }, context);
+
+		await handler("message_start")({ message: { role: "assistant" } }, context);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					usage: { input: 1, output: 1, totalTokens: 2 },
+				},
+			},
+			context,
+		);
+		// A duplicate/late message_end must attach to the completed generation
+		// instead of opening a phantom one that turn cleanup would abandon.
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					usage: { input: 1, output: 1, totalTokens: 2 },
+				},
+			},
+			context,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			context,
+		);
+		await handler("agent_end")({ messages: [] }, context);
+
+		const generations = telemetry.state.observations.filter(
+			(record) => record.name === "llm-response",
+		);
+		expect(generations).toHaveLength(1);
+		expect(generations[0]?.end).toMatchObject({ output: "done" });
+		await handler("session_shutdown")({}, context);
+	});
+
+	// When payload capture is enabled, the turn span metadata must carry the
+	// bounded payload summary alongside the booked request; with capture off
+	// the request is still booked but no payload text may reach the span.
+	async function driveTurnSpanMetadataCapture(captureEnabled: boolean) {
+		if (captureEnabled) {
+			process.env.PI_LANGFUSE_CAPTURE_PROVIDER_PAYLOAD = "1";
+		}
+		const agentDir = tempRoot(
+			captureEnabled
+				? "pi-langfuse-span-capture-agent-"
+				: "pi-langfuse-span-nocapture-agent-",
+		);
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "span-public",
+			"secret-key": "span-secret",
+			"base-url": "http://span-host",
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+
+		const context = {
+			model: { id: "span-model", provider: "span-provider" },
+			sessionManager: {
+				getSessionFile: () =>
+					"/tmp/pi-agent/sessions/--span--/span-session.jsonl",
+				getSessionId: () => "span-session",
+			},
+		};
+		const handler = (name: string) => eventHandler(pi, name);
+
+		await handler("session_start")({ reason: "startup" }, context);
+		await handler("model_select")(
+			{ model: { id: "span-model", provider: "span-provider" } },
+			context,
+		);
+		await handler("before_agent_start")(
+			{
+				prompt: "span prompt",
+				systemPrompt: "span system",
+				systemPromptOptions: { cwd: "/tmp/span" },
+			},
+			context,
+		);
+		await handler("agent_start")({}, context);
+		await handler("turn_start")({ turnIndex: 0 }, context);
+		await handler("before_provider_request")(
+			{
+				payload: {
+					model: "span-model",
+					messages: [{ role: "user", content: "CAPTURE-payload marker" }],
+				},
+			},
+			context,
+		);
+
+		const turnRecord = telemetry.state.observations.find(
+			(record) => record.name === "agent.turn",
+		);
+		if (!turnRecord) throw new Error("turn span missing");
+		const updateCalls =
+			(turnRecord.updateCalls as Array<Record<string, unknown>> | undefined) ??
+			[];
+		const requestUpdate = updateCalls.find((update) => {
+			const metadata = update.metadata as
+				| { requests?: unknown; providerPayload?: unknown }
+				| undefined;
+			return Array.isArray(metadata?.requests);
+		});
+		if (!requestUpdate) throw new Error("turn request booking missing");
+		const metadata = requestUpdate.metadata as {
+			requests: Array<{ model?: string; payloadSize?: number }>;
+			providerPayload?: unknown;
+		};
+
+		await handler("message_start")({ message: { role: "assistant" } }, context);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					usage: { input: 1, output: 1, totalTokens: 2 },
+				},
+			},
+			context,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			context,
+		);
+		await handler("agent_end")({ messages: [] }, context);
+		await handler("session_shutdown")({}, context);
+		return metadata;
+	}
+
+	it("carries providerPayload on the turn span when payload capture is enabled", async () => {
+		const metadata = await driveTurnSpanMetadataCapture(true);
+
+		expect(metadata.requests).toHaveLength(1);
+		expect(metadata.requests[0]).toMatchObject({
+			model: "span-model",
+		});
+		expect(metadata.requests[0]?.payloadSize).toBeGreaterThan(0);
+		expect(typeof metadata.providerPayload).toBe("string");
+		expect(String(metadata.providerPayload)).toContain(
+			"CAPTURE-payload marker",
+		);
+	});
+
+	it("keeps providerPayload off the turn span when payload capture is disabled", async () => {
+		const metadata = await driveTurnSpanMetadataCapture(false);
+
+		expect(metadata.requests).toHaveLength(1);
+		expect(metadata.requests[0]?.model).toBe("span-model");
+		expect(metadata.providerPayload).toBeUndefined();
+	});
+
+	it("attaches late message and response events to the completed generation without opening a phantom", async () => {
+		const agentDir = tempRoot("pi-langfuse-late-events-agent-");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "late-events-public",
+			"secret-key": "late-events-secret",
+			"base-url": "http://late-events-host",
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+
+		const context = {
+			model: { id: "late-events-model", provider: "late-events-provider" },
+			sessionManager: {
+				getSessionFile: () =>
+					"/tmp/pi-agent/sessions/--late-events--/late-events-session.jsonl",
+				getSessionId: () => "late-events-session",
+			},
+		};
+		const handler = (name: string) => eventHandler(pi, name);
+
+		await handler("session_start")({ reason: "startup" }, context);
+		await handler("model_select")(
+			{
+				model: {
+					id: "late-events-model",
+					provider: "late-events-provider",
+				},
+			},
+			context,
+		);
+		await handler("before_agent_start")(
+			{
+				prompt: "late events prompt",
+				systemPrompt: "late events system",
+				systemPromptOptions: { cwd: "/tmp/late-events" },
+			},
+			context,
+		);
+		await handler("agent_start")({}, context);
+		await handler("turn_start")({ turnIndex: 0 }, context);
+		await handler("before_provider_request")(
+			{
+				payload: {
+					model: "late-events-model",
+					messages: [{ role: "user", content: "REQ-late events" }],
+				},
+			},
+			context,
+		);
+		await handler("message_start")({ message: { role: "assistant" } }, context);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					usage: { input: 1, output: 1, totalTokens: 2 },
+				},
+			},
+			context,
+		);
+		// Out-of-order host deliveries after completion must reuse the ended
+		// generation lookup result and hit the ended guards, not open a new one.
+		await handler("message_update")(
+			{
+				message: { role: "assistant" },
+				assistantMessageEvent: { type: "text_delta", delta: "late delta" },
+			},
+			context,
+		);
+		await handler("after_provider_response")(
+			{ status: 200, headers: {} },
+			context,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			context,
+		);
+		await handler("agent_end")({ messages: [] }, context);
+
+		const generations = telemetry.state.observations.filter(
+			(record) => record.name === "llm-response",
+		);
+		expect(generations).toHaveLength(1);
+		expect(generations[0]?.end).toMatchObject({ output: "done" });
+		await handler("session_shutdown")({}, context);
+	});
+
+	it("treats non-object payloads as unrecognized requests without model parameters", async () => {
+		const agentDir = tempRoot("pi-langfuse-non-object-agent-");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "non-object-public",
+			"secret-key": "non-object-secret",
+			"base-url": "http://non-object-host",
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+
+		const context = {
+			model: {
+				id: "non-object-model",
+				provider: "non-object-provider",
+			},
+			sessionManager: {
+				getSessionFile: () =>
+					"/tmp/pi-agent/sessions/--non-object--/non-object-session.jsonl",
+				getSessionId: () => "non-object-session",
+			},
+		};
+		const handler = (name: string) => eventHandler(pi, name);
+
+		await handler("session_start")({ reason: "startup" }, context);
+		await handler("model_select")(
+			{
+				model: {
+					id: "non-object-model",
+					provider: "non-object-provider",
+				},
+			},
+			context,
+		);
+		await handler("before_agent_start")(
+			{
+				prompt: "non-object prompt",
+				systemPrompt: "non-object system",
+				systemPromptOptions: { cwd: "/tmp/non-object" },
+			},
+			context,
+		);
+		await handler("agent_start")({}, context);
+		await handler("turn_start")({ turnIndex: 0 }, context);
+		// A provider request whose payload is not an object must still be
+		// tracked under the session model without model parameters.
+		await handler("before_provider_request")(
+			{ payload: "INPUT-non-object payload" as unknown },
+			context,
+		);
+		await handler("message_start")({ message: { role: "assistant" } }, context);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					usage: { input: 1, output: 1, totalTokens: 2 },
+				},
+			},
+			context,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			context,
+		);
+		await handler("agent_end")({ messages: [] }, context);
+
+		const generations = telemetry.state.observations.filter(
+			(record) => record.name === "llm-response",
+		);
+		expect(generations).toHaveLength(1);
+		expect(generations[0]?.end).toMatchObject({
+			output: "done",
+			model: "non-object-model",
+		});
+		const generationEnd = generations[0]?.end as
+			| Record<string, unknown>
+			| undefined;
+		expect(generationEnd?.modelParameters).toBeUndefined();
+		await handler("session_shutdown")({}, context);
+	});
+
+	it("does not coalesce same-turn requests with unserializable payloads", async () => {
+		const agentDir = tempRoot("pi-langfuse-unserializable-agent-");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "unserializable-public",
+			"secret-key": "unserializable-secret",
+			"base-url": "http://unserializable-host",
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+
+		const context = {
+			model: {
+				id: "unserializable-model",
+				provider: "unserializable-provider",
+			},
+			sessionManager: {
+				getSessionFile: () =>
+					"/tmp/pi-agent/sessions/--unserializable--/unserializable-session.jsonl",
+				getSessionId: () => "unserializable-session",
+			},
+		};
+		const handler = (name: string) => eventHandler(pi, name);
+
+		await handler("session_start")({ reason: "startup" }, context);
+		await handler("model_select")(
+			{
+				model: {
+					id: "unserializable-model",
+					provider: "unserializable-provider",
+				},
+			},
+			context,
+		);
+		await handler("before_agent_start")(
+			{
+				prompt: "unserializable prompt",
+				systemPrompt: "unserializable system",
+				systemPromptOptions: { cwd: "/tmp/unserializable" },
+			},
+			context,
+		);
+		await handler("agent_start")({}, context);
+		await handler("turn_start")({ turnIndex: 0 }, context);
+
+		// Identity is unavailable for unserializable payloads; each request
+		// must open its own generation instead of coalescing into the first.
+		const cyclicPayload = (marker: string) => {
+			const payload: Record<string, unknown> = { marker };
+			payload.self = payload;
+			return payload;
+		};
+		await handler("before_provider_request")(
+			{ payload: cyclicPayload("first") },
+			context,
+		);
+		// A failed response materializes the first generation.
+		await handler("after_provider_response")(
+			{ status: 429, headers: {} },
+			context,
+		);
+		await handler("before_provider_request")(
+			{ payload: cyclicPayload("second") },
+			context,
+		);
+		await handler("message_start")({ message: { role: "assistant" } }, context);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					usage: { input: 2, output: 1, totalTokens: 3 },
+				},
+			},
+			context,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			context,
+		);
+		await handler("agent_end")({ messages: [] }, context);
+
+		const requestKeys = telemetry.state.observations
+			.filter((record) => record.name === "llm-response")
+			.map(
+				(generation) =>
+					(generation.metadata as { requestKey?: string }).requestKey,
+			)
+			.sort();
+		expect(requestKeys).toEqual(["turn:0:request:0", "turn:0:request:1"]);
+		await handler("session_shutdown")({}, context);
+	});
+
+	it("flows late message events to the newest active request after a newer request completed", async () => {
+		const agentDir = tempRoot("pi-langfuse-newest-active-agent-");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "newest-active-public",
+			"secret-key": "newest-active-secret",
+			"base-url": "http://newest-active-host",
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+
+		const context = {
+			model: {
+				id: "newest-active-model",
+				provider: "newest-active-provider",
+			},
+			sessionManager: {
+				getSessionFile: () =>
+					"/tmp/pi-agent/sessions/--newest-active--/newest-active-session.jsonl",
+				getSessionId: () => "newest-active-session",
+			},
+		};
+		const handler = (name: string) => eventHandler(pi, name);
+
+		await handler("session_start")({ reason: "startup" }, context);
+		await handler("model_select")(
+			{
+				model: {
+					id: "newest-active-model",
+					provider: "newest-active-provider",
+				},
+			},
+			context,
+		);
+		await handler("before_agent_start")(
+			{
+				prompt: "newest active prompt",
+				systemPrompt: "newest active system",
+				systemPromptOptions: { cwd: "/tmp/newest-active" },
+			},
+			context,
+		);
+		await handler("agent_start")({}, context);
+		await handler("turn_start")({ turnIndex: 0 }, context);
+
+		// Two explicit-key requests; only the newest is completed. A late
+		// message event must flow to the older request that is still active,
+		// not to the completed one and not to a phantom generation.
+		await handler("before_provider_request")(
+			{
+				requestId: "req-1",
+				payload: {
+					model: "newest-active-model",
+					messages: [{ role: "user", content: "REQ-one" }],
+				},
+			},
+			context,
+		);
+		await handler("before_provider_request")(
+			{
+				requestId: "req-2",
+				payload: {
+					model: "newest-active-model",
+					messages: [{ role: "user", content: "REQ-two" }],
+				},
+			},
+			context,
+		);
+		await handler("message_end")(
+			{
+				requestId: "req-2",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "second done" }],
+					usage: { input: 1, output: 1, totalTokens: 2 },
+				},
+			},
+			context,
+		);
+		await handler("message_update")(
+			{
+				message: { role: "assistant" },
+				assistantMessageEvent: { type: "text_delta", delta: "late delta" },
+			},
+			context,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			context,
+		);
+		await handler("agent_end")({ messages: [] }, context);
+
+		const generations = telemetry.state.observations.filter(
+			(record) => record.name === "llm-response",
+		);
+		expect(generations).toHaveLength(2);
+		const byRequestKey = new Map(
+			generations.map((generation) => [
+				(generation.metadata as { requestKey?: string }).requestKey,
+				generation,
+			]),
+		);
+		// The late delta materialized the still-active request's generation.
+		const firstGeneration = byRequestKey.get("req-1");
+		if (!firstGeneration) throw new Error("active request generation missing");
+		const firstUpdates =
+			(firstGeneration.updateCalls as
+				| Array<Record<string, unknown>>
+				| undefined) ?? [];
+		expect(
+			firstUpdates.some(
+				(update) =>
+					(update.metadata as { timeToFirstTokenMs?: number })
+						?.timeToFirstTokenMs !== undefined,
+			),
+		).toBe(true);
+		expect(byRequestKey.get("req-2")?.end).toMatchObject({
+			output: "second done",
+		});
+		await handler("session_shutdown")({}, context);
+	});
+
+	// A same-id retry must reuse the existing generation state, not replace
+	// it: one observation that carries the earlier response metadata and ends
+	// normally with the streamed output.
+	it("reuses the pinned generation state across a same-id retry", async () => {
+		const agentDir = tempRoot("pi-langfuse-retry-reuse-agent-");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "retry-reuse-public",
+			"secret-key": "retry-reuse-secret",
+			"base-url": "http://retry-reuse-host",
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+
+		const context = {
+			model: {
+				id: "retry-reuse-model",
+				provider: "retry-reuse-provider",
+			},
+			sessionManager: {
+				getSessionFile: () =>
+					"/tmp/pi-agent/sessions/--retry-reuse--/retry-reuse-session.jsonl",
+				getSessionId: () => "retry-reuse-session",
+			},
+		};
+		const handler = (name: string) => eventHandler(pi, name);
+
+		await handler("session_start")({ reason: "startup" }, context);
+		await handler("model_select")(
+			{
+				model: {
+					id: "retry-reuse-model",
+					provider: "retry-reuse-provider",
+				},
+			},
+			context,
+		);
+		await handler("before_agent_start")(
+			{
+				prompt: "retry reuse prompt",
+				systemPrompt: "retry reuse system",
+				systemPromptOptions: { cwd: "/tmp/retry-reuse" },
+			},
+			context,
+		);
+		await handler("agent_start")({}, context);
+		await handler("turn_start")({ turnIndex: 0 }, context);
+		await handler("before_provider_request")(
+			{
+				requestId: "provider-req-1",
+				payload: {
+					model: "retry-reuse-model",
+					messages: [{ role: "user", content: "REQ-retry" }],
+				},
+			},
+			context,
+		);
+		await handler("after_provider_response")(
+			{ requestId: "provider-req-1", status: 429, headers: {} },
+			context,
+		);
+		await handler("before_provider_request")(
+			{
+				requestId: "provider-req-1",
+				payload: {
+					model: "retry-reuse-model",
+					messages: [{ role: "user", content: "REQ-retry" }],
+				},
+			},
+			context,
+		);
+		await handler("message_start")({ message: { role: "assistant" } }, context);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					usage: { input: 2, output: 1, totalTokens: 3 },
+				},
+			},
+			context,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			context,
+		);
+		await handler("agent_end")({ messages: [] }, context);
+
+		const generations = telemetry.state.observations.filter(
+			(record) => record.name === "llm-response",
+		);
+		expect(generations).toHaveLength(1);
+		const generation = generations[0];
+		if (!generation) throw new Error("pinned generation missing");
+		expect((generation.metadata as { requestKey?: string }).requestKey).toBe(
+			"provider-req-1",
+		);
+		// The retried request kept the original state: response metadata and a
+		// normal end survive the retry instead of a replacement state.
+		expect(generation.metadata).toMatchObject({
+			providerResponseStatuses: [429],
+		});
+		expect(generation.end).toMatchObject({ output: "done" });
+		await handler("session_shutdown")({}, context);
+	});
+
+	// Responses-style reasoning effort may arrive as a number; it must be
+	// reported under the flat reasoning_effort parameter either way.
+	it("reports numeric Responses reasoning effort as a model parameter", async () => {
+		const agentDir = tempRoot("pi-langfuse-numeric-effort-agent-");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "numeric-effort-public",
+			"secret-key": "numeric-effort-secret",
+			"base-url": "http://numeric-effort-host",
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+
+		const context = {
+			model: {
+				id: "numeric-effort-model",
+				provider: "numeric-effort-provider",
+			},
+			sessionManager: {
+				getSessionFile: () =>
+					"/tmp/pi-agent/sessions/--numeric-effort--/numeric-effort-session.jsonl",
+				getSessionId: () => "numeric-effort-session",
+			},
+		};
+		const handler = (name: string) => eventHandler(pi, name);
+
+		await handler("session_start")({ reason: "startup" }, context);
+		await handler("model_select")(
+			{
+				model: {
+					id: "numeric-effort-model",
+					provider: "numeric-effort-provider",
+				},
+			},
+			context,
+		);
+		await handler("before_agent_start")(
+			{
+				prompt: "numeric effort prompt",
+				systemPrompt: "numeric effort system",
+				systemPromptOptions: { cwd: "/tmp/numeric-effort" },
+			},
+			context,
+		);
+		await handler("agent_start")({}, context);
+		await handler("turn_start")({ turnIndex: 0 }, context);
+		await handler("before_provider_request")(
+			{
+				payload: {
+					model: "numeric-effort-model",
+					messages: [{ role: "user", content: "REQ-effort" }],
+					reasoning: { effort: 2 },
+				},
+			},
+			context,
+		);
+		await handler("message_start")({ message: { role: "assistant" } }, context);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					usage: { input: 1, output: 1, totalTokens: 2 },
+				},
+			},
+			context,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			context,
+		);
+		await handler("agent_end")({ messages: [] }, context);
+
+		const generations = telemetry.state.observations.filter(
+			(record) => record.name === "llm-response",
+		);
+		expect(generations).toHaveLength(1);
+		expect(generations[0]?.end).toMatchObject({
+			modelParameters: { reasoning_effort: 2 },
+		});
 		await handler("session_shutdown")({}, context);
 	});
 

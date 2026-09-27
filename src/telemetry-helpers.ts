@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { basename } from "node:path";
 import type { Config } from "./config.js";
 import type { PiUsage, PromptState } from "./lifecycle-types.js";
@@ -123,20 +124,346 @@ export function summarizeProviderPayload(
 ) {
 	if (!payload || typeof payload !== "object") return { type: typeof payload };
 	const data = payload as Record<string, unknown>;
-	const messages = Array.isArray(data.messages)
-		? summarizeMessages(
-				config,
-				data.messages as Array<{ role?: string; content?: unknown }>,
-			)
-		: undefined;
+	const contents = providerRequestContents(data);
 	return {
 		model: typeof data.model === "string" ? data.model : fallbackModel,
-		messageCount: Array.isArray(data.messages)
-			? data.messages.length
-			: undefined,
-		messages,
+		// Only input-shaped payloads carry a source marker; Chat Completions
+		// summaries keep the legacy shape (no source key) unchanged.
+		source: contents && contents.field !== "messages" ? "input" : undefined,
+		messageCount: requestItemCount(contents),
+		messages: summarizeProviderRequestForDisplay(config, contents),
 		keys: Object.keys(data).slice(0, 50),
 	};
+}
+
+/** Wire item count of recognized contents: items length, one for text. */
+function requestItemCount(contents: ProviderRequestContents | undefined) {
+	if (!contents) return undefined;
+	return "items" in contents ? contents.items.length : 1;
+}
+
+/** Bounded display summary of recognized request contents. */
+function summarizeProviderRequestForDisplay(
+	config: Config,
+	contents: ProviderRequestContents | undefined,
+) {
+	if (!contents) return undefined;
+	if (contents.field === "messages") {
+		return summarizeMessages(
+			config,
+			contents.items as Array<{ role?: string; content?: unknown }>,
+		);
+	}
+	return summarizeProviderRequestInput(
+		config,
+		contents.field === "input-items" ? contents.items : contents.text,
+	);
+}
+
+/**
+ * Complete in-memory request identity over the full unredacted payload.
+ *
+ * Distinct requests produce distinct identities even when their bounded
+ * display summaries collide (windowed items, omitted tool arguments, or
+ * parameter values). The value exists only for same-turn retry coalescing:
+ * it is compared in memory and must never be written to any sink. Unserializable
+ * payloads (cycles, BigInt) return undefined, which disables coalescing for
+ * that request rather than mis-merging it.
+ */
+export function providerRequestIdentity(payload: unknown): string | undefined {
+	try {
+		return createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Recognizable request contents inside a provider payload. Responses-style
+ * payloads carry `input` (an item array or a plain string) where Chat
+ * Completions payloads carry `messages`.
+ */
+export type ProviderRequestContents =
+	| { field: "messages"; items: unknown[] }
+	| { field: "input-items"; items: unknown[] }
+	| { field: "input-text"; text: string };
+
+/** Provenance of the contents recorded on a provider_request trace. */
+export type ProviderRequestSource =
+	| "payload.messages"
+	| "payload.input"
+	| "context";
+
+export interface CapturedProviderRequest {
+	/** Recognized contents, or undefined when the payload carried none. */
+	contents: ProviderRequestContents | undefined;
+	/** The captured contents themselves (item array or plain string). */
+	captured: unknown;
+	/** Wire item count derived only from captured contents, never context. */
+	messageCount: number | undefined;
+	/** Wire byte estimate derived only from captured contents, never context. */
+	estimatedBytes: number | undefined;
+}
+
+/**
+ * Capture the request contents of a provider payload plus the wire metrics
+ * derived from them. Unrecognized payloads capture nothing: metrics stay
+ * undefined so a record can never claim wire contents it never observed.
+ */
+export function captureProviderRequest(
+	payload: Record<string, unknown> | undefined,
+): CapturedProviderRequest {
+	const contents = providerRequestContents(payload);
+	const captured = contents
+		? "items" in contents
+			? contents.items
+			: contents.text
+		: undefined;
+	return {
+		contents,
+		captured,
+		messageCount: Array.isArray(captured)
+			? captured.length
+			: captured !== undefined
+				? 1
+				: undefined,
+		estimatedBytes: estimateJsonBytes(captured),
+	};
+}
+
+/**
+ * Where the recorded request contents came from: the captured payload field,
+ * the prompt context as a diagnostic fallback, or nothing at all.
+ */
+export function providerRequestProvenance(
+	capture: CapturedProviderRequest,
+	lastContextMessages: unknown,
+): {
+	fallbackMessages: unknown;
+	requestSource: ProviderRequestSource | undefined;
+} {
+	const fallbackMessages = capture.contents ? undefined : lastContextMessages;
+	return {
+		fallbackMessages,
+		requestSource: capture.contents
+			? capture.contents.field === "messages"
+				? "payload.messages"
+				: "payload.input"
+			: fallbackMessages
+				? ("context" as const)
+				: undefined,
+	};
+}
+
+export interface ProviderRequestTraceInput {
+	/** Whether to embed captured contents ("full") or the display summary. */
+	captureMode: "full" | "summary";
+	/** Index of the turn that issued the request. */
+	turnIndex: number;
+	/** Model requested by the payload, or the session fallback model. */
+	model: string | undefined;
+	/** Provenance label for the recorded contents. */
+	requestSource: ProviderRequestSource | undefined;
+	/** Captured payload contents and their wire metrics. */
+	capture: CapturedProviderRequest;
+	/** Whether the configured capture policy stores full payloads. */
+	payloadCaptured: boolean;
+	/** Bounded serialized payload summary, when payload capture is enabled. */
+	payloadSummary: string | undefined;
+	/** Bounded display summary of the request contents (summary mode). */
+	messagesSummary: unknown;
+}
+
+/**
+ * Build the provider_request raw trace record for one capture mode. Full mode
+ * embeds the captured contents; summary mode embeds the bounded display
+ * summary and marks full contents as omitted only when contents were captured.
+ */
+export function providerRequestTraceRecord(
+	input: ProviderRequestTraceInput,
+): { type: string } & Record<string, unknown> {
+	const base = {
+		type: "provider_request",
+		turnIndex: input.turnIndex,
+		model: input.model,
+		requestSource: input.requestSource,
+		messageCount: input.capture.messageCount,
+		estimatedBytes: input.capture.estimatedBytes,
+		payloadCaptured: input.payloadCaptured,
+		payloadSummary: input.payloadSummary,
+	};
+	if (input.captureMode === "full") {
+		return { ...base, captureMode: "full", messages: input.capture.captured };
+	}
+	return {
+		...base,
+		captureMode: "summary",
+		messagesSummary: input.messagesSummary,
+		fullMessagesOmitted:
+			input.capture.captured !== undefined ? true : undefined,
+	};
+}
+
+export function providerRequestContents(
+	payload: Record<string, unknown> | undefined,
+): ProviderRequestContents | undefined {
+	if (!payload) return undefined;
+	if (Array.isArray(payload.messages))
+		return { field: "messages", items: payload.messages };
+	if (typeof payload.input === "string")
+		return { field: "input-text", text: payload.input };
+	if (Array.isArray(payload.input))
+		return { field: "input-items", items: payload.input };
+	return undefined;
+}
+
+/** Responses input item types that carry tool-call request data. */
+export const RESPONSES_TOOL_CALL_ITEM_TYPES = new Set([
+	"function_call",
+	"custom_tool_call",
+]);
+
+/** Responses input item types that carry tool output data. */
+export const RESPONSES_TOOL_OUTPUT_ITEM_TYPES = new Set([
+	"function_call_output",
+	"custom_tool_call_output",
+]);
+
+/** True for JSON objects other than arrays. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+const RESPONSES_TEXT_PART_TYPES = new Set([
+	"text",
+	"input_text",
+	"output_text",
+]);
+
+/**
+ * Responses content parts name their text variants input_text/output_text;
+ * normalize them so shared message summarization can extract the text.
+ */
+function normalizeResponsesTextParts(content: unknown): unknown {
+	if (!Array.isArray(content)) return content;
+	return content.map((part) =>
+		isNamedTextPart(part) ? { type: "text", text: part.text } : part,
+	);
+}
+
+/** A content part carrying plain text under a Responses text-part type. */
+function isNamedTextPart(
+	part: unknown,
+): part is { type: string; text: string } {
+	if (!isRecord(part)) return false;
+	return (
+		typeof part.type === "string" &&
+		RESPONSES_TEXT_PART_TYPES.has(part.type) &&
+		typeof part.text === "string"
+	);
+}
+
+function summarizeResponseInputItem(
+	config: Config,
+	item: unknown,
+): { role: string; content: string } {
+	if (typeof item === "string") {
+		return { role: "user", content: summarizeMessageContent(config, item) };
+	}
+	if (!isRecord(item)) {
+		return { role: "unknown", content: summarizeMessageContent(config, item) };
+	}
+	if (typeof item.role === "string") {
+		return {
+			role: item.role,
+			content: summarizeMessageContent(
+				config,
+				normalizeResponsesTextParts(item.content),
+			),
+		};
+	}
+	return summarizeUnroledResponseItem(config, item);
+}
+
+/**
+ * Unroled Responses items are typed structs: summarize their shape and
+ * correlation ids, never their contents.
+ */
+function summarizeUnroledResponseItem(
+	config: Config,
+	data: Record<string, unknown>,
+): { role: string; content: string } {
+	const itemType = typeof data.type === "string" ? data.type : "unknown";
+	if (RESPONSES_TOOL_CALL_ITEM_TYPES.has(itemType)) {
+		return toolCallItemSummary(config, itemType, data);
+	}
+	if (RESPONSES_TOOL_OUTPUT_ITEM_TYPES.has(itemType)) {
+		return toolOutputItemSummary(config, itemType, data);
+	}
+	if (itemType === "reasoning") {
+		// Reasoning summaries and encrypted content are never expanded here.
+		return { role: "assistant", content: "[reasoning item]" };
+	}
+	return { role: itemType, content: `[${itemType} item]` };
+}
+
+/** Tool inputs are tool-call data: record the call shape, never the arguments. */
+function toolCallItemSummary(
+	config: Config,
+	itemType: string,
+	data: Record<string, unknown>,
+): { role: string; content: string } {
+	const name = typeof data.name === "string" ? data.name : "unknown";
+	return {
+		role: "assistant",
+		content: telemetryText(
+			config,
+			`[${itemType}: ${name}]`,
+			config.traceInputMaxChars,
+		),
+	};
+}
+
+/** Tool outputs stay structural; full text belongs to tool records. */
+function toolOutputItemSummary(
+	config: Config,
+	itemType: string,
+	data: Record<string, unknown>,
+): { role: string; content: string } {
+	const callId = typeof data.call_id === "string" ? data.call_id : "unknown";
+	return {
+		role: "tool",
+		content: telemetryText(
+			config,
+			`[${itemType}: ${callId}]`,
+			config.traceInputMaxChars,
+		),
+	};
+}
+
+/**
+ * Summarize a Responses-style request input (item array or plain string) with
+ * the same per-item bounds and redaction chat messages receive.
+ */
+export function summarizeProviderRequestInput(config: Config, input: unknown) {
+	const items =
+		typeof input === "string"
+			? [input]
+			: Array.isArray(input)
+				? input
+				: undefined;
+	if (!items) return undefined;
+	const limit = 40;
+	const selected = items
+		.slice(-limit)
+		.map((item) => summarizeResponseInputItem(config, item));
+	if (items.length > limit) {
+		selected.unshift({
+			role: "system",
+			content: `[truncated ${items.length - limit} earlier item(s)]`,
+		});
+	}
+	return selected;
 }
 
 export function estimateJsonBytes(value: unknown) {

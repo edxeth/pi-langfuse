@@ -273,4 +273,257 @@ describe("payload policy", () => {
 		);
 		expect(exported.message).toContain("[REDACTED:langfuse-secret-key:");
 	});
+
+	// Full-mode raw records carry unroled Responses input items (the shapes
+	// pi builds for the Responses API). Tool fields must follow tool capture
+	// policy and reasoning contents must never be captured.
+	const responsesFullMessages = () => [
+		{
+			role: "user",
+			content: [{ type: "input_text", text: "INPUT-user text" }],
+		},
+		{
+			type: "message",
+			role: "assistant",
+			content: [{ type: "output_text", text: "INPUT-assistant text" }],
+		},
+		{
+			type: "function_call",
+			id: "fc_1",
+			call_id: "call_1",
+			name: "bash",
+			arguments: '{"command":"LEAK-tool-arguments"}',
+		},
+		{
+			type: "custom_tool_call",
+			id: "ctc_1",
+			call_id: "call_2",
+			name: "edit",
+			input: "LEAK-custom-tool-input",
+		},
+		{
+			type: "function_call_output",
+			call_id: "call_1",
+			output: "LEAK-tool-output",
+		},
+		{
+			type: "custom_tool_call_output",
+			call_id: "call_2",
+			output: "LEAK-custom-tool-output",
+		},
+		{
+			type: "reasoning",
+			id: "rs_1",
+			summary: [{ type: "summary_text", text: "LEAK-reasoning-summary" }],
+			content: [{ type: "reasoning_text", text: "LEAK-reasoning-content" }],
+			encrypted_content: "LEAK-encrypted-content",
+		},
+	];
+
+	it("honors tool capture opt-outs on unroled Responses items in full raw records", () => {
+		const shaped = shapeRawTraceRecord(
+			{
+				...baseConfig,
+				capturePolicy: "conversations",
+				captureToolInput: false,
+				captureToolOutput: false,
+			},
+			{
+				type: "provider_request",
+				captureMode: "full",
+				messages: responsesFullMessages(),
+			},
+		);
+		const json = JSON.stringify(shaped);
+
+		expect(json).not.toContain("LEAK-tool-arguments");
+		expect(json).not.toContain("LEAK-custom-tool-input");
+		expect(json).not.toContain("LEAK-tool-output");
+		expect(json).not.toContain("LEAK-custom-tool-output");
+		// Conversation contents and item structure remain.
+		expect(json).toContain("INPUT-user text");
+		expect(json).toContain("INPUT-assistant text");
+		expect(json).toContain("bash");
+		expect(json).toContain("call_1");
+	});
+
+	// Unrecognized unroled item types are not tool data: their fields fall
+	// back to the role-based mapping (empty role), so only the arguments key
+	// keeps tool policy and everything else follows provider/metadata policy.
+	it("keeps role-based field classification for unrecognized unroled item types", () => {
+		const shaped = shapeRawTraceRecord(
+			{ ...baseConfig, capturePolicy: "conversations" },
+			{
+				type: "provider_request",
+				messages: [
+					{
+						type: "web_search_call",
+						id: "ws_1",
+						status: "completed",
+						arguments: "LEAK-search-args",
+						content: "KEEP-search-content",
+					},
+				],
+			},
+		);
+		const items = shaped.messages as Array<Record<string, unknown>>;
+
+		expect(Object.keys(items[0] ?? {})).toEqual([
+			"type",
+			"id",
+			"status",
+			"content",
+		]);
+		expect(items[0]).toMatchObject({
+			type: "web_search_call",
+			id: "ws_1",
+			status: "completed",
+			content: "KEEP-search-content",
+		});
+		expect(JSON.stringify(shaped)).not.toContain("LEAK-search-args");
+	});
+
+	// Role-bearing messages keep the role-based mapping even when a type
+	// field is present: a typed role message must not lose its content to
+	// item-type classification.
+	it("keeps the role-based mapping for role messages that carry a type", () => {
+		const shaped = shapeRawTraceRecord(
+			{ ...baseConfig, capturePolicy: "conversations" },
+			{
+				type: "provider_request",
+				messages: [
+					{
+						role: "user",
+						type: "reasoning",
+						content: "KEEP-typed-role-content",
+					},
+				],
+			},
+		);
+		const items = shaped.messages as Array<Record<string, unknown>>;
+
+		expect(items[0]).toMatchObject({
+			role: "user",
+			type: "reasoning",
+			content: "KEEP-typed-role-content",
+		});
+	});
+
+	// When the node budget runs out mid-list, whole later messages are
+	// omitted: two fully-shaped simple messages consume exactly four nodes
+	// (message + content string each), so the third hits the guard.
+	it("omits whole messages once the node budget is exhausted", () => {
+		const shaped = shapeRawTraceRecord(
+			{ ...baseConfig, payloadMaxNodes: 4 },
+			{
+				type: "provider_request",
+				messages: [
+					{ role: "user", content: "KEEP-first message" },
+					{ role: "user", content: "KEEP-second message" },
+					{ role: "user", content: "LEAK-third message" },
+				],
+			},
+		);
+		const items = shaped.messages as Array<Record<string, unknown>>;
+
+		expect(items).toHaveLength(2);
+		expect(JSON.stringify(items)).toContain("KEEP-first message");
+		expect(JSON.stringify(items)).toContain("KEEP-second message");
+		expect(JSON.stringify(shaped)).not.toContain("LEAK-third message");
+	});
+
+	// A message keeps at most maxObjectKeys content keys after its role;
+	// later keys (including content) are dropped at the first overflow.
+	it("drops message keys beyond the per-message object key budget", () => {
+		const shaped = shapeRawTraceRecord(
+			{
+				...baseConfig,
+				capturePolicy: "conversations",
+				payloadMaxObjectKeys: 2,
+			},
+			{
+				type: "provider_request",
+				messages: [
+					{
+						role: "user",
+						k1: "KEEP-one",
+						k2: "KEEP-two",
+						k3: "LEAK-three",
+						content: "LEAK-content",
+					},
+				],
+			},
+		);
+		const items = shaped.messages as Array<Record<string, unknown>>;
+
+		expect(Object.keys(items[0] ?? {})).toEqual(["role", "k1", "k2"]);
+		expect(items[0]).toMatchObject({
+			role: "user",
+			k1: "KEEP-one",
+			k2: "KEEP-two",
+		});
+		expect(JSON.stringify(shaped)).not.toContain("LEAK-three");
+		expect(JSON.stringify(shaped)).not.toContain("LEAK-content");
+	});
+
+	// The node-budget guard also fires inside a message: once earlier keys
+	// exhaust the budget, a provider-input content array must drop its nested
+	// messages entirely instead of partially shaping them.
+	it("drops nested provider-input messages once the node budget is exhausted", () => {
+		const shaped = shapeRawTraceRecord(
+			{ ...baseConfig, payloadMaxNodes: 2 },
+			{
+				type: "provider_request",
+				messages: [
+					{
+						type: "web_search_call",
+						marker: "KEEP-marker",
+						content: [{ role: "user", content: "LEAK-nested" }],
+					},
+				],
+			},
+		);
+		const items = shaped.messages as Array<Record<string, unknown>>;
+
+		expect(items).toHaveLength(1);
+		expect(items[0]?.content).toEqual([]);
+		expect(JSON.stringify(shaped)).not.toContain("LEAK-nested");
+	});
+
+	it("excludes reasoning contents from full raw records at every policy", () => {
+		for (const capturePolicy of ["conversations", "full-debug"] as const) {
+			const shaped = shapeRawTraceRecord(
+				{ ...baseConfig, capturePolicy },
+				{
+					type: "provider_request",
+					captureMode: "full",
+					messages: responsesFullMessages(),
+				},
+			);
+			const json = JSON.stringify(shaped);
+
+			expect(json).not.toContain("LEAK-reasoning-summary");
+			expect(json).not.toContain("LEAK-reasoning-content");
+			expect(json).not.toContain("LEAK-encrypted-content");
+			// The reasoning item's identity stays for correlation.
+			expect(json).toContain("rs_1");
+		}
+
+		// Full-debug keeps tool fields (policy opt-in) while still excluding
+		// reasoning contents.
+		const fullDebug = JSON.stringify(
+			shapeRawTraceRecord(
+				{ ...baseConfig, capturePolicy: "full-debug" },
+				{
+					type: "provider_request",
+					captureMode: "full",
+					messages: responsesFullMessages(),
+				},
+			),
+		);
+		expect(fullDebug).toContain("LEAK-tool-arguments");
+		expect(fullDebug).toContain("LEAK-custom-tool-input");
+		expect(fullDebug).toContain("LEAK-tool-output");
+		expect(fullDebug).not.toContain("LEAK-reasoning-summary");
+	});
 });

@@ -4,6 +4,10 @@ import {
 	type RedactionConfig,
 	sanitizeForTelemetry,
 } from "./redaction.js";
+import {
+	RESPONSES_TOOL_CALL_ITEM_TYPES,
+	RESPONSES_TOOL_OUTPUT_ITEM_TYPES,
+} from "./telemetry-helpers.js";
 
 export const DEFAULT_CAPTURE_POLICY = "full-debug" as const;
 
@@ -358,6 +362,42 @@ function messageField(role: string, key: string): CaptureField {
 	return "metadata";
 }
 
+/**
+ * Field classification for unroled Responses input items. Role-bearing
+ * messages keep the role-based mapping. Tool fields on these items follow
+ * tool capture policy, and reasoning contents are excluded from capture
+ * entirely — summaries and encrypted reasoning blobs are never persisted,
+ * regardless of policy or overrides.
+ */
+function responsesItemField(
+	itemType: string,
+	key: string,
+): CaptureField | "exclude" | undefined {
+	if (itemType === "reasoning") {
+		return reasoningItemField(key);
+	}
+	if (RESPONSES_TOOL_CALL_ITEM_TYPES.has(itemType)) {
+		return toolCallItemField(key);
+	}
+	if (RESPONSES_TOOL_OUTPUT_ITEM_TYPES.has(itemType)) {
+		return key === "output" ? "toolOutput" : undefined;
+	}
+	return undefined;
+}
+
+/** Tool-call request fields belong to tool-input capture. */
+function toolCallItemField(key: string): CaptureField | undefined {
+	return key === "arguments" || key === "input" ? "toolInput" : undefined;
+}
+
+/** Reasoning contents are never captured; id/type stay for correlation. */
+function reasoningItemField(key: string): CaptureField | "exclude" | undefined {
+	if (key === "summary" || key === "content" || key === "encrypted_content") {
+		return "exclude";
+	}
+	return undefined;
+}
+
 function shapeProviderMessage(
 	config: PayloadPolicyConfig,
 	message: Record<string, unknown>,
@@ -367,7 +407,28 @@ function shapeProviderMessage(
 ): Record<string, unknown> | undefined {
 	if (state.nodes >= limits.maxNodes) return undefined;
 	state.nodes += 1;
+	return shapeMessageEntries(config, message, options, limits, state);
+}
+
+/** Role-bearing chat messages carry role; unroled Responses items carry type. */
+function messageKind(message: Record<string, unknown>) {
 	const role = typeof message.role === "string" ? message.role : "";
+	return {
+		role,
+		itemType:
+			role === "" && typeof message.type === "string" ? message.type : "",
+	};
+}
+
+/** Shape a provider message into its capture record: role plus classified keys. */
+function shapeMessageEntries(
+	config: PayloadPolicyConfig,
+	message: Record<string, unknown>,
+	options: ShapeOptions,
+	limits: PayloadLimits,
+	state: ShapeState,
+) {
+	const { role, itemType } = messageKind(message);
 	const output: Record<string, unknown> = {};
 	let contentKeys = 0;
 	for (const [key, item] of Object.entries(message)) {
@@ -376,17 +437,40 @@ function shapeProviderMessage(
 			continue;
 		}
 		if (contentKeys >= limits.maxObjectKeys) break;
-		const field = messageField(role, key);
-		const shaped =
-			field === "providerInput"
-				? shapeProviderInputValue(config, item, options, limits, state)
-				: shapeValueForKey(config, key, field, item, options, limits, state);
-		if (shaped !== undefined) {
-			output[key] = shaped;
-			contentKeys += 1;
-		}
+		const shaped = shapeMessageEntry(
+			config,
+			role,
+			itemType,
+			key,
+			item,
+			options,
+			limits,
+			state,
+		);
+		if (shaped === undefined) continue;
+		output[key] = shaped;
+		contentKeys += 1;
 	}
 	return output;
+}
+
+/** Shape one non-role key of a provider message; undefined means dropped. */
+function shapeMessageEntry(
+	config: PayloadPolicyConfig,
+	role: string,
+	itemType: string,
+	key: string,
+	item: unknown,
+	options: ShapeOptions,
+	limits: PayloadLimits,
+	state: ShapeState,
+) {
+	const itemField = itemType ? responsesItemField(itemType, key) : undefined;
+	if (itemField === "exclude") return undefined;
+	const field = itemField ?? messageField(role, key);
+	return field === "providerInput"
+		? shapeProviderInputValue(config, item, options, limits, state)
+		: shapeValueForKey(config, key, field, item, options, limits, state);
 }
 
 function shapeProviderInputValue<T>(

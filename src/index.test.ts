@@ -26,6 +26,7 @@ describe("index (extension entry)", () => {
 		delete process.env.PI_LANGFUSE_REDACTION_SECRETS;
 		delete process.env.PI_LANGFUSE_SKIP_UNPERSISTED;
 		delete process.env.PI_LANGFUSE_RAW_PROVIDER_REQUEST;
+		delete process.env.PI_LANGFUSE_CAPTURE_PROVIDER_PAYLOAD;
 		delete process.env.PI_CODING_AGENT_DIR;
 	});
 
@@ -40,7 +41,12 @@ describe("index (extension entry)", () => {
 
 	async function captureRawProviderRequestRecords(options: {
 		mode?: "full" | "off";
-		messages: Array<{ role: string; content: string }>;
+		messages?: Array<{ role: string; content: string }>;
+		contextMessages?: Array<{ role: string; content: unknown }>;
+		payload?: unknown;
+		drive?: (
+			send: (eventName: string, event: unknown) => Promise<void>,
+		) => Promise<void>;
 	}) {
 		const rawTraceDir = mkdtempSync(join(tmpdir(), "pi-langfuse-index-test-"));
 		const sessionFile = "/tmp/pi-agent/sessions/--work--/session.jsonl";
@@ -82,9 +88,22 @@ describe("index (extension entry)", () => {
 			},
 		);
 		await getHandler("turn_start")({ turnIndex: 0 });
-		await getHandler("before_provider_request")({
-			payload: { model: "test-model", messages: options.messages },
-		});
+		if (options.contextMessages) {
+			await getHandler("context")({ messages: options.contextMessages });
+		}
+		const send = async (eventName: string, event: unknown) => {
+			await getHandler(eventName)(event);
+		};
+		if (options.drive) {
+			await options.drive(send);
+		} else {
+			await send("before_provider_request", {
+				payload: options.payload ?? {
+					model: "test-model",
+					messages: options.messages ?? [],
+				},
+			});
+		}
 
 		return readFileSync(join(rawTraceDir, "--work--", "session.jsonl"), "utf-8")
 			.trim()
@@ -278,6 +297,252 @@ describe("index (extension entry)", () => {
 		expect(records.some((record) => record.type === "agent_prompt_start")).toBe(
 			true,
 		);
+	});
+
+	it("attributes Responses provider_request records to the payload input instead of the context fallback", async () => {
+		const input = [
+			{ role: "system", content: "INPUT-system prompt" },
+			{
+				role: "user",
+				content: [{ type: "input_text", text: "INPUT-user turn" }],
+			},
+			{
+				type: "function_call",
+				call_id: "call_1",
+				name: "read",
+				arguments: '{"path":"/tmp/tool-args"}',
+			},
+			{
+				type: "function_call_output",
+				call_id: "call_1",
+				output: "tool output",
+			},
+			{ type: "reasoning", summary: [] },
+		];
+		const records = await captureRawProviderRequestRecords({
+			contextMessages: [
+				{ role: "system", content: "CTX-system prompt" },
+				{ role: "user", content: "CTX-user turn" },
+			],
+			payload: { model: "grok-4.7", input, stream: true },
+		});
+		const providerRequest = records.find(
+			(record) => record.type === "provider_request",
+		);
+
+		expect(providerRequest).toMatchObject({
+			type: "provider_request",
+			captureMode: "summary",
+			requestSource: "payload.input",
+			messageCount: 5,
+			fullMessagesOmitted: true,
+		});
+		const summaryJson = JSON.stringify(providerRequest?.messagesSummary);
+		expect(summaryJson).toContain("INPUT-");
+		expect(summaryJson).not.toContain("CTX-");
+		// Tool and reasoning contents are not expanded into the summary.
+		expect(summaryJson).not.toContain("/tmp/tool-args");
+		expect(summaryJson).not.toContain("tool output");
+	});
+
+	it("attributes string-shaped Responses input records to the payload input", async () => {
+		const records = await captureRawProviderRequestRecords({
+			payload: { model: "grok-4.7", input: "STRING-plain prompt" },
+		});
+		const providerRequest = records.find(
+			(record) => record.type === "provider_request",
+		);
+
+		expect(providerRequest).toMatchObject({
+			requestSource: "payload.input",
+			messageCount: 1,
+			fullMessagesOmitted: true,
+		});
+		const summaryJson = JSON.stringify(providerRequest?.messagesSummary);
+		expect(summaryJson).toContain("STRING-plain prompt");
+		expect(providerRequest?.messagesSummary).toEqual([
+			{ role: "user", content: "STRING-plain prompt" },
+		]);
+	});
+
+	it("never presents the context fallback as a captured wire request", async () => {
+		const contextMessages = [{ role: "user", content: "CTX-context only" }];
+
+		const summaryRecords = await captureRawProviderRequestRecords({
+			contextMessages,
+			payload: { model: "test-model" },
+		});
+		const summaryRecord = summaryRecords.find(
+			(record) => record.type === "provider_request",
+		);
+		expect(summaryRecord?.requestSource).toBe("context");
+		// Wire metrics are only set for contents observed in the payload; the
+		// fallback is a diagnostic summary of earlier context.
+		expect(summaryRecord?.messageCount).toBeUndefined();
+		expect(summaryRecord).not.toHaveProperty("estimatedBytes");
+		expect(summaryRecord).not.toHaveProperty("fullMessagesOmitted");
+		expect(JSON.stringify(summaryRecord?.messagesSummary)).toContain(
+			"CTX-context only",
+		);
+
+		const fullRecords = await captureRawProviderRequestRecords({
+			mode: "full",
+			contextMessages,
+			payload: { model: "test-model" },
+		});
+		const fullRecord = fullRecords.find(
+			(record) => record.type === "provider_request",
+		);
+		expect(fullRecord?.requestSource).toBe("context");
+		expect(fullRecord).not.toHaveProperty("messages");
+		expect(fullRecord?.messageCount).toBeUndefined();
+		expect(fullRecord).not.toHaveProperty("estimatedBytes");
+	});
+
+	it("records unknown payloads without provenance or wire metrics", async () => {
+		const records = await captureRawProviderRequestRecords({
+			payload: { model: "test-model", temperature: 0.5 },
+		});
+		const providerRequest = records.find(
+			(record) => record.type === "provider_request",
+		);
+
+		expect(providerRequest).toMatchObject({
+			type: "provider_request",
+			captureMode: "summary",
+		});
+		// No recognizable contents and no context: the record claims no source,
+		// no wire metrics, no captured or summarized contents, and — with
+		// payload capture disabled — no payload summary text.
+		expect(providerRequest?.requestSource).toBeUndefined();
+		expect(providerRequest?.messageCount).toBeUndefined();
+		expect(providerRequest).not.toHaveProperty("estimatedBytes");
+		expect(providerRequest).not.toHaveProperty("fullMessagesOmitted");
+		expect(providerRequest).not.toHaveProperty("payloadSummary");
+		expect(providerRequest?.messagesSummary).toBeUndefined();
+	});
+
+	it("records the request model from the payload, falling back to the session model", async () => {
+		const records = await captureRawProviderRequestRecords({
+			drive: async (send) => {
+				await send("before_provider_request", {
+					payload: {
+						model: "grok-4.7",
+						messages: [{ role: "user", content: "PAYLOAD-MODEL request" }],
+					},
+				});
+				await send("before_provider_request", {
+					payload: {
+						messages: [{ role: "user", content: "SESSION-MODEL request" }],
+					},
+				});
+			},
+		});
+		const providerRequests = records.filter(
+			(record) => record.type === "provider_request",
+		);
+
+		expect(providerRequests).toHaveLength(2);
+		// The payload model wins; without one, the session model is recorded.
+		expect(providerRequests[0]?.model).toBe("grok-4.7");
+		expect(providerRequests[1]?.model).toBe("test-model");
+	});
+
+	it("ignores provider requests that reference an unknown turn", async () => {
+		const records = await captureRawProviderRequestRecords({
+			drive: async (send) => {
+				await send("before_provider_request", {
+					turnIndex: 9,
+					payload: {
+						model: "test-model",
+						messages: [{ role: "user", content: "ORPHAN request" }],
+					},
+				});
+			},
+		});
+
+		expect(
+			records.filter((record) => record.type === "provider_request"),
+		).toHaveLength(0);
+	});
+
+	it("carries the bounded payload summary when payload capture is enabled", async () => {
+		process.env.PI_LANGFUSE_CAPTURE_PROVIDER_PAYLOAD = "1";
+		const records = await captureRawProviderRequestRecords({
+			messages: [{ role: "user", content: "SUMMARY-payload marker" }],
+		});
+		const providerRequest = records.find(
+			(record) => record.type === "provider_request",
+		);
+
+		expect(providerRequest).toMatchObject({
+			payloadCaptured: true,
+			requestSource: "payload.messages",
+			messageCount: 1,
+		});
+		const payloadSummary = String(providerRequest?.payloadSummary);
+		expect(payloadSummary).toContain("SUMMARY-payload marker");
+	});
+
+	it("does not let a malformed payload interrupt request tracing", async () => {
+		const records = await captureRawProviderRequestRecords({
+			payload: null,
+			drive: async (send) => {
+				await send("before_provider_request", {
+					payload: {
+						model: "hostile-model",
+						get messages(): Array<{ role: string; content: string }> {
+							throw new Error("malformed payload");
+						},
+					},
+				});
+				await send("before_provider_request", {
+					payload: {
+						model: "test-model",
+						messages: [{ role: "user", content: "recovered" }],
+					},
+				});
+			},
+		});
+
+		// The malformed payload produced no record; the next request still does.
+		const providerRequests = records.filter(
+			(record) => record.type === "provider_request",
+		);
+		expect(providerRequests).toHaveLength(1);
+		expect(providerRequests[0]).toMatchObject({
+			model: "test-model",
+			requestSource: "payload.messages",
+			messageCount: 1,
+		});
+	});
+
+	it("captures Responses input items as the wire request in full mode", async () => {
+		const input = [
+			{ role: "system", content: "INPUT-system prompt" },
+			{
+				role: "user",
+				content: [{ type: "input_text", text: "INPUT-user turn" }],
+			},
+		];
+		const records = await captureRawProviderRequestRecords({
+			mode: "full",
+			contextMessages: [{ role: "user", content: "CTX-context only" }],
+			payload: { model: "grok-4.7", input },
+		});
+		const providerRequest = records.find(
+			(record) => record.type === "provider_request",
+		);
+
+		expect(providerRequest).toMatchObject({
+			type: "provider_request",
+			captureMode: "full",
+			requestSource: "payload.input",
+			messageCount: 2,
+		});
+		const messagesJson = JSON.stringify(providerRequest?.messages);
+		expect(messagesJson).toContain("INPUT-");
+		expect(messagesJson).not.toContain("CTX-");
 	});
 
 	it("should update model on model_select", async () => {

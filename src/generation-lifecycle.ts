@@ -28,6 +28,13 @@ import type {
 	usageDetailsFromUsage,
 	writeRawTrace,
 } from "./telemetry-helpers.js";
+import {
+	captureProviderRequest,
+	providerRequestIdentity,
+	providerRequestProvenance,
+	providerRequestTraceRecord,
+	summarizeProviderRequestInput,
+} from "./telemetry-helpers.js";
 
 export interface GenerationLifecycleDependencies {
 	getConfig: () => Config;
@@ -131,6 +138,8 @@ const MODEL_PARAMETER_KEYS = [
 	"topP",
 	"max_tokens",
 	"maxTokens",
+	"max_output_tokens",
+	"maxOutputTokens",
 	"max_completion_tokens",
 	"presence_penalty",
 	"frequency_penalty",
@@ -140,6 +149,16 @@ const MODEL_PARAMETER_KEYS = [
 function extractModelParameters(payload: unknown) {
 	const data = asRecord(payload);
 	if (!data) return undefined;
+	const parameters = pickModelParameters(data);
+	// Responses-style payloads nest the effort under `reasoning`; report it
+	// under the flat name chat-style payloads already use.
+	const effort = parameters.reasoning_effort ?? reasoningEffortParameter(data);
+	if (effort !== undefined) parameters.reasoning_effort = effort;
+	return Object.keys(parameters).length > 0 ? parameters : undefined;
+}
+
+/** Collect the flat scalar model parameters present in the payload. */
+function pickModelParameters(data: EventRecord) {
 	const parameters: Record<string, string | number> = {};
 	for (const key of MODEL_PARAMETER_KEYS) {
 		const value = data[key];
@@ -147,7 +166,15 @@ function extractModelParameters(payload: unknown) {
 			parameters[key] = value;
 		}
 	}
-	return Object.keys(parameters).length > 0 ? parameters : undefined;
+	return parameters;
+}
+
+/** Responses-style reasoning effort nested under `reasoning`. */
+function reasoningEffortParameter(data: EventRecord) {
+	const effort = asRecord(data.reasoning)?.effort;
+	return typeof effort === "string" || typeof effort === "number"
+		? effort
+		: undefined;
 }
 
 const SAFE_PROVIDER_RESPONSE_HEADERS = new Set([
@@ -261,60 +288,81 @@ function createGenerationState(
 	return state;
 }
 
-function getOrCreateGenerationState(
+interface GenerationLookupOptions {
+	create: boolean;
+	newRequest: boolean;
+	requestFingerprint?: string;
+}
+
+function nextGeneratedRequestKey(turn: TurnState) {
+	const requestKey = `turn:${turn.index}:request:${turn.nextGenerationIndex}`;
+	turn.nextGenerationIndex += 1;
+	return requestKey;
+}
+
+/** Events carrying an explicit request key pin their generation by that key. */
+function generationForExplicitRequestKey(
 	turn: TurnState,
-	event: EventRecord,
-	options: {
-		create: boolean;
-		newRequest: boolean;
-		requestFingerprint?: string;
-	},
-): GenerationState | undefined {
-	const explicitRequestKey = getExplicitRequestKey(event);
-	if (explicitRequestKey) {
-		const existing = turn.generations.get(explicitRequestKey);
-		if (existing || !options.create) return existing;
-		return createGenerationState(turn, explicitRequestKey);
-	}
+	requestKey: string,
+	options: GenerationLookupOptions,
+) {
+	const existing = turn.generations.get(requestKey);
+	if (existing || !options.create) return existing;
+	return createGenerationState(turn, requestKey);
+}
 
-	if (options.newRequest) {
-		const latest = findLatestGeneration(turn, (state) => !state.ended);
-		if (
-			latest &&
-			options.requestFingerprint &&
-			latest.requestFingerprint === options.requestFingerprint
-		)
-			return latest;
-		if (!options.create) return undefined;
-		const requestKey = `turn:${turn.index}:request:${turn.nextGenerationIndex}`;
-		turn.nextGenerationIndex += 1;
-		return createGenerationState(
-			turn,
-			requestKey,
-			undefined,
-			options.requestFingerprint,
-		);
-	}
-
-	const pending = findLatestGeneration(
+/** A new provider request reuses a retry with identical contents, else opens one. */
+function generationForNewRequest(
+	turn: TurnState,
+	options: GenerationLookupOptions,
+) {
+	const latest = findLatestGeneration(turn, (state) => !state.ended);
+	if (
+		latest &&
+		options.requestFingerprint &&
+		latest.requestFingerprint === options.requestFingerprint
+	)
+		return latest;
+	if (!options.create) return undefined;
+	return createGenerationState(
 		turn,
-		(state) => !state.ended && !state.generation && !state.finishPromise,
+		nextGeneratedRequestKey(turn),
+		undefined,
+		options.requestFingerprint,
 	);
-	if (pending) return pending;
+}
 
-	const open = findLatestGeneration(
+/**
+ * Message events belong to the newest request still in flight. When a
+ * retry with different contents supersedes an earlier request, the older
+ * generation stays open until turn cleanup abandons it.
+ */
+function generationForMessageEvent(
+	turn: TurnState,
+	options: GenerationLookupOptions,
+) {
+	const active = findLatestGeneration(
 		turn,
 		(state) => !state.ended && !state.finishPromise,
 	);
-	if (open) return open;
-
+	if (active) return active;
 	const completed = findLatestGeneration(turn, (state) => state.ended);
 	if (completed) return completed;
-
 	if (!options.create) return undefined;
-	const requestKey = `turn:${turn.index}:request:${turn.nextGenerationIndex}`;
-	turn.nextGenerationIndex += 1;
-	return createGenerationState(turn, requestKey);
+	return createGenerationState(turn, nextGeneratedRequestKey(turn));
+}
+
+function getOrCreateGenerationState(
+	turn: TurnState,
+	event: EventRecord,
+	options: GenerationLookupOptions,
+): GenerationState | undefined {
+	const explicitRequestKey = getExplicitRequestKey(event);
+	if (explicitRequestKey) {
+		return generationForExplicitRequestKey(turn, explicitRequestKey, options);
+	}
+	if (options.newRequest) return generationForNewRequest(turn, options);
+	return generationForMessageEvent(turn, options);
 }
 
 function providerResponseMetadata(
@@ -502,96 +550,116 @@ export function createGenerationLifecycleHandlers(
 		);
 	};
 
+	/** Book one provider request on the turn span for rate/cost diagnostics. */
+	const recordTurnRequest = (
+		config: Config,
+		turn: TurnState,
+		model: string,
+		payloadSummaryText: string,
+	) => {
+		if (!turn.requests) turn.requests = [];
+		turn.requests.push({
+			timestamp: new Date().toISOString(),
+			payloadSize: payloadSummaryText.length,
+			model,
+		});
+		turn.span?.update?.({
+			metadata: {
+				requests: turn.requests,
+				providerPayload: config.captureProviderPayload
+					? payloadSummaryText
+					: undefined,
+			},
+		});
+	};
+
+	/** Correlate (or create) the generation for this provider request. */
+	const trackGenerationRequest = (
+		prompt: PromptState,
+		turn: TurnState,
+		record: EventRecord,
+		event: BeforeProviderRequestEvent,
+		config: Config,
+		reqModel: string | undefined,
+	) => {
+		if (!deps.canTrace(config) || !prompt.trace) return;
+		// Identity covers the complete payload; the truncated display
+		// summary cannot distinguish requests that collide after windowing,
+		// redaction, or parameter omission.
+		const generationState = getOrCreateGenerationState(turn, record, {
+			create: true,
+			newRequest: true,
+			requestFingerprint: providerRequestIdentity(event.payload),
+		});
+		if (generationState) {
+			generationState.inputSnapshot = snapshotInput(prompt, config);
+			generationState.requestModel = reqModel;
+			generationState.modelParameters = extractModelParameters(event.payload);
+		}
+	};
+
 	const beforeProviderRequest = async (
 		event: BeforeProviderRequestEvent,
 		ctx: ExtensionContext,
 	) => {
-		const state = deps.getSessionState(ctx);
-		const prompt = state?.promptState;
-		if (!state || !prompt || prompt.finalizing) return;
+		const resolved = getSessionPrompt(ctx, event);
+		if (!resolved) return;
+		const { state, prompt } = resolved;
 		const config = deps.getConfig();
 		const record = eventRecord(event);
 		const turn = getTurn(prompt, record);
 		if (!turn) return;
 
 		try {
-			const payloadSummary = deps.summarizeProviderPayload(
-				config,
-				event.payload,
-				state.model,
-			);
 			const payloadSummaryText = deps.safeJson(
 				config,
-				payloadSummary,
+				deps.summarizeProviderPayload(config, event.payload, state.model),
 				config.providerPayloadMaxChars,
 			);
 			const payload = asRecord(event.payload);
 			const reqModel = getRequestModel(event.payload) || state.model;
-			const payloadMessages = Array.isArray(payload?.messages)
-				? payload.messages
-				: prompt.lastContextMessages;
-			if (config.rawTraceProviderRequestMode !== "off") {
-				const providerRequestBase = {
-					type: "provider_request",
+			const capture = captureProviderRequest(payload);
+			const { fallbackMessages, requestSource } = providerRequestProvenance(
+				capture,
+				prompt.lastContextMessages,
+			);
+			const summarizeRequestContents = () => {
+				if (capture.contents?.field === "input-items")
+					return summarizeProviderRequestInput(config, capture.contents.items);
+				if (capture.contents?.field === "input-text")
+					return summarizeProviderRequestInput(config, capture.contents.text);
+				return deps.summarizeProviderRequestMessages(
+					config,
+					capture.captured ?? fallbackMessages,
+				);
+			};
+			const writeProviderRequestTrace = () => {
+				if (config.rawTraceProviderRequestMode === "off") return undefined;
+				// When the payload carries no recognizable request contents, the
+				// prompt context is recorded as a diagnostic summary only: provenance
+				// is marked and no wire metrics are claimed for contents that were
+				// never observed in a payload.
+				return providerRequestTraceRecord({
+					captureMode:
+						config.rawTraceProviderRequestMode === "full" ? "full" : "summary",
 					turnIndex: turn.index,
 					model: reqModel,
-					messageCount: Array.isArray(payloadMessages)
-						? payloadMessages.length
-						: undefined,
-					estimatedBytes: deps.estimateJsonBytes(payloadMessages),
+					requestSource,
+					capture,
 					payloadCaptured: config.captureProviderPayload,
 					payloadSummary: config.captureProviderPayload
 						? payloadSummaryText
 						: undefined,
-				};
-				deps.writeRawTrace(
-					config,
-					state,
-					config.rawTraceProviderRequestMode === "full"
-						? {
-								...providerRequestBase,
-								captureMode: "full",
-								messages: payloadMessages,
-							}
-						: {
-								...providerRequestBase,
-								captureMode: "summary",
-								messagesSummary: deps.summarizeProviderRequestMessages(
-									config,
-									payloadMessages,
-								),
-								fullMessagesOmitted: Array.isArray(payloadMessages),
-							},
-				);
+					messagesSummary: summarizeRequestContents(),
+				});
+			};
+			const providerRequestTrace = writeProviderRequestTrace();
+			if (providerRequestTrace) {
+				deps.writeRawTrace(config, state, providerRequestTrace);
 			}
 
-			const payloadSize = payloadSummaryText.length;
-			if (!turn.requests) turn.requests = [];
-			turn.requests.push({
-				timestamp: new Date().toISOString(),
-				payloadSize,
-				model: reqModel,
-			});
-			turn.span?.update?.({
-				metadata: {
-					requests: turn.requests,
-					providerPayload: config.captureProviderPayload
-						? payloadSummaryText
-						: undefined,
-				},
-			});
-
-			if (!deps.canTrace(config) || !prompt.trace) return;
-			const generationState = getOrCreateGenerationState(turn, record, {
-				create: true,
-				newRequest: true,
-				requestFingerprint: payloadSummaryText,
-			});
-			if (generationState) {
-				generationState.inputSnapshot = snapshotInput(prompt, config);
-				generationState.requestModel = reqModel;
-				generationState.modelParameters = extractModelParameters(event.payload);
-			}
+			recordTurnRequest(config, turn, reqModel, payloadSummaryText);
+			trackGenerationRequest(prompt, turn, record, event, config, reqModel);
 		} catch {
 			// Provider payload shaping is diagnostic-only and must not interrupt the request.
 		}
