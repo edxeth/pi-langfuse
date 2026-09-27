@@ -715,6 +715,103 @@ describe("langfuse v5 runtime facade", () => {
 		}
 	});
 
+	it("retains failed fallback traces and retries with stable event identities", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 20,
+			traceVisibilityMs: 10,
+			pollIntervalMs: 1,
+		});
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			mocks.traceGet.mockReset().mockRejectedValue(new Error("not visible"));
+			let deliveries = 0;
+			mocks.ingestionBatch.mockReset().mockImplementation(async () => {
+				deliveries += 1;
+				if (deliveries === 1) throw new Error("HTTP 503");
+				return { successes: [], errors: [] };
+			});
+			const lf = await getRuntime(config);
+			const trace = lf.trace({
+				id: "a".repeat(32),
+				name: "pi-agent",
+				input: "retry prompt",
+			});
+			const prompt = lf.span({ name: "agent.prompt", traceId: trace.id });
+			prompt.end({ output: "done" });
+
+			await flushClient();
+			expect(mocks.ingestionBatch).toHaveBeenCalledTimes(1);
+
+			await flushClient();
+			expect(mocks.ingestionBatch).toHaveBeenCalledTimes(2);
+
+			const callIds = (index: number) => {
+				const [request] = (mocks.ingestionBatch.mock.calls as unknown as Array<[
+					unknown,
+				]>)[index] ?? [];
+				if (!request) throw new Error("fallback request was not captured");
+				const batch = (request as { batch: Array<{ id: string }> }).batch;
+				return batch.map((event) => event.id).sort();
+			};
+			// The retry must reuse the original envelope event ids so the server
+			// can deduplicate an ambiguous first delivery.
+			expect(callIds(1)).toEqual(callIds(0));
+			expect(JSON.stringify((mocks.ingestionBatch.mock.calls as unknown as Array<[unknown]>)[1]?.[0])).toContain(
+				"retry prompt",
+			);
+
+			mocks.ingestionBatch.mockClear();
+			await flushClient();
+			expect(mocks.ingestionBatch).toHaveBeenCalledTimes(0);
+		} finally {
+			mocks.ingestionBatch.mockResolvedValue({ successes: [], errors: [] });
+			warn.mockRestore();
+			restoreTimeouts();
+		}
+	});
+
+	it("discards fallback traces with an explicit diagnostic once the retry budget is spent", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 20,
+			traceVisibilityMs: 10,
+			pollIntervalMs: 1,
+		});
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			mocks.traceGet.mockReset().mockRejectedValue(new Error("not visible"));
+			mocks.ingestionBatch
+				.mockReset()
+				.mockRejectedValue(new Error("HTTP 503 unavailable"));
+			const lf = await getRuntime(config);
+			const trace = lf.trace({
+				id: "b".repeat(32),
+				name: "pi-agent",
+				input: "budget prompt",
+			});
+			const prompt = lf.span({ name: "agent.prompt", traceId: trace.id });
+			prompt.end({ output: "done" });
+
+			await flushClient();
+			await flushClient();
+			await flushClient();
+			expect(mocks.ingestionBatch).toHaveBeenCalledTimes(3);
+			const discardWarning = warn.mock.calls.find(([message]) =>
+				String(message).includes("discarded"),
+			);
+			expect(discardWarning).toBeDefined();
+			expect(String(discardWarning?.[0])).toContain(trace.id);
+			expect(String(discardWarning?.[0])).toContain("3 failed");
+
+			mocks.ingestionBatch.mockClear();
+			await flushClient();
+			expect(mocks.ingestionBatch).toHaveBeenCalledTimes(0);
+		} finally {
+			mocks.ingestionBatch.mockResolvedValue({ successes: [], errors: [] });
+			warn.mockRestore();
+			restoreTimeouts();
+		}
+	});
+
 	it("drops single fallback events that exceed the ingestion byte limit", async () => {
 		const restoreTimeouts = setRuntimeTimeoutsForTest({
 			shutdownStepMs: 20,

@@ -70,7 +70,14 @@ export interface RestFallbackTrace {
 	metadata?: RestFallbackMetadata;
 	readonly observations: RestFallbackObservation[];
 	completed: boolean;
-	attempted: boolean;
+	/** Drain rounds that attempted replay without full delivery. */
+	attempts: number;
+	/**
+	 * Events built for replay, cached so every attempt reuses identical
+	 * envelope event ids; the ingestion API deduplicates by event id, so a
+	 * regenerated id would defeat recovery of an ambiguous delivery.
+	 */
+	pendingEvents?: RestFallbackEvent[];
 }
 
 export interface RestFallbackStore {
@@ -187,7 +194,7 @@ export function recordTrace(
 		name: input.body.name || "pi-agent",
 		observations: [],
 		completed: false,
-		attempted: false,
+		attempts: 0,
 	};
 	applyTraceBody(trace, input.body);
 	store.traces.set(trace.id, trace);
@@ -339,41 +346,93 @@ function boundedEventList(ids: string[], max = MAX_REPORTED_FAILURE_REASONS) {
 	return `${shown.join(", ")}${omitted > 0 ? ` (+${omitted} more)` : ""}`;
 }
 
+const MAX_FALLBACK_ATTEMPTS = 3;
+const MAX_RETAINED_FALLBACK_BYTES = 32_000_000;
+
+function pendingEventsForTrace(trace: RestFallbackTrace): RestFallbackEvent[] {
+	// Rebuilds may pick up observations added after the first attempt, but
+	// every event already built keeps its original envelope id and body.
+	const known = new Map<string, RestFallbackEvent>();
+	for (const event of trace.pendingEvents ?? []) {
+		known.set(`${event.type}:${String(event.body.id)}`, event);
+	}
+	const events = [
+		fallbackTraceEvent(trace),
+		...trace.observations.map(fallbackObservationEvent),
+	];
+	trace.pendingEvents = events.map((event) => {
+		const key = `${event.type}:${String(event.body.id)}`;
+		return known.get(key) ?? event;
+	});
+	return trace.pendingEvents;
+}
+
+function retainedTraceBytes(trace: RestFallbackTrace) {
+	return (trace.pendingEvents ?? []).reduce(
+		(sum, event) => sum + eventBytes(event),
+		0,
+	);
+}
+
+function enforceRetentionBound(
+	store: RestFallbackStore,
+	candidates: RestFallbackTrace[],
+): string[] {
+	let total = 0;
+	for (const trace of candidates) total += retainedTraceBytes(trace);
+	const discarded: string[] = [];
+	// FIFO: the store Map preserves insertion order, so the oldest completed
+	// traces give up their recovery copies first when the budget is exceeded.
+	for (const trace of candidates) {
+		if (total <= MAX_RETAINED_FALLBACK_BYTES) break;
+		total -= retainedTraceBytes(trace);
+		discarded.push(trace.id);
+		retireTrace(store, trace);
+	}
+	return discarded;
+}
+
 export interface BuiltFallbackBatches {
 	batches: RestFallbackEvent[][];
 	oversizedEventLabels: string[];
+	/** Trace ids carried by each batch, aligned with `batches`. */
+	batchTraceIds: Array<Set<string>>;
 }
 
 function buildBatches(traces: RestFallbackTrace[]): BuiltFallbackBatches {
 	const batches: RestFallbackEvent[][] = [];
 	const oversizedEventLabels: string[] = [];
+	const batchTraceIds: Array<Set<string>> = [];
 	let current: RestFallbackEvent[] = [];
+	let currentOwners = new Set<string>();
+	const closeCurrent = () => {
+		if (current.length === 0) return;
+		batches.push(current);
+		batchTraceIds.push(currentOwners);
+		current = [];
+		currentOwners = new Set();
+	};
 	for (const trace of traces) {
 		// One event above the server's per-request limit cannot be delivered by
 		// any batching, so it is dropped and reported instead of poisoning the
 		// whole batch that carries it.
-		const sendable: RestFallbackEvent[] = [];
-		for (const event of [
-			fallbackTraceEvent(trace),
-			...trace.observations.map(fallbackObservationEvent),
-		]) {
-			if (eventBytes(event) > MAX_REST_BATCH_BYTES) {
-				oversizedEventLabels.push(
-					`${event.type} ${String(event.body.id ?? trace.id)} (${eventBytes(event)} bytes)`,
-				);
-				continue;
-			}
-			sendable.push(event);
-		}
+		const sendable = pendingEventsForTrace(trace).filter((event) => {
+			if (eventBytes(event) <= MAX_REST_BATCH_BYTES) return true;
+			oversizedEventLabels.push(
+				`${event.type} ${String(event.body.id ?? trace.id)} (${eventBytes(event)} bytes)`,
+			);
+			return false;
+		});
+		if (sendable.length === 0) continue;
 		if (
 			current.length > 0 &&
 			batchSize([...current, ...sendable]) > MAX_REST_BATCH_BYTES
 		) {
-			batches.push(current);
-			current = [];
+			closeCurrent();
 		}
 		if (batchSize(sendable) <= MAX_REST_BATCH_BYTES) {
 			current.push(...sendable);
+			currentOwners.add(trace.id);
 			continue;
 		}
 		for (const event of sendable) {
@@ -381,14 +440,14 @@ function buildBatches(traces: RestFallbackTrace[]): BuiltFallbackBatches {
 				current.length > 0 &&
 				batchSize([...current, event]) > MAX_REST_BATCH_BYTES
 			) {
-				batches.push(current);
-				current = [];
+				closeCurrent();
 			}
 			current.push(event);
+			currentOwners.add(trace.id);
 		}
 	}
-	if (current.length > 0) batches.push(current);
-	return { batches, oversizedEventLabels };
+	closeCurrent();
+	return { batches, oversizedEventLabels, batchTraceIds };
 }
 
 async function withTimeout<T>(
@@ -463,6 +522,10 @@ async function traceIsCompleteOnServer(
 		pollIntervalMs: number;
 	},
 ) {
+	if (!client.api?.trace?.get) {
+		// The check cannot run at all; polling would only stall the drain.
+		return false;
+	}
 	const expected = trace.observations.map((observation) => observation.id);
 	const deadline = Date.now() + options.visibilityTimeoutMs;
 	while (Date.now() < deadline) {
@@ -571,54 +634,96 @@ export async function drainCompletedRestFallback(
 	},
 ) {
 	const candidates = [...store.traces.values()].filter(
-		(trace) => trace.completed && !trace.attempted,
+		(trace) => trace.completed,
 	);
 	if (candidates.length === 0) return;
-	for (const trace of candidates) trace.attempted = true;
-	try {
-		const checked = await Promise.all(
-			candidates.map(async (trace) => ({
-				trace,
-				complete: await traceIsCompleteOnServer(client, trace, options),
-			})),
+
+	const problems: string[] = [];
+	const evicted = enforceRetentionBound(store, candidates);
+	if (evicted.length > 0) {
+		problems.push(
+			`REST fallback discarded ${evicted.length} trace(s) beyond the ${MAX_RETAINED_FALLBACK_BYTES}-byte retention budget: ${boundedEventList(evicted)}`,
 		);
-		const missing = checked
-			.filter(({ complete }) => !complete)
-			.map(({ trace }) => trace);
-		if (missing.length === 0) return;
-		const { batches, oversizedEventLabels } = buildBatches(missing);
-		const results = await Promise.allSettled(
-			batches.map((events) =>
-				sendBatch(client, events, options.requestTimeoutMs),
-			),
-		);
-		const failures = results.filter(
-			(result): result is PromiseRejectedResult => result.status === "rejected",
-		);
-		if (failures.length > 0 || oversizedEventLabels.length > 0) {
-			const problems: string[] = [];
-			if (failures.length > 0) {
-				const reasons = Array.from(
-					new Set(
-						failures.map((failure) => fallbackFailureMessage(failure.reason)),
-					),
-				);
-				// Cap the joined reasons so one terminal line stays constant-bounded even
-				// when every batch fails for a different reason.
-				const shown = reasons.slice(0, MAX_REPORTED_FAILURE_REASONS);
-				const omitted = reasons.length - shown.length;
-				problems.push(
-					`REST fallback ingestion failed for ${failures.length}/${batches.length} batch(es): ${shown.join("; ")}${omitted > 0 ? ` (+${omitted} more)` : ""}`,
-				);
-			}
-			if (oversizedEventLabels.length > 0) {
-				problems.push(
-					`REST fallback ingestion dropped ${oversizedEventLabels.length} oversized event(s) beyond the ${MAX_REST_BATCH_BYTES}-byte limit: ${boundedEventList(oversizedEventLabels)}`,
-				);
-			}
-			throw new Error(problems.join("; "));
-		}
-	} finally {
-		for (const trace of candidates) retireTrace(store, trace);
 	}
+	const retained = candidates.filter((trace) => store.traces.has(trace.id));
+	if (retained.length === 0) {
+		if (problems.length > 0) throw new Error(problems.join("; "));
+		return;
+	}
+
+	const checked = await Promise.all(
+		retained.map(async (trace) => ({
+			trace,
+			complete: await traceIsCompleteOnServer(client, trace, options),
+		})),
+	);
+	for (const { trace, complete } of checked) {
+		if (complete) retireTrace(store, trace);
+	}
+	const replay = checked
+		.filter(({ complete }) => !complete)
+		.map(({ trace }) => trace);
+	if (replay.length === 0) {
+		if (problems.length > 0) throw new Error(problems.join("; "));
+		return;
+	}
+
+	const { batches, oversizedEventLabels, batchTraceIds } =
+		buildBatches(replay);
+	const results = await Promise.allSettled(
+		batches.map((events) =>
+			sendBatch(client, events, options.requestTimeoutMs),
+		),
+	);
+	const failedTraceIds = new Set<string>();
+	const failures: PromiseRejectedResult[] = [];
+	results.forEach((result, index) => {
+		if (result.status !== "rejected") return;
+		failures.push(result);
+		for (const id of batchTraceIds[index] ?? []) failedTraceIds.add(id);
+	});
+
+	if (failures.length > 0) {
+		const reasons = Array.from(
+			new Set(failures.map((failure) => fallbackFailureMessage(failure.reason))),
+		);
+		// Cap the joined reasons so one terminal line stays constant-bounded even
+		// when every batch fails for a different reason.
+		const shown = reasons.slice(0, MAX_REPORTED_FAILURE_REASONS);
+		const omitted = reasons.length - shown.length;
+		const keptForRetry = replay.filter(
+			(trace) =>
+				failedTraceIds.has(trace.id) && trace.attempts + 1 < MAX_FALLBACK_ATTEMPTS,
+		).length;
+		problems.push(
+			`REST fallback ingestion failed for ${failures.length}/${batches.length} batch(es): ${shown.join("; ")}${omitted > 0 ? ` (+${omitted} more)` : ""}${keptForRetry > 0 ? `; retaining ${keptForRetry} trace(s) for a later drain` : ""}`,
+		);
+	}
+	if (oversizedEventLabels.length > 0) {
+		problems.push(
+			`REST fallback ingestion dropped ${oversizedEventLabels.length} oversized event(s) beyond the ${MAX_REST_BATCH_BYTES}-byte limit: ${boundedEventList(oversizedEventLabels)}`,
+		);
+	}
+
+	// Settle every replayed trace: delivered traces retire, failed traces
+	// consume one attempt and are either kept for a later drain or discarded
+	// with an explicit loss diagnostic once the retry budget is spent.
+	const exhausted: string[] = [];
+	for (const trace of replay) {
+		if (!failedTraceIds.has(trace.id)) {
+			retireTrace(store, trace);
+			continue;
+		}
+		trace.attempts += 1;
+		if (trace.attempts >= MAX_FALLBACK_ATTEMPTS) {
+			exhausted.push(trace.id);
+			retireTrace(store, trace);
+		}
+	}
+	if (exhausted.length > 0) {
+		problems.push(
+			`REST fallback discarded ${exhausted.length} trace(s) after ${MAX_FALLBACK_ATTEMPTS} failed attempts: ${boundedEventList(exhausted)}`,
+		);
+	}
+	if (problems.length > 0) throw new Error(problems.join("; "));
 }
