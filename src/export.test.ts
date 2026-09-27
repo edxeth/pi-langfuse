@@ -240,6 +240,80 @@ describe("redacted export", () => {
 		expect(report.error?.code).toBe("destination-not-a-directory");
 	});
 
+	it("rejects a scanner-required export with no files when the scanner is unavailable", () => {
+		const root = mkdtempSync(
+			join(tmpdir(), "pi-langfuse-export-empty-scan-test-"),
+		);
+		const sessions = join(root, "sessions");
+		const out = join(root, "export");
+		mkdirSync(sessions, { recursive: true });
+
+		const originalPath = process.env.PATH;
+		process.env.PATH = "";
+		try {
+			const report = exportRedactedData(
+				baseConfig,
+				`--sessions-only --sessions-dir ${sessions} --out ${out} --require-trufflehog`,
+			);
+
+			// The missing required scanner must fail the export itself, not just
+			// the (zero) individual files.
+			expect(report.summary).toMatchObject({
+				files: 0,
+				approved: 0,
+				rejected: 0,
+			});
+			expect(report.status).toBe("rejected");
+			expect(report.trufflehog).toMatchObject({
+				enabled: true,
+				required: true,
+				available: false,
+			});
+			expect(readFileSync(join(out, "REVIEW.md"), "utf-8")).toContain(
+				"Status: rejected",
+			);
+		} finally {
+			process.env.PATH = originalPath;
+			delete process.env.TRUFFLEHOG_BIN;
+		}
+	});
+
+	it("approves a scanner-required export with zero files when the scan succeeds", () => {
+		const root = mkdtempSync(
+			join(tmpdir(), "pi-langfuse-export-scan-ok-test-"),
+		);
+		const bin = join(root, "bin");
+		const sessions = join(root, "sessions");
+		const out = join(root, "export");
+		mkdirSync(bin, { recursive: true });
+		mkdirSync(sessions, { recursive: true });
+		writeFileSync(
+			join(bin, "trufflehog"),
+			'#!/bin/sh\nif [ "$1" = "--version" ]; then echo trufflehog-test; exit 0; fi\nexit 0\n',
+		);
+		chmodSync(join(bin, "trufflehog"), 0o755);
+
+		const originalPath = process.env.PATH;
+		process.env.PATH = bin;
+		process.env.TRUFFLEHOG_BIN = join(bin, "trufflehog");
+		try {
+			const report = exportRedactedData(
+				baseConfig,
+				`--sessions-only --sessions-dir ${sessions} --out ${out} --require-trufflehog`,
+			);
+
+			expect(report.summary).toMatchObject({
+				files: 0,
+				approved: 0,
+				rejected: 0,
+			});
+			expect(report.status).toBe("approved");
+		} finally {
+			process.env.PATH = originalPath;
+			delete process.env.TRUFFLEHOG_BIN;
+		}
+	});
+
 	it("rejects exports when TruffleHog scan fails", () => {
 		const root = mkdtempSync(join(tmpdir(), "pi-langfuse-export-test-"));
 		const bin = join(root, "bin");

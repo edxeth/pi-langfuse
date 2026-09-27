@@ -53,11 +53,7 @@ const report = exportRedactedData(resolveConfig({}), args, {
 if (report.error) {
 	process.stderr.write(`Export failed: ${report.error.message}\n`);
 }
-const status = report.error
-	? "failed"
-	: report.summary.rejected === 0
-		? "approved"
-		: "rejected";
+const status = report.error ? "failed" : report.status;
 console.log(
 	JSON.stringify(
 		{
@@ -72,4 +68,4 @@ console.log(
 	),
 );
 
-if (report.error || report.summary.rejected > 0) process.exitCode = 2;
+if (report.error || report.status === "rejected") process.exitCode = 2;

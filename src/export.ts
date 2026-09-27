@@ -44,6 +44,12 @@ interface ExportDestinationError {
 interface ExportReport {
 	createdAt: string;
 	outDir: string;
+	/**
+	 * Export-level approval: "failed" when the export aborted before writing,
+	 * "rejected" when any file was rejected or a required scanner was
+	 * unavailable or failed (independent of file count), else "approved".
+	 */
+	status: "approved" | "rejected" | "failed";
 	files: ExportFileResult[];
 	summary: {
 		approved: number;
@@ -336,6 +342,7 @@ export function exportRedactedData(
 		return {
 			createdAt: new Date().toISOString(),
 			outDir,
+			status: "failed",
 			files: [],
 			summary: { approved: 0, rejected: 0, files: 0 },
 			error: destinationError,
@@ -424,13 +431,29 @@ export function exportRedactedData(
 		};
 	}
 
+	const approvedCount = files.filter(
+		(file) => file.status === "approved",
+	).length;
+	const rejectedCount = files.filter(
+		(file) => file.status === "rejected",
+	).length;
+	// A required scanner that is unavailable or failed rejects the whole
+	// export, independent of how many input files were scanned (including zero).
+	const scannerRequiredFailure =
+		!!trufflehog &&
+		trufflehog.required &&
+		(!trufflehog.available || trufflehog.findings > 0 || !!trufflehog.warning);
+	const exportStatus: ExportReport["status"] =
+		rejectedCount > 0 || scannerRequiredFailure ? "rejected" : "approved";
+
 	const report: ExportReport = {
 		createdAt: new Date().toISOString(),
 		outDir,
+		status: exportStatus,
 		files,
 		summary: {
-			approved: files.filter((file) => file.status === "approved").length,
-			rejected: files.filter((file) => file.status === "rejected").length,
+			approved: approvedCount,
+			rejected: rejectedCount,
 			files: files.length,
 		},
 		trufflehog,
@@ -477,7 +500,7 @@ export function exportRedactedData(
 	);
 	writeFileSync(
 		join(outDir, "REVIEW.md"),
-		`# pi-langfuse redacted export\n\nStatus: ${report.summary.rejected === 0 ? "approved" : "rejected"}\n\n- Files: ${report.summary.files}\n- Approved: ${report.summary.approved}\n- Rejected: ${report.summary.rejected}\n- TruffleHog: ${trufflehog ? `${trufflehog.enabled ? (trufflehog.available ? "ran" : "unavailable") : "skipped"}, required=${trufflehog.required}, findings=${trufflehog.findings}` : "not requested"}\n- Training index: training-index.jsonl\n\nThis export is local-only. Review approved files before using them for training or sharing.\n`,
+		`# pi-langfuse redacted export\n\nStatus: ${exportStatus}\n\n- Files: ${report.summary.files}\n- Approved: ${report.summary.approved}\n- Rejected: ${report.summary.rejected}\n- TruffleHog: ${trufflehog ? `${trufflehog.enabled ? (trufflehog.available ? "ran" : "unavailable") : "skipped"}, required=${trufflehog.required}, findings=${trufflehog.findings}` : "not requested"}\n- Training index: training-index.jsonl\n\nThis export is local-only. Review approved files before using them for training or sharing.\n`,
 	);
 
 	ctx?.ui?.notify?.(
