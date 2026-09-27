@@ -603,6 +603,69 @@ it("stamps trace identity on child spans before the prompt root exports", async 
 		}
 	});
 
+	it("publishes traces flagged public over the normal OTel export", async () => {
+		const { server, requests } = createCollectingTraceServer();
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", () => resolve());
+		});
+
+		try {
+			const address = server.address() as AddressInfo;
+			const runtime = await getRuntime({
+				...baseConfig,
+				host: `http://127.0.0.1:${address.port}`,
+			});
+			const trace = runtime.trace({ name: "published-trace", public: true });
+			const prompt = runtime.span({ name: "agent.prompt", traceId: trace.id });
+			prompt.end({ output: "published answer" });
+			await flushClient();
+
+			const otelBodies = requests
+				.filter(({ url }) => url.includes("otel"))
+				.map(({ body }) => body);
+			if (otelBodies.length === 0) throw new Error("no OTel export received");
+			const spans = exportedSpans(otelBodies);
+			const root = spans.find((span) => span.name === "agent.prompt");
+			if (!root) throw new Error("prompt root was not exported");
+			const attributes = otelBodies
+				.map((body) => JSON.parse(body) as {
+					resourceSpans?: Array<{
+						scopeSpans?: Array<{
+							spans?: Array<{
+								spanId?: string;
+								attributes?: Array<{
+									key?: string;
+									value?: { boolValue?: boolean };
+								}>;
+							}>;
+						}>;
+					}>;
+				})
+				.flatMap((payload) =>
+					(payload.resourceSpans ?? []).flatMap((resource) =>
+						(resource.scopeSpans ?? []).flatMap((scope) => scope.spans ?? []),
+					),
+				);
+			const exportedRoot = attributes.find(
+				(span) => span.spanId === root.spanId,
+			);
+			if (!exportedRoot) throw new Error("root span payload not found");
+			expect(
+				exportedRoot.attributes?.some(
+					(attribute) =>
+						attribute.key === "langfuse.trace.public" &&
+						attribute.value?.boolValue === true,
+				),
+			).toBe(true);
+		} finally {
+			await shutdownClient();
+			await new Promise<void>((resolve, reject) => {
+				server.close((error) => (error ? reject(error) : resolve()));
+			});
+		}
+	});
+
 	it("rejects a child observation whose parent trace is not registered", async () => {
 		const server = createServer((_request, response) => {
 			response.statusCode = 200;

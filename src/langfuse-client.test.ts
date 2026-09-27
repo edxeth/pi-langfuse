@@ -46,7 +46,10 @@ const mocks = vi.hoisted(() => {
 				record.end = record.lastUpdate;
 			}),
 			setTraceIO: vi.fn(),
-			setTraceAsPublic: vi.fn(),
+			setTraceAsPublic: vi.fn(() => {
+				record.setTraceAsPublicCalls =
+					Number(record.setTraceAsPublicCalls ?? 0) + 1;
+			}),
 			startObservation: vi.fn(
 				(
 					childName: string,
@@ -440,6 +443,28 @@ describe("langfuse v5 runtime facade", () => {
 		if (!root) throw new Error("prompt root was not created");
 		expect(root.parentObservationId).toBeUndefined();
 		expect(root.traceId).not.toBe(external.traceId);
+	});
+
+	it("applies the public flag on the OTel path without ever unpublishing", async () => {
+		const lf = await getRuntime(config);
+		const publicTrace = lf.trace({ name: "pi-agent", public: true });
+		const privateTrace = lf.trace({ name: "pi-agent" });
+		const laterPublic = lf.trace({ name: "pi-agent" });
+		laterPublic.update({ public: true });
+		const forcedPrivate = lf.trace({ name: "pi-agent", public: true });
+		forcedPrivate.update({ public: false });
+
+		const publicCalls = (traceId: string) => {
+			const root = mocks.records.find((record) => record.traceId === traceId);
+			if (!root) throw new Error("trace root was not created");
+			return Number(root.setTraceAsPublicCalls ?? 0);
+		};
+		// The published flag must reach the normal OTel path, not only the
+		// fallback, and must never attempt to reverse a publication.
+		expect(publicCalls(publicTrace.id)).toBe(1);
+		expect(publicCalls(privateTrace.id)).toBe(0);
+		expect(publicCalls(laterPublic.id)).toBe(1);
+		expect(publicCalls(forcedPrivate.id)).toBe(1);
 	});
 
 	it("keeps an asynchronous observation context across awaited work", async () => {

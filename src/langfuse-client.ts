@@ -145,6 +145,7 @@ interface VendorObservation {
 	readonly otelSpan?: unknown;
 	update(attributes: Record<string, unknown>): VendorObservation;
 	end(): void;
+	setTraceAsPublic(): void;
 	setTraceIO(attributes: {
 		input?: unknown;
 		output?: unknown;
@@ -338,6 +339,17 @@ function traceAttributes(body: TraceUpdateBody | undefined) {
 	return observationAttributes(body);
 }
 
+/**
+ * Publishing is one-way on the server, so only an explicit true sets the
+ * OTel public attribute; false or omitted values never attempt to unpublish.
+ */
+function applyPublicTraceFlag(
+	vendorRoot: VendorObservation,
+	body: TraceUpdateBody | undefined,
+) {
+	if (body?.public === true) vendorRoot.setTraceAsPublic();
+}
+
 function traceIOAttributes(body: TraceUpdateBody | undefined): {
 	input?: unknown;
 	output?: unknown;
@@ -448,6 +460,7 @@ function createTrace(
 		),
 	);
 	const vendorRoot = root as unknown as VendorObservation;
+	applyPublicTraceFlag(vendorRoot, shaped);
 	const fallback = recordTrace(rt.fallbackStore, {
 		id: vendorRoot.traceId,
 		timestamp: new Date().toISOString(),
@@ -488,6 +501,7 @@ function createTrace(
 					runtimeTrace.lastUpdate,
 					shapedUpdate,
 				);
+				applyPublicTraceFlag(vendorRoot, shapedUpdate);
 				updateTrace(rt.fallbackStore, vendorRoot.traceId, shapedUpdate);
 				updateObservation(rt.fallbackStore, vendorRoot.id, shapedUpdate);
 				runWithVendorContext(vendorRoot, () => {
@@ -609,6 +623,7 @@ function wrapObservation<T extends LangfuseSpan | LangfuseGeneration>(
 			: shaped;
 		if (rootTrace) {
 			rootTrace.lastUpdate = effective as TraceUpdateBody;
+			applyPublicTraceFlag(rootTrace.root, effective as TraceUpdateBody);
 		}
 		updateObservation(rt.fallbackStore, observation.id, shaped);
 		observation.update(observationAttributes(effective));
