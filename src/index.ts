@@ -598,6 +598,8 @@ export default async function (pi: ExtensionAPI) {
 
 	pi.on("agent_end", agentLifecycle.agentEnd);
 
+	pi.on("agent_settled", agentLifecycle.agentSettled);
+
 	pi.on("session_compact", async (_event, ctx) => {
 		const state = getTypedSessionState(ctx);
 		if (!state || state.promptState?.finalizing) return;

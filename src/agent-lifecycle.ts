@@ -1,5 +1,6 @@
 import type {
 	AgentEndEvent,
+	AgentSettledEvent,
 	AgentStartEvent,
 	BeforeAgentStartEvent,
 	ExtensionContext,
@@ -78,6 +79,10 @@ export interface AgentLifecycleHandlers {
 	) => Promise<void>;
 	agentStart: (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void>;
 	agentEnd: (event: AgentEndEvent, ctx: ExtensionContext) => Promise<void>;
+	agentSettled: (
+		event: AgentSettledEvent,
+		ctx: ExtensionContext,
+	) => Promise<void>;
 }
 
 export function createAgentLifecycleHandlers(
@@ -204,6 +209,13 @@ export function createAgentLifecycleHandlers(
 						failed: Boolean(failure) || undefined,
 						stopReason: failure?.stopReason,
 						errorMessage: failure?.errorMessage,
+						recoveredFailure: prompt.recoveredFailure
+							? {
+									stopReason: prompt.recoveredFailure.stopReason,
+									errorMessage: prompt.recoveredFailure.errorMessage,
+								}
+							: undefined,
+						recoveredFailureCount: prompt.recoveredFailureCount || undefined,
 						abandonmentReason,
 						turns: prompt.turns,
 						toolCalls: prompt.toolCalls,
@@ -235,6 +247,13 @@ export function createAgentLifecycleHandlers(
 							failed: Boolean(failure) || undefined,
 							stopReason: failure?.stopReason,
 							errorMessage: failure?.errorMessage,
+							recoveredFailure: prompt.recoveredFailure
+								? {
+										stopReason: prompt.recoveredFailure.stopReason,
+										errorMessage: prompt.recoveredFailure.errorMessage,
+									}
+								: undefined,
+							recoveredFailureCount: prompt.recoveredFailureCount || undefined,
 							abandonmentReason,
 							toolCalls: prompt.toolCalls,
 							toolErrors: prompt.toolErrors,
@@ -317,6 +336,7 @@ export function createAgentLifecycleHandlers(
 				cacheWrite: 0,
 				lastAssistantText: "",
 				startSignature: signature,
+				recoveredFailureCount: 0,
 				sourceMetadata,
 				activeTurns: new Map(),
 				activeTools: new Map(),
@@ -397,17 +417,139 @@ export function createAgentLifecycleHandlers(
 		}
 	};
 
+	const startUnannouncedPrompt = async (
+		state: SessionState<PromptState>,
+		config: Config,
+		ctx: ExtensionContext,
+	) => {
+		// Pi starts deferred runs (e.g. sendMessage(..., { triggerTurn: true })
+		// during agent_settled) without before_agent_start, so no event ever
+		// announces a user prompt. Own the run anyway: the previous prompt is
+		// already settled, and the run gets a trace whose metadata marks that no
+		// user prompt was captured. Concurrent agent_start deliveries await the
+		// pending start instead of opening a second prompt.
+		const sessionFile = ctx.sessionManager.getSessionFile();
+		if (config.skipUnpersistedSessions && !sessionFile) return;
+		if (!deps.canTrace(config) && !config.rawTraceEnabled) return;
+		state.sessionFile = sessionFile || state.sessionFile;
+
+		const pendingStart = state.promptStartPromise;
+		if (pendingStart) {
+			await pendingStart;
+			if (state.promptState) return;
+		}
+
+		const cwd = process.cwd();
+		const signature = `unannounced-agent-run:${Date.now()}`;
+		const promptStart = (async () => {
+			const systemPrompt = ctx.getSystemPrompt?.() ?? "";
+			const sourceMetadata = deps.collectSourceMetadata(cwd);
+			const prompt: PromptState = {
+				userPrompt: "",
+				systemPrompt,
+				cwd,
+				startedAt: Date.now(),
+				toolCalls: 0,
+				toolErrors: 0,
+				turns: 0,
+				tokensIn: 0,
+				tokensOut: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				lastAssistantText: "",
+				startSignature: signature,
+				recoveredFailureCount: 0,
+				sourceMetadata,
+				activeTurns: new Map(),
+				activeTools: new Map(),
+				completedTurnIndexes: new Set(),
+			};
+			state.promptState = prompt;
+
+			deps.writeRawTrace(config, state, {
+				type: "agent_prompt_start",
+				cwd,
+				prompt: "",
+				systemPrompt,
+				promptSource: "unannounced-agent-run",
+				sessionReason: state.sessionReason,
+				sourceMetadata,
+			});
+
+			try {
+				if (!deps.canTrace(config)) return;
+
+				await deps.ensureLocalLangfuseStarted(config);
+				if (state.promptState !== prompt) return;
+				const lf = await deps.getRuntime(config);
+				if (state.promptState !== prompt) return;
+				const trace = lf.trace({
+					name: "pi-agent",
+					sessionId: state.sessionId || undefined,
+					userId: deps.getUserId(config),
+					tags: deps.buildTraceTags(config, state, cwd),
+					release: config.release || undefined,
+					environment: config.environment || undefined,
+					metadata: {
+						redaction: deps.redactionMetadata(config),
+						...sourceMetadata,
+						cwd,
+						systemPrompt: deps.telemetryText(
+							config,
+							systemPrompt,
+							config.traceInputMaxChars,
+						),
+						model: state.model,
+						provider: state.provider,
+						sessionReason: state.sessionReason,
+						runtime: deps.getRuntimeName(),
+						sessionRoot: deps.getSessionRoot(state.sessionFile),
+						sessionFile: state.sessionFile || undefined,
+						previousSessionFile: state.previousSessionFile || undefined,
+						tiaActive: process.env.TIA_ACTIVE === "1",
+						tiaCommand: process.env.TIA_COMMAND || undefined,
+						promptSource: "unannounced-agent-run",
+					},
+				});
+
+				if (state.promptState === prompt) {
+					prompt.trace = trace;
+					prompt.promptSpan = lf.span({
+						name: "agent.prompt",
+						traceId: trace.id,
+					});
+				}
+			} catch (e) {
+				console.warn("📊 Langfuse: Failed to create trace", e);
+			}
+		})();
+		state.promptStartPromise = promptStart;
+		state.promptStartSignature = signature;
+		try {
+			await promptStart;
+		} finally {
+			if (state.promptStartPromise === promptStart) {
+				state.promptStartPromise = undefined;
+				state.promptStartSignature = undefined;
+			}
+		}
+	};
+
 	const agentStart = async (_event: AgentStartEvent, ctx: ExtensionContext) => {
 		const state = deps.getSessionState(ctx);
-		const prompt = state?.promptState;
-		if (!state || !prompt) return;
+		if (!state) return;
 		const config = deps.getConfig();
-		if (
-			!deps.canTrace(config) ||
-			!prompt.trace ||
-			prompt.finalizing ||
-			prompt.promptSpanEnded
-		)
+		if (!state.promptState) {
+			await startUnannouncedPrompt(state, config, ctx);
+		}
+		const prompt = state.promptState;
+		if (!prompt || prompt.finalizing) return;
+		// Pi resets its turn counter to 0 on every agent_start, including the
+		// continuations after automatic retry, compaction, or queued work that
+		// never re-emit before_agent_start. Guards from the finished run must not
+		// swallow the continuation's turns.
+		if (prompt.activeTurns.size === 0) prompt.completedTurnIndexes.clear();
+		if (!deps.canTrace(config) || !prompt.trace || prompt.promptSpanEnded)
 			return;
 		const trace = prompt.trace;
 		if (!trace) return;
@@ -474,11 +616,32 @@ export function createAgentLifecycleHandlers(
 				);
 			}
 		}
+		// agent_end closes ONE low-level agent run. Pi can retry, compact, or
+		// continue queued work without another before_agent_start, so prompt
+		// finalization waits for agent_settled. A run that ends with a healthy
+		// assistant message supersedes an earlier failed attempt.
 		const failure = lastAssistant
 			? getLifecycleFailure(lastAssistant)
 			: undefined;
-		if (failure) prompt.failure = failure;
-		await finalizePrompt(state, config, true);
+		if (failure) {
+			prompt.failure = failure;
+		} else if (lastAssistant && prompt.failure) {
+			prompt.recoveredFailure = prompt.failure;
+			prompt.recoveredFailureCount += 1;
+			prompt.failure = undefined;
+		}
+	};
+
+	const agentSettled = async (
+		_event: AgentSettledEvent,
+		ctx: ExtensionContext,
+	) => {
+		const state = deps.getSessionState(ctx);
+		const prompt = state?.promptState;
+		if (!state || !prompt || prompt.finalizing) return;
+		// Pi emits agent_settled only after retry, compaction, and queued
+		// continuations are done: the first boundary that may end the trace.
+		await finalizePrompt(state, deps.getConfig(), true);
 	};
 
 	return {
@@ -486,5 +649,6 @@ export function createAgentLifecycleHandlers(
 		beforeAgentStart,
 		agentStart,
 		agentEnd,
+		agentSettled,
 	};
 }

@@ -401,6 +401,7 @@ describe("registered Langfuse v5 runtime path", () => {
 					},
 				],
 			});
+			await emit("agent_settled", {});
 			await emit("session_shutdown", {});
 			drainRawTraceQueue();
 

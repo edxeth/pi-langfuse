@@ -50,6 +50,9 @@ export interface PromptState {
 	startSignature: string;
 	lastUsage?: PiUsage;
 	failure?: LifecycleFailure;
+	/** Most recent failure that a later agent run of this prompt recovered from. */
+	recoveredFailure?: LifecycleFailure;
+	recoveredFailureCount: number;
 	abandonmentReason?: string;
 	activeTurns: Map<number, TurnState>;
 	activeTools: Map<string, ToolState>;

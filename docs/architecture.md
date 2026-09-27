@@ -34,7 +34,7 @@ Trace (name: "pi-agent")
     - `tool_result` stores provisional result data; `tool_execution_end` supplies authoritative completion data.
     - `message_end` finalizes the generation with usage, cost, and provider metadata.
     - `turn_end` closes the turn span.
-4.  **Finalization**: `agent_end`, configuration refresh, session replacement, or `session_shutdown` closes unfinished child observations before the parent and updates trace health and aggregate metrics.
+4.  **Finalization**: `agent_settled` — Pi's final boundary after automatic retry, overflow compaction, and queued continuations — configuration refresh, session replacement, or `session_shutdown` closes unfinished child observations before the parent and updates trace health and aggregate metrics. `agent_end` only closes one low-level agent run: it records the run outcome (a healthy final run marks an earlier failure as recovered) and keeps the prompt open for continuation events that never re-emit `before_agent_start`. A prompt interrupted before settlement is finalized as abandoned by the interrupting boundary. A run that starts with no prompt at all — Pi defers `sendMessage(..., { triggerTurn: true })` issued during settlement and starts it without `before_agent_start` — gets its own trace with empty prompt input and `promptSource: "unannounced-agent-run"` metadata instead of being dropped.
 5.  **Flush and fallback**: A bounded OTel flush runs at prompt completion. If a completed trace is not visible, the facade sends one redacted REST batch attempt and retires the snapshot.
 
 ## State Management

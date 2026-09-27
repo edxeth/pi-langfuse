@@ -15,7 +15,10 @@ import { pathToFileURL } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import registerExtension from "./index.js";
-import { shutdownClient } from "./langfuse-client.js";
+import {
+	setRuntimeTimeoutsForTest,
+	shutdownClient,
+} from "./langfuse-client.js";
 import { drainRawTraceQueue } from "./raw-trace.js";
 
 interface FakeRecord {
@@ -423,9 +426,22 @@ function tempRoot(prefix: string) {
 	return root;
 }
 
+// The fake telemetry client exposes no REST API, so every completed trace
+// waits out the real 1500 ms visibility-poll deadline before the fallback
+// gives up. The production path stays live; only the irrelevant wall-clock
+// wait shrinks. Without this, tests finishing three prompts (e.g. the
+// duplicate-lifecycle test) run near the 5 s vitest timeout and fail
+// intermittently under load.
+let restoreFallbackTimeouts: (() => void) | undefined;
+
 beforeEach(() => {
 	drainRawTraceQueue();
 	telemetry.reset();
+	restoreFallbackTimeouts = setRuntimeTimeoutsForTest({
+		shutdownStepMs: 100,
+		traceVisibilityMs: 30,
+		pollIntervalMs: 5,
+	});
 	delete process.env.LANGFUSE_PUBLIC_KEY;
 	delete process.env.LANGFUSE_SECRET_KEY;
 	delete process.env.LANGFUSE_BASE_URL;
@@ -444,6 +460,8 @@ beforeEach(() => {
 afterEach(async () => {
 	drainRawTraceQueue();
 	await shutdownClient();
+	restoreFallbackTimeouts?.();
+	restoreFallbackTimeouts = undefined;
 	for (const root of createdRoots.splice(0)) {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -692,6 +710,7 @@ describe("executable compatibility contract", () => {
 				{ role: "assistant", content: [{ type: "text", text: "done" }] },
 			],
 		});
+		await eventHandler(pi, "agent_settled")({});
 
 		expect(telemetry.state.flushes).toBe(1);
 		expect(telemetry.state.shutdowns).toBe(0);
@@ -1193,6 +1212,10 @@ describe("executable compatibility contract", () => {
 				},
 				contextB,
 			),
+		]);
+		await Promise.all([
+			handler("agent_settled")({}, contextA),
+			handler("agent_settled")({}, contextB),
 		]);
 		await Promise.all([
 			handler("session_shutdown")({}, contextA),
@@ -2345,6 +2368,7 @@ describe("executable compatibility contract", () => {
 			context,
 		);
 		await handler("agent_end")({ messages: [] }, context);
+		await handler("agent_settled")({}, context); // Pi settles every accepted run
 
 		// The hook is observation-only: payloads must survive untouched.
 		expect(firstPayload).toEqual(firstSnapshot);
@@ -2482,6 +2506,7 @@ describe("executable compatibility contract", () => {
 			context,
 		);
 		await handler("agent_end")({ messages: [] }, context);
+		await handler("agent_settled")({}, context); // Pi settles every accepted run
 
 		const generations = telemetry.state.observations.filter(
 			(record) => record.name === "llm-response",
@@ -2585,6 +2610,7 @@ describe("executable compatibility contract", () => {
 			context,
 		);
 		await handler("agent_end")({ messages: [] }, context);
+		await handler("agent_settled")({}, context); // Pi settles every accepted run
 
 		// The identical display summaries must not merge the two requests into
 		// one generation keyed to the first request.
@@ -2683,6 +2709,7 @@ describe("executable compatibility contract", () => {
 			context,
 		);
 		await handler("agent_end")({ messages: [] }, context);
+		await handler("agent_settled")({}, context); // Pi settles every accepted run
 
 		const generations = telemetry.state.observations.filter(
 			(record) => record.name === "llm-response",
@@ -2768,6 +2795,7 @@ describe("executable compatibility contract", () => {
 			context,
 		);
 		await handler("agent_end")({ messages: [] }, context);
+		await handler("agent_settled")({}, context); // Pi settles every accepted run
 
 		const generations = telemetry.state.observations.filter(
 			(record) => record.name === "llm-response",
@@ -2854,6 +2882,7 @@ describe("executable compatibility contract", () => {
 			context,
 		);
 		await handler("agent_end")({ messages: [] }, context);
+		await handler("agent_settled")({}, context); // Pi settles every accepted run
 
 		const generations = telemetry.state.observations.filter(
 			(record) => record.name === "llm-response",
@@ -2958,6 +2987,7 @@ describe("executable compatibility contract", () => {
 			context,
 		);
 		await handler("agent_end")({ messages: [] }, context);
+		await handler("agent_settled")({}, context); // Pi settles every accepted run
 		await handler("session_shutdown")({}, context);
 		return metadata;
 	}
@@ -3067,6 +3097,7 @@ describe("executable compatibility contract", () => {
 			context,
 		);
 		await handler("agent_end")({ messages: [] }, context);
+		await handler("agent_settled")({}, context); // Pi settles every accepted run
 
 		const generations = telemetry.state.observations.filter(
 			(record) => record.name === "llm-response",
@@ -3146,6 +3177,7 @@ describe("executable compatibility contract", () => {
 			context,
 		);
 		await handler("agent_end")({ messages: [] }, context);
+		await handler("agent_settled")({}, context); // Pi settles every accepted run
 
 		const generations = telemetry.state.observations.filter(
 			(record) => record.name === "llm-response",
@@ -3247,6 +3279,7 @@ describe("executable compatibility contract", () => {
 			context,
 		);
 		await handler("agent_end")({ messages: [] }, context);
+		await handler("agent_settled")({}, context); // Pi settles every accepted run
 
 		const requestKeys = telemetry.state.observations
 			.filter((record) => record.name === "llm-response")
@@ -3354,6 +3387,7 @@ describe("executable compatibility contract", () => {
 			context,
 		);
 		await handler("agent_end")({ messages: [] }, context);
+		await handler("agent_settled")({}, context); // Pi settles every accepted run
 
 		const generations = telemetry.state.observations.filter(
 			(record) => record.name === "llm-response",
@@ -3476,6 +3510,7 @@ describe("executable compatibility contract", () => {
 			context,
 		);
 		await handler("agent_end")({ messages: [] }, context);
+		await handler("agent_settled")({}, context); // Pi settles every accepted run
 
 		const generations = telemetry.state.observations.filter(
 			(record) => record.name === "llm-response",
@@ -3571,6 +3606,7 @@ describe("executable compatibility contract", () => {
 			context,
 		);
 		await handler("agent_end")({ messages: [] }, context);
+		await handler("agent_settled")({}, context); // Pi settles every accepted run
 
 		const generations = telemetry.state.observations.filter(
 			(record) => record.name === "llm-response",
@@ -3897,6 +3933,7 @@ describe("executable compatibility contract", () => {
 			contextA,
 		);
 		await handler("agent_end")({ messages: [] }, contextA);
+		await handler("agent_settled")({}, contextA); // Pi settles every accepted run
 
 		const traceA = latestRecord(telemetry.state.traces, "pi-agent");
 		const generationA = latestRecord(
@@ -3985,6 +4022,7 @@ describe("executable compatibility contract", () => {
 			contextB,
 		);
 		await handler("agent_end")({ messages: [] }, contextB);
+		await handler("agent_settled")({}, contextB); // Pi settles every accepted run
 
 		const traceB = telemetry.state.traces.find(
 			(record) => record.sessionId === "children-b",
@@ -4058,6 +4096,7 @@ describe("executable compatibility contract", () => {
 			context,
 		);
 		await handler("agent_end")({ messages: [failureMessage] }, context);
+		await handler("agent_settled")({}, context); // Pi settles every accepted run
 
 		expect(telemetry.state.traces).toHaveLength(1);
 		const trace = telemetry.state.traces[0];
@@ -4109,6 +4148,333 @@ describe("executable compatibility contract", () => {
 		expect(
 			records.filter((record) => record.type === "agent_prompt_start"),
 		).toHaveLength(1);
+		await handler("session_shutdown")({ reason: "quit" }, context);
+	});
+
+	it("keeps one trace across automatic retry until Pi reports settlement", async () => {
+		const agentDir = tempRoot("pi-langfuse-retry-recovery-agent-");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "retry-public",
+			"secret-key": "retry-secret",
+			"base-url": "http://retry-host",
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+		const handler = (name: string) => eventHandler(pi, name);
+		const context = {
+			model: { id: "retry-model", provider: "retry-provider" },
+			sessionManager: {
+				getSessionFile: () =>
+					"/tmp/pi-agent/sessions/--retry--/retry-session.jsonl",
+				getSessionId: () => "retry-session",
+			},
+		};
+		await handler("session_start")({ reason: "startup" }, context);
+		await handler("model_select")(
+			{ model: { id: "retry-model", provider: "retry-provider" } },
+			context,
+		);
+		await handler("before_agent_start")(
+			{
+				prompt: "retry prompt",
+				systemPrompt: "retry system",
+				systemPromptOptions: { cwd: "/tmp/retry" },
+			},
+			context,
+		);
+		await handler("agent_start")({}, context);
+		await handler("turn_start")({ turnIndex: 0 }, context);
+		await handler("before_provider_request")(
+			{ payload: { model: "retry-model" } },
+			context,
+		);
+		const failedMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "attempt failed" }],
+			model: "retry-model",
+			usage: { input: 1, output: 0, totalTokens: 1 },
+			stopReason: "error",
+			errorMessage: "503 Service Unavailable",
+		};
+		await handler("message_end")({ message: failedMessage }, context);
+		await handler("turn_end")(
+			{ turnIndex: 0, message: failedMessage, toolResults: [] },
+			context,
+		);
+		await handler("agent_end")({ messages: [failedMessage] }, context);
+
+		// Pi emits agent_end before deciding to retry: the trace must stay open
+		// because the automatic continuation never re-emits before_agent_start.
+		expect(telemetry.state.flushes).toBe(0);
+		expect(
+			latestRecord(telemetry.state.observations, "agent.prompt").endCalls,
+		).toBeUndefined();
+
+		// Pi's continuation emits a fresh agent_start/turn_start pair; its turn
+		// counter restarts at 0.
+		await handler("agent_start")({}, context);
+		await handler("turn_start")({ turnIndex: 0 }, context);
+		await handler("before_provider_request")(
+			{ payload: { model: "retry-model" } },
+			context,
+		);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "SUCCESS-ANSWER" }],
+					model: "retry-model",
+					usage: { input: 100, output: 50, totalTokens: 150 },
+				},
+			},
+			context,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "SUCCESS-ANSWER" }],
+					usage: { input: 100, output: 50, totalTokens: 150 },
+				},
+				toolResults: [],
+			},
+			context,
+		);
+		await handler("agent_end")(
+			{
+				messages: [
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "SUCCESS-ANSWER" }],
+					},
+				],
+			},
+			context,
+		);
+		await handler("agent_settled")({}, context);
+
+		expect(telemetry.state.flushes).toBe(1);
+		expect(telemetry.state.traces).toHaveLength(1);
+		const trace = telemetry.state.traces[0];
+		if (!trace) throw new Error("recovered trace was not created");
+		const observations = telemetry.state.observations.filter(
+			(record) => record.traceId === trace.id,
+		);
+		const prompts = observations.filter(
+			(record) => record.name === "agent.prompt",
+		);
+		const turns = observations.filter((record) => record.name === "agent.turn");
+		const generations = observations.filter(
+			(record) => record.name === "llm-response",
+		);
+		expect(prompts).toHaveLength(1);
+		expect(turns).toHaveLength(2);
+		expect(generations).toHaveLength(2);
+		for (const turn of turns) {
+			expect(turn.parentObservationId).toBe(prompts[0]?.id);
+		}
+		const failedGeneration = generations.find(
+			(record) => (record.end as Record<string, unknown> | undefined)?.isError,
+		);
+		const successGeneration = generations.find(
+			(record) => record !== failedGeneration,
+		);
+		expect(failedGeneration?.end).toMatchObject({
+			isError: true,
+			statusMessage: "503 Service Unavailable",
+		});
+		expect(successGeneration?.end).toMatchObject({
+			output: "SUCCESS-ANSWER",
+			usage: { input: 100, output: 50, total: 150 },
+		});
+		expect(trace.lastUpdate).toMatchObject({
+			output: "SUCCESS-ANSWER",
+			metadata: {
+				completed: true,
+				turns: 2,
+				recoveredFailure: {
+					stopReason: "error",
+					errorMessage: "503 Service Unavailable",
+				},
+				recoveredFailureCount: 1,
+			},
+		});
+		const finalMetadata = (
+			trace.lastUpdate as { metadata?: Record<string, unknown> }
+		).metadata;
+		expect(finalMetadata?.failed).toBeFalsy();
+		expect(prompts[0]?.end).toMatchObject({
+			output: "SUCCESS-ANSWER",
+			metadata: {
+				completed: true,
+				turns: 2,
+				recoveredFailureCount: 1,
+			},
+		});
+		await handler("session_shutdown")({ reason: "quit" }, context);
+	});
+
+	it("tracks a deferred custom triggerTurn run that never saw before_agent_start", async () => {
+		const agentDir = tempRoot("pi-langfuse-deferred-trigger-agent-");
+		const rawTraceDir = join(agentDir, "raw-traces");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "deferred-public",
+			"secret-key": "deferred-secret",
+			"base-url": "http://deferred-host",
+			"raw-trace-enabled": true,
+			"raw-trace-dir": rawTraceDir,
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+		const handler = (name: string) => eventHandler(pi, name);
+		const context = {
+			model: { id: "deferred-model", provider: "deferred-provider" },
+			sessionManager: {
+				getSessionFile: () =>
+					"/tmp/pi-agent/sessions/--deferred--/deferred-session.jsonl",
+				getSessionId: () => "deferred-session",
+			},
+		};
+		await handler("session_start")({ reason: "startup" }, context);
+		await handler("model_select")(
+			{ model: { id: "deferred-model", provider: "deferred-provider" } },
+			context,
+		);
+		await handler("before_agent_start")(
+			{
+				prompt: "first prompt",
+				systemPrompt: "first system",
+				systemPromptOptions: { cwd: "/tmp/deferred" },
+			},
+			context,
+		);
+		await handler("agent_start")({}, context);
+		await handler("turn_start")({ turnIndex: 0 }, context);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "first answer" }],
+					usage: { input: 1, output: 1, totalTokens: 2 },
+				},
+			},
+			context,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			context,
+		);
+		await handler("agent_end")(
+			{
+				messages: [
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "first answer" }],
+					},
+				],
+			},
+			context,
+		);
+		await handler("agent_settled")({}, context);
+
+		// pi.sendMessage(..., { triggerTurn: true }) during agent_settled
+		// defers a real agent run that starts without before_agent_start once
+		// the settled dispatch finishes. The concurrent duplicate agent_start
+		// must not open a second prompt.
+		await Promise.all([
+			handler("agent_start")({}, context),
+			handler("agent_start")({}, context),
+		]);
+		await handler("turn_start")({ turnIndex: 0 }, context);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "custom-trigger answer" }],
+					usage: { input: 2, output: 3, totalTokens: 5 },
+				},
+			},
+			context,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			context,
+		);
+		await handler("agent_end")(
+			{
+				messages: [
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "custom-trigger answer" }],
+					},
+				],
+			},
+			context,
+		);
+		await handler("agent_settled")({}, context);
+
+		expect(telemetry.state.traces).toHaveLength(2);
+		const firstTrace = telemetry.state.traces[0];
+		const secondTrace = telemetry.state.traces[1];
+		if (!firstTrace || !secondTrace) {
+			throw new Error("expected one trace per run");
+		}
+		expect(firstTrace.input).toContain("first prompt");
+		expect(firstTrace.metadata).toMatchObject({ completed: true });
+		// The deferred run has no user prompt: it must be represented without
+		// pretending the custom message was one.
+		expect(secondTrace.input).toBeUndefined();
+		expect(secondTrace.metadata).toMatchObject({
+			completed: true,
+			promptSource: "unannounced-agent-run",
+		});
+		const secondObservations = telemetry.state.observations.filter(
+			(record) => record.traceId === secondTrace.id,
+		);
+		expect(secondObservations.map((record) => record.name)).toEqual([
+			"agent.prompt",
+			"agent.turn",
+			"llm-response",
+		]);
+		expect(latestRecord(secondObservations, "agent.prompt").end).toMatchObject({
+			output: "custom-trigger answer",
+			metadata: { completed: true },
+		});
+		expect(latestRecord(secondObservations, "llm-response").end).toMatchObject({
+			output: "custom-trigger answer",
+			usage: { input: 2, output: 3, total: 5 },
+		});
+		expect(telemetry.state.flushes).toBe(2);
+
+		drainRawTraceQueue();
+		const records = readFileSync(
+			join(rawTraceDir, "--deferred--", "deferred-session.jsonl"),
+			"utf-8",
+		)
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+		const starts = records.filter(
+			(record) => record.type === "agent_prompt_start",
+		);
+		expect(starts).toHaveLength(2);
+		expect(starts[0]).toMatchObject({ prompt: "first prompt" });
+		expect(starts[0]).not.toHaveProperty("promptSource");
+		expect(starts[1]).toMatchObject({
+			prompt: "",
+			promptSource: "unannounced-agent-run",
+		});
 		await handler("session_shutdown")({ reason: "quit" }, context);
 	});
 
@@ -4222,6 +4588,10 @@ describe("executable compatibility contract", () => {
 		await Promise.all([
 			handler("agent_end")({ messages: [] }, contextA),
 			handler("agent_end")({ messages: [] }, contextA),
+		]);
+		await Promise.all([
+			handler("agent_settled")({}, contextA),
+			handler("agent_settled")({}, contextA),
 		]);
 		await handler("turn_end")(
 			{
@@ -4408,6 +4778,7 @@ describe("executable compatibility contract", () => {
 			contextC,
 		);
 		await handler("agent_end")({ messages: [] }, contextC);
+		await handler("agent_settled")({}, contextC); // Pi settles every accepted run
 
 		const traceC = telemetry.state.traces.find(
 			(record) => record.sessionId === "lifecycle-c",
@@ -4548,6 +4919,7 @@ describe("executable compatibility contract", () => {
 			context,
 		);
 		await handler("agent_end")({ messages: [] }, context);
+		await handler("agent_settled")({}, context); // Pi settles every accepted run
 		await handler("session_shutdown")({}, context);
 		drainRawTraceQueue();
 
@@ -4754,6 +5126,8 @@ describe("executable compatibility contract", () => {
 			},
 			context,
 		);
+		// Pi settles every accepted run
+		await eventHandler(pi, "agent_settled")({}, context);
 
 		const trace = latestRecord(telemetry.state.traces, "pi-agent");
 		const generation = latestRecord(
