@@ -124,6 +124,7 @@ const mocks = vi.hoisted(() => {
 				span,
 			}),
 		),
+		deleteSpan: vi.fn((_current: { span?: unknown }) => ({ span: undefined })),
 	};
 	const tracing = {
 		propagateAttributes: vi.fn(
@@ -372,6 +373,20 @@ describe("langfuse v5 runtime facade", () => {
 			traces: 0,
 			observations: 0,
 		});
+	});
+
+	it("starts each prompt root independently of any active external span", async () => {
+		const external = { id: "external-span", traceId: "c".repeat(32) };
+		await mocks.context.with({ span: external }, async () => {
+			const lf = await getRuntime(config);
+			const trace = lf.trace({ id: "a".repeat(32), name: "pi-agent" });
+			expect(trace.id).not.toBe(external.traceId);
+		});
+		expect(mocks.trace.deleteSpan).toHaveBeenCalled();
+		const root = mocks.records.find((record) => record.name === "agent.prompt");
+		if (!root) throw new Error("prompt root was not created");
+		expect(root.parentObservationId).toBeUndefined();
+		expect(root.traceId).not.toBe(external.traceId);
 	});
 
 	it("keeps an asynchronous observation context across awaited work", async () => {

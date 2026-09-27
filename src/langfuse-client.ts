@@ -433,10 +433,15 @@ function createTrace(
 		Parameters<LangfuseRuntime["trace"]>[0]
 	>;
 	rt.idGenerator.requestTraceId(shaped.id || undefined);
-	const root = propagateAttributes(propagationAttributes(shaped), () =>
-		startVendorObservation(
-			"agent.prompt",
-			observationAttributes(shaped as ObservationBody),
+	// Each Pi prompt is an independent trace: strip any ambient OTel parent so
+	// the root cannot inherit an unrelated active trace id and an unsampled
+	// external parent cannot suppress export (ParentBasedSampler).
+	const root = context.with(otelTrace.deleteSpan(context.active()), () =>
+		propagateAttributes(propagationAttributes(shaped), () =>
+			startVendorObservation(
+				"agent.prompt",
+				observationAttributes(shaped as ObservationBody),
+			),
 		),
 	);
 	const vendorRoot = root as unknown as VendorObservation;

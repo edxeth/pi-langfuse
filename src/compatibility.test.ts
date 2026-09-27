@@ -223,6 +223,8 @@ const telemetry = vi.hoisted(() => {
 				span,
 			}),
 		),
+		// Mirrors @opentelemetry/api: prompt roots strip ambient parents.
+		deleteSpan: vi.fn((_current: { span?: unknown }) => ({ span: undefined })),
 	};
 	const tracing = {
 		propagateAttributes: vi.fn(

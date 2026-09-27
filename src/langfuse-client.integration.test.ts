@@ -1,6 +1,10 @@
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { trace as otelTrace } from "@opentelemetry/api";
+import {
+	context as otelContext,
+	trace as otelTrace,
+	TraceFlags,
+} from "@opentelemetry/api";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "./config.js";
 import {
@@ -37,6 +41,36 @@ const baseConfig: Omit<Config, "host"> = {
 	localAutostartHealthUrl: "http://127.0.0.1/api/public/health",
 	localAutostartTimeoutMs: 200,
 };
+
+type ExportedOtlpSpan = {
+	traceId: string;
+	spanId: string;
+	parentSpanId?: string;
+	name: string;
+};
+
+function exportedSpans(bodies: string[]): ExportedOtlpSpan[] {
+	const spans: ExportedOtlpSpan[] = [];
+	for (const body of bodies) {
+		let payload: {
+			resourceSpans?: Array<{
+				scopeSpans?: Array<{ spans?: ExportedOtlpSpan[] }>;
+			}>;
+		};
+		try {
+			payload = JSON.parse(body);
+		} catch {
+			continue;
+		}
+		if (!payload?.resourceSpans) continue;
+		for (const resource of payload.resourceSpans) {
+			for (const scope of resource.scopeSpans ?? []) {
+				spans.push(...(scope.spans ?? []));
+			}
+		}
+	}
+	return spans;
+}
 
 describe("langfuse v5 local runtime", () => {
 	afterEach(async () => {
@@ -462,6 +496,104 @@ describe("langfuse v5 local runtime", () => {
 			).toContain("agent.prompt");
 		} finally {
 			restoreTimeouts();
+			await shutdownClient();
+			await new Promise<void>((resolve, reject) => {
+				server.close((error) => (error ? reject(error) : resolve()));
+			});
+		}
+	});
+
+	it("starts prompt roots independently of an active external OTel parent", async () => {
+		const requests: Array<{ url: string; body: string }> = [];
+		const server = createServer((request, response) => {
+			const chunks: Buffer[] = [];
+			request.on("data", (chunk: Buffer) => chunks.push(chunk));
+			request.on("end", () => {
+				requests.push({
+					url: request.url || "",
+					body: Buffer.concat(chunks).toString("utf8"),
+				});
+				response.statusCode = 200;
+				response.setHeader("content-type", "application/json");
+				response.end("{}");
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", () => resolve());
+		});
+
+		try {
+			const address = server.address() as AddressInfo;
+			const runtime = await getRuntime({
+				...baseConfig,
+				host: `http://127.0.0.1:${address.port}`,
+			});
+			const sampledExternal = otelTrace.wrapSpanContext({
+				traceId: "c".repeat(32),
+				spanId: "1".repeat(16),
+				traceFlags: TraceFlags.SAMPLED,
+				isRemote: true,
+			});
+			const unsampledExternal = otelTrace.wrapSpanContext({
+				traceId: "d".repeat(32),
+				spanId: "2".repeat(16),
+				traceFlags: TraceFlags.NONE,
+				isRemote: true,
+			});
+			const sampledPrompt = await otelContext.with(
+				otelTrace.setSpan(otelContext.active(), sampledExternal),
+				async () => {
+					const trace = runtime.trace({
+						name: "pi-agent",
+						id: "a".repeat(32),
+					});
+					const prompt = runtime.span({
+						name: "agent.prompt",
+						traceId: trace.id,
+					});
+					prompt.end({ output: "sampled-parent answer" });
+					return trace;
+				},
+			);
+			const unsampledPrompt = await otelContext.with(
+				otelTrace.setSpan(otelContext.active(), unsampledExternal),
+				async () => {
+					const trace = runtime.trace({
+						name: "pi-agent",
+						id: "b".repeat(32),
+					});
+					const prompt = runtime.span({
+						name: "agent.prompt",
+						traceId: trace.id,
+					});
+					prompt.end({ output: "unsampled-parent answer" });
+					return trace;
+				},
+			);
+			await flushClient();
+
+			// Each prompt keeps its requested identity instead of inheriting the
+			// external trace, and the unsampled parent must not suppress export.
+			expect(sampledPrompt.id).toBe("a".repeat(32));
+			expect(unsampledPrompt.id).toBe("b".repeat(32));
+			const otelPayload = requests
+				.filter(({ url }) => url.includes("otel"))
+				.map(({ body }) => body)
+				.join("\n");
+			expect(otelPayload).toContain("a".repeat(32));
+			expect(otelPayload).toContain("b".repeat(32));
+			expect(otelPayload).not.toContain("c".repeat(32));
+			expect(otelPayload).not.toContain("d".repeat(32));
+			const spans = exportedSpans(requests.map(({ body }) => body));
+			const roots = spans.filter((span) => span.name === "agent.prompt");
+			expect(roots).toHaveLength(2);
+			for (const root of roots) {
+				expect(root.parentSpanId).toBeUndefined();
+				expect(root.traceId).not.toBe("c".repeat(32));
+				expect(root.traceId).not.toBe("d".repeat(32));
+			}
+		} finally {
 			await shutdownClient();
 			await new Promise<void>((resolve, reject) => {
 				server.close((error) => (error ? reject(error) : resolve()));
