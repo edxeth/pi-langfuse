@@ -1,4 +1,13 @@
 import {
+	CAPTURE_POLICIES,
+	type CaptureField,
+	type CapturePolicy,
+	type CapturePolicyConfig,
+	DEFAULT_CAPTURE_POLICY,
+	isCaptureEnabled,
+	normalizeCapturePolicy,
+} from "./capture-policy.js";
+import {
 	isBinaryKey,
 	isSensitiveKey,
 	type RedactionConfig,
@@ -9,35 +18,18 @@ import {
 	RESPONSES_TOOL_OUTPUT_ITEM_TYPES,
 } from "./telemetry-helpers.js";
 
-export const DEFAULT_CAPTURE_POLICY = "full-debug" as const;
+export {
+	CAPTURE_POLICIES,
+	type CaptureField,
+	type CapturePolicy,
+	DEFAULT_CAPTURE_POLICY,
+	isCaptureEnabled,
+	normalizeCapturePolicy,
+};
 
-export const CAPTURE_POLICIES = [
-	"metadata-only",
-	"prompts-only",
-	"conversations",
-	"full-debug",
-] as const;
-
-export type CapturePolicy = (typeof CAPTURE_POLICIES)[number];
-
-export type CaptureField =
-	| "prompt"
-	| "systemPrompt"
-	| "providerInput"
-	| "assistantOutput"
-	| "toolInput"
-	| "toolOutput"
-	| "metadata";
-
-export interface PayloadPolicyConfig extends RedactionConfig {
-	capturePolicy?: CapturePolicy;
-	capturePrompt?: boolean;
-	captureSystemPrompt?: boolean;
-	captureProviderInput?: boolean;
-	captureAssistantOutput?: boolean;
-	captureToolInput?: boolean;
-	captureToolOutput?: boolean;
-	captureMetadata?: boolean;
+export interface PayloadPolicyConfig
+	extends CapturePolicyConfig,
+		RedactionConfig {
 	payloadMaxStringChars?: number;
 	payloadMaxToolChars?: number;
 	payloadMaxDepth?: number;
@@ -76,55 +68,6 @@ function sanitizeLimits(limits: PayloadLimits, field: CaptureField) {
 		maxNodes: limits.maxNodes,
 	};
 }
-
-const POLICY_FIELDS: Record<CapturePolicy, Record<CaptureField, boolean>> = {
-	"metadata-only": {
-		prompt: false,
-		systemPrompt: false,
-		providerInput: false,
-		assistantOutput: false,
-		toolInput: false,
-		toolOutput: false,
-		metadata: true,
-	},
-	"prompts-only": {
-		prompt: true,
-		systemPrompt: true,
-		providerInput: false,
-		assistantOutput: false,
-		toolInput: false,
-		toolOutput: false,
-		metadata: true,
-	},
-	conversations: {
-		prompt: true,
-		systemPrompt: true,
-		providerInput: true,
-		assistantOutput: true,
-		toolInput: false,
-		toolOutput: false,
-		metadata: true,
-	},
-	"full-debug": {
-		prompt: true,
-		systemPrompt: true,
-		providerInput: true,
-		assistantOutput: true,
-		toolInput: true,
-		toolOutput: true,
-		metadata: true,
-	},
-};
-
-const OVERRIDE_KEYS: Record<CaptureField, keyof PayloadPolicyConfig> = {
-	prompt: "capturePrompt",
-	systemPrompt: "captureSystemPrompt",
-	providerInput: "captureProviderInput",
-	assistantOutput: "captureAssistantOutput",
-	toolInput: "captureToolInput",
-	toolOutput: "captureToolOutput",
-	metadata: "captureMetadata",
-};
 
 const STRUCTURAL_KEYS = new Set([
 	"type",
@@ -170,32 +113,6 @@ const STRUCTURAL_KEYS = new Set([
 	"messageModel",
 	"sessionReason",
 ]);
-
-function policyFor(value: unknown): CapturePolicy {
-	return typeof value === "string" &&
-		CAPTURE_POLICIES.includes(value as CapturePolicy)
-		? (value as CapturePolicy)
-		: DEFAULT_CAPTURE_POLICY;
-}
-
-export function normalizeCapturePolicy(
-	value: unknown,
-): CapturePolicy | undefined {
-	if (typeof value !== "string") return undefined;
-	const normalized = value.trim().toLowerCase();
-	return CAPTURE_POLICIES.includes(normalized as CapturePolicy)
-		? (normalized as CapturePolicy)
-		: undefined;
-}
-
-export function isCaptureEnabled(
-	config: PayloadPolicyConfig,
-	field: CaptureField,
-): boolean {
-	const override = config[OVERRIDE_KEYS[field]];
-	if (typeof override === "boolean") return override;
-	return POLICY_FIELDS[policyFor(config.capturePolicy)][field];
-}
 
 function normalizedLimit(value: unknown, fallback: number) {
 	if (value === Infinity) return Infinity;

@@ -27,6 +27,7 @@ describe("index (extension entry)", () => {
 		delete process.env.PI_LANGFUSE_SKIP_UNPERSISTED;
 		delete process.env.PI_LANGFUSE_RAW_PROVIDER_REQUEST;
 		delete process.env.PI_LANGFUSE_CAPTURE_PROVIDER_PAYLOAD;
+		delete process.env.PI_LANGFUSE_CAPTURE_POLICY;
 		delete process.env.PI_CODING_AGENT_DIR;
 	});
 
@@ -41,7 +42,7 @@ describe("index (extension entry)", () => {
 
 	async function captureRawProviderRequestRecords(options: {
 		mode?: "full" | "off";
-		messages?: Array<{ role: string; content: string }>;
+		messages?: Array<Record<string, unknown>>;
 		contextMessages?: Array<{ role: string; content: unknown }>;
 		payload?: unknown;
 		drive?: (
@@ -482,6 +483,31 @@ describe("index (extension entry)", () => {
 		});
 		const payloadSummary = String(providerRequest?.payloadSummary);
 		expect(payloadSummary).toContain("SUMMARY-payload marker");
+	});
+
+	it("applies tool-output capture policy to flattened provider summaries", async () => {
+		process.env.PI_LANGFUSE_CAPTURE_POLICY = "conversations";
+		process.env.PI_LANGFUSE_CAPTURE_PROVIDER_PAYLOAD = "1";
+		const records = await captureRawProviderRequestRecords({
+			messages: [
+				{ role: "user", content: "POLICY-user turn" },
+				{
+					role: "tool",
+					tool_call_id: "call_1",
+					content: "POLICY-tool output",
+				},
+			],
+		});
+		const providerRequest = records.find(
+			(record) => record.type === "provider_request",
+		);
+
+		// Both flattened summary strings must exclude tool output: after
+		// serialization their internal roles are lost, so the policy has to
+		// hold at summary build time.
+		const recordJson = JSON.stringify(providerRequest);
+		expect(recordJson).not.toContain("POLICY-tool output");
+		expect(recordJson).toContain("POLICY-user turn");
 	});
 
 	it("does not let a malformed payload interrupt request tracing", async () => {

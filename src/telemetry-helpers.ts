@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { basename } from "node:path";
+import { isCaptureEnabled } from "./capture-policy.js";
 import type { Config } from "./config.js";
 import type { PiUsage, PromptState } from "./lifecycle-types.js";
 import { appendRawTrace } from "./raw-trace.js";
@@ -101,6 +102,33 @@ export function summarizeMessageContent(config: Config, content: unknown) {
 	return content == null ? "" : String(content);
 }
 
+/** Marker for message content the capture policy excludes from summaries. */
+const OMITTED_TOOL_OUTPUT = "[tool output omitted]";
+
+/** Message roles whose plain content is tool output, not conversation text. */
+const TOOL_OUTPUT_ROLES = new Set(["tool", "tool_result", "toolResult"]);
+
+/**
+ * Summarize one message's content under the capture policy for its role.
+ * Summaries are flattened strings: once serialized into payload summaries the
+ * internal roles are lost, so excluded tool output must be replaced here,
+ * before flattening, or a tool-output opt-out could never hold.
+ */
+function summarizeMessageForRole(
+	config: Config,
+	role: string | undefined,
+	content: unknown,
+) {
+	if (
+		role !== undefined &&
+		TOOL_OUTPUT_ROLES.has(role) &&
+		!isCaptureEnabled(config, "toolOutput")
+	) {
+		return OMITTED_TOOL_OUTPUT;
+	}
+	return summarizeMessageContent(config, content);
+}
+
 export function summarizeMessages(
 	config: Config,
 	messages: Array<{ role?: string; content?: unknown }>,
@@ -108,7 +136,7 @@ export function summarizeMessages(
 	const limit = 40;
 	const selected = messages.slice(-limit).map((message) => ({
 		role: message.role || "unknown",
-		content: summarizeMessageContent(config, message.content),
+		content: summarizeMessageForRole(config, message.role, message.content),
 	}));
 	if (messages.length > limit) {
 		selected.unshift({

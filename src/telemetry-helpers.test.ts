@@ -39,6 +39,11 @@ const config: Config = {
 	localAutostartTimeoutMs: 200,
 };
 
+const conversationsConfig: Config = {
+	...config,
+	capturePolicy: "conversations",
+};
+
 describe("telemetry capture fidelity", () => {
 	// Word-based filler keeps the redactor out of the way: long unbroken
 	// character runs are treated as blobs and replaced.
@@ -498,6 +503,77 @@ describe("provider payload summaries", () => {
 			role: "user",
 			content: "windowed-44",
 		});
+	});
+});
+
+describe("provider summary capture policy", () => {
+	// Chat Completions tool results and Pi-protocol toolResult messages both
+	// carry tool output as message content; excluded tool output must never
+	// reach a flattened summary string that can no longer be classified.
+	const chatToolMessage = {
+		role: "tool",
+		tool_call_id: "call_1",
+		content: "TOOL-OUTPUT-secret",
+	};
+
+	it("marks excluded tool output in message summaries", () => {
+		expect(
+			summarizeMessages(conversationsConfig, [
+				{ role: "user", content: "KEEP-user" },
+				chatToolMessage,
+			]),
+		).toEqual([
+			{ role: "user", content: "KEEP-user" },
+			{ role: "tool", content: "[tool output omitted]" },
+		]);
+	});
+
+	it("keeps tool output in summaries under the default and the override", () => {
+		expect(summarizeMessages(config, [chatToolMessage])).toEqual([
+			{ role: "tool", content: "TOOL-OUTPUT-secret" },
+		]);
+		expect(
+			summarizeMessages({ ...conversationsConfig, captureToolOutput: true }, [
+				chatToolMessage,
+			]),
+		).toEqual([{ role: "tool", content: "TOOL-OUTPUT-secret" }]);
+	});
+
+	it("flattens chat payload summaries without excluded tool output", () => {
+		const summary = summarizeProviderPayload(
+			conversationsConfig,
+			{
+				model: "m",
+				messages: [{ role: "user", content: "KEEP-user" }, chatToolMessage],
+			},
+			"fallback-model",
+		);
+		const json = JSON.stringify(summary);
+
+		expect(json).not.toContain("TOOL-OUTPUT-secret");
+		expect(json).toContain("KEEP-user");
+	});
+
+	it("marks Pi toolResult context messages by the same policy", () => {
+		const summary = summarizeMessages(conversationsConfig, [
+			{
+				role: "toolResult",
+				toolCallId: "t1",
+				content: [{ type: "text", text: "PI-TOOL-OUTPUT-secret" }],
+			},
+		] as Array<{ role?: string; content?: unknown; toolCallId?: string }>);
+
+		expect(summary).toEqual([
+			{ role: "toolResult", content: "[tool output omitted]" },
+		]);
+	});
+
+	it("keeps non-tool conversation text in summaries under exclusion policies", () => {
+		expect(
+			summarizeMessages(conversationsConfig, [
+				{ role: "assistant", content: "KEEP-assistant" },
+			]),
+		).toEqual([{ role: "assistant", content: "KEEP-assistant" }]);
 	});
 });
 
