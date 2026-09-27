@@ -6,7 +6,7 @@ Every prompt, turn, tool call, and streaming response is traced with cost and to
 
 ## Node.js 22+ release
 
-The 2.0 release line requires Node.js 22 or newer. Registry installs load the compiled `dist/index.js`; Git checkouts load `src/index.ts` directly through Pi's TypeScript extension loader. Existing trace names, raw-trace records, local Server v3 files, credentials, and volumes remain compatible.
+The 2.0 release line requires Node.js 22 or newer. Both registry and Git installs load `src/index.ts` through Pi's TypeScript extension loader. The npm API and export CLI use the compiled `dist` files. Existing trace names, raw-trace records, local Server v3 files, credentials, and volumes remain compatible.
 
 See [Migration to 2.0](./docs/migration.md) before upgrading.
 
@@ -24,7 +24,7 @@ See [Migration to 2.0](./docs/migration.md) before upgrading.
 - **Local-First Setup**: Local mode creates a self-hosted localhost Langfuse stack with generated secrets.
 - **Autostart**: Once local init is complete, the extension starts Docker Compose on demand when tracing begins.
 - **Raw Traces**: Optional redacted JSONL companion stream for training, distillation, and audit workflows.
-- **Langfuse v5 and OpenTelemetry**: Uses a typed runtime facade with bounded flush and REST fallback when a completed trace is not visible.
+- **Langfuse v5 and OpenTelemetry**: Uses a typed runtime facade with bounded flush and OTLP replay when recorded observations remain unconfirmed.
 - **Operator Commands**: Inspect status, test connectivity with an isolated trace, and change capture policy without interrupting an active run.
 
 ## Quick Start

@@ -35,7 +35,7 @@ Trace (name: "pi-agent")
     - `message_end` finalizes the generation with usage, cost, and provider metadata.
     - `turn_end` closes the turn span.
 4.  **Finalization**: `agent_settled` — Pi's final boundary after automatic retry, overflow compaction, and queued continuations — configuration refresh, session replacement, or `session_shutdown` closes unfinished child observations before the parent and updates trace health and aggregate metrics. `agent_end` only closes one low-level agent run: it records the run outcome (a healthy final run marks an earlier failure as recovered) and keeps the prompt open for continuation events that never re-emit `before_agent_start`. A prompt interrupted before settlement is finalized as abandoned by the interrupting boundary. A run that starts with no prompt at all — Pi defers `sendMessage(..., { triggerTurn: true })` issued during settlement and starts it without `before_agent_start` — gets its own trace with empty prompt input and `promptSource: "unannounced-agent-run"` metadata instead of being dropped.
-5.  **Flush and fallback**: A bounded OTel flush runs at prompt completion. If a completed trace is not visible, the facade sends one redacted REST batch attempt and retires the snapshot.
+5.  **Flush and recovery**: A bounded OTel flush runs at prompt completion. The v2 observations API confirms each recorded observation ID. Unconfirmed traces can replay through OTLP with their original IDs. Recovery retains bounded snapshots for up to three attempts and checks completeness after replay. Shutdown exhausts that bounded retry budget and reports permanent losses, even when other traces recover. Scores use the supported scores endpoint.
 
 ## State Management
 
@@ -45,8 +45,8 @@ Maps correlate turns by `turnIndex`, generations by their ordered request state 
 
 ## Truncation and privacy
 
-Payload policy runs before each Langfuse or raw-trace write. The default `full-debug` policy preserves existing capture behavior. `metadata-only`, `prompts-only`, and `conversations` reduce content capture without changing structural trace identifiers. Fine-grained overrides and payload budgets apply to strings, tool payloads, depth, collections, and total nodes.
+Payload policy runs before each Langfuse or raw-trace write. Ambiguous sensitive assignments become a redacted marker instead of retaining potentially secret text. The default `full-debug` policy preserves existing capture behavior. `metadata-only`, `prompts-only`, and `conversations` reduce content capture without changing structural trace identifiers. Fine-grained overrides and payload budgets apply to strings, tool payloads, depth, collections, and total nodes.
 
-Exports force redaction independently of live capture settings. Raw `provider_request` records store bounded summaries by default. Set `rawTraceProviderRequestMode: "full"` or `PI_LANGFUSE_RAW_PROVIDER_REQUEST=full` only for controlled runs that need the exact redacted provider request contents.
+Exports force redaction independently of live capture settings. Raw `provider_request` records store bounded summaries by default. Set `rawTraceProviderRequestMode: "full"` or `PI_LANGFUSE_RAW_PROVIDER_REQUEST=full` only for controlled runs that need the redacted contents observed at the provider hook. Later extensions can still replace that payload before transmission.
 
 See [privacy.md](./privacy.md) for the policy matrix and redaction boundary.
