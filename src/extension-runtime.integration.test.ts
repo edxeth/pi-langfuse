@@ -178,15 +178,6 @@ function setIsolatedEnvironment() {
 	process.env.PI_LANGFUSE_SKIP_UNPERSISTED = "0";
 }
 
-function exportedScores(bodies: string[]) {
-	return bodies.flatMap((body) => {
-		const payload = parsePayload(body);
-		return (payload?.batch ?? [])
-			.filter((item) => item.type === "score-create" && item.body)
-			.map((item) => item.body as Record<string, unknown>);
-	});
-}
-
 const createdRoots: string[] = [];
 
 function tempRoot(prefix: string) {
@@ -229,6 +220,7 @@ describe("registered Langfuse v5 runtime path", () => {
 		process.env.PI_LANGFUSE_RAW_TRACE_DIR = rawTraceDir;
 
 		const bodies: string[] = [];
+		const scoreBodies: Record<string, unknown>[] = [];
 		const receivedSpans: OtlpSpan[] = [];
 		const server = createServer((request, response) => {
 			const chunks: Buffer[] = [];
@@ -236,6 +228,23 @@ describe("registered Langfuse v5 runtime path", () => {
 			request.on("end", () => {
 				const body = Buffer.concat(chunks).toString("utf8");
 				bodies.push(body);
+				// A v4-shaped server: the supported routes answer, the legacy
+				// v3-only routes are gone.
+				if (request.url?.includes("/api/public/scores")) {
+					scoreBodies.push(JSON.parse(body) as Record<string, unknown>);
+					response.statusCode = 200;
+					response.setHeader("content-type", "application/json");
+					response.end(JSON.stringify({ id: "created-score" }));
+					return;
+				}
+				if (
+					request.url?.includes("/api/public/ingestion") ||
+					request.url?.includes("/api/public/traces/")
+				) {
+					response.statusCode = 404;
+					response.end("not found");
+					return;
+				}
 				// Answer the v2 observations query from received OTLP spans so the
 				// fallback completeness check behaves like a real server.
 				if (request.url?.includes("/api/public/otel/v1/traces")) {
@@ -540,12 +549,14 @@ describe("registered Langfuse v5 runtime path", () => {
 					) || "{}",
 				),
 			).toEqual({ input: 0.04, output: 0.06, total: 0.1 });
-			// Scores must carry the configured environment, matching the
-			// environment stamped on spans.
-			for (const score of exportedScores(bodies)) {
+			// Scores travel through the supported scores endpoint (the legacy
+			// ingestion route is rejected by this server) and carry the
+			// configured environment, matching the environment on spans.
+			expect(scoreBodies.length).toBeGreaterThan(0);
+			for (const score of scoreBodies) {
 				expect(score.environment).toBe("extension-test");
 			}
-			expect(exportedScores(bodies)).toEqual(
+			expect(scoreBodies).toEqual(
 				expect.arrayContaining([
 					expect.objectContaining({
 						name: "input_tokens",

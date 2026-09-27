@@ -103,20 +103,106 @@ export async function sendIsolatedTestTrace(
 	}
 	const responseBody = await response.text();
 	if (responseBody.trim()) {
-		let parsed: { partialSuccess?: { message?: unknown } } | undefined;
+		// The standard OTLP trace response reports partial rejection through
+		// rejectedSpans and errorMessage; proto3 JSON may encode the int64
+		// rejected count as a string.
+		let parsed:
+			| {
+					partialSuccess?: {
+						rejectedSpans?: number | string;
+						errorMessage?: unknown;
+					};
+			  }
+			| undefined;
 		try {
 			parsed = JSON.parse(responseBody) as {
-				partialSuccess?: { message?: unknown };
+				partialSuccess?: {
+					rejectedSpans?: number | string;
+					errorMessage?: unknown;
+				};
 			};
 		} catch {
 			parsed = undefined;
 		}
-		const partialMessage = parsed?.partialSuccess?.message;
-		if (typeof partialMessage === "string" && partialMessage.trim()) {
+		const partial = parsed?.partialSuccess;
+		const rejected = Number(partial?.rejectedSpans ?? 0);
+		if (Number.isFinite(rejected) && rejected > 0) {
 			throw new Error(
-				`isolated test trace was rejected: ${partialMessage.trim()}`,
+				`isolated test trace was rejected: server reported ${rejected} rejected span(s)`,
+			);
+		}
+		if (
+			typeof partial?.errorMessage === "string" &&
+			partial.errorMessage.trim()
+		) {
+			throw new Error(
+				`isolated test trace was rejected: ${partial.errorMessage.trim()}`,
 			);
 		}
 	}
 	return { traceId };
+}
+
+export interface TraceObservationsPollOptions {
+	auth: string;
+	baseUrl: string;
+	traceId: string;
+	expectedNames: string[];
+	intervalMs?: number;
+	maxAttempts?: number;
+}
+
+/**
+ * Polls the supported v2 observations endpoint until every expected
+ * observation name is queryable for the trace. An HTTP 200 with an empty
+ * page means indexing has not caught up, so the poll continues instead of
+ * resolving early.
+ */
+export async function pollForTraceObservations(
+	options: TraceObservationsPollOptions,
+): Promise<
+	Array<{
+		id: string;
+		name?: string | null;
+		type?: string;
+		model?: string | null;
+		usageDetails?: Record<string, number>;
+	}>
+> {
+	const intervalMs = options.intervalMs ?? 2_000;
+	const maxAttempts = options.maxAttempts ?? 10;
+	const url = `${options.baseUrl.replace(/\/$/, "")}/api/public/v2/observations?traceId=${encodeURIComponent(options.traceId)}&fields=core,basic,model,usage`;
+	for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+		const response = await fetch(url, {
+			headers: {
+				Authorization: options.auth,
+				"Content-Type": "application/json",
+			},
+		});
+		if (response.ok) {
+			const page = (await response.json()) as {
+				data?: Array<{
+					id: string;
+					name?: string | null;
+					type?: string;
+					model?: string | null;
+					usageDetails?: Record<string, number>;
+				}>;
+			};
+			const observations = page.data ?? [];
+			if (
+				options.expectedNames.every((name) =>
+					observations.some((observation) => observation.name === name),
+				)
+			) {
+				return observations;
+			}
+		}
+		if (attempt + 1 < maxAttempts) {
+			await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
+		}
+	}
+	throw new Error(
+		`observations for trace ${options.traceId} were not queryable after ${maxAttempts} attempt(s)`,
+	);
 }

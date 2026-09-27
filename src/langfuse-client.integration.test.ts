@@ -168,9 +168,7 @@ describe("langfuse v5 local runtime", () => {
 			expect(trace.id).toBe("a".repeat(32));
 			expect(activeTraceId).toBe(trace.id);
 			expect(requests.length).toBeGreaterThan(0);
-			expect(
-				requests.some(({ url }) => url.includes("otel")),
-			).toBe(true);
+			expect(requests.some(({ url }) => url.includes("otel"))).toBe(true);
 			const exported = payloads().join("\n");
 			expect(exported).toContain("local answer");
 			expect(exported).toContain("agent.prompt");
@@ -185,6 +183,11 @@ describe("langfuse v5 local runtime", () => {
 	});
 
 	it("prevents non-media data prefixes from corrupting later media", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 200,
+			traceVisibilityMs: 25,
+			pollIntervalMs: 1,
+		});
 		const requests: string[] = [];
 		const consoleError = vi
 			.spyOn(console, "error")
@@ -237,15 +240,18 @@ describe("langfuse v5 local runtime", () => {
 				),
 			).toBe(false);
 		} finally {
+			// Settle within the shortened windows; the echo server never
+			// reports observations, so retained traces discard explicitly.
 			await shutdownClient();
 			consoleError.mockRestore();
+			restoreTimeouts();
 			await new Promise<void>((resolve, reject) => {
 				server.close((error) => (error ? reject(error) : resolve()));
 			});
 		}
 	});
 
-		it("replays an unconfirmed trace over the OTLP ingestion endpoint", async () => {
+	it("replays an unconfirmed trace over the OTLP ingestion endpoint", async () => {
 		const requests: Array<{ url: string; body: string }> = [];
 		const server = createServer((request, response) => {
 			const chunks: Buffer[] = [];
@@ -272,7 +278,10 @@ describe("langfuse v5 local runtime", () => {
 			pollIntervalMs: 1,
 		});
 
-		type ReplayAttribute = { key: string; value?: { stringValue?: string; boolValue?: boolean } };
+		type ReplayAttribute = {
+			key: string;
+			value?: { stringValue?: string; boolValue?: boolean };
+		};
 		type ReplaySpan = {
 			traceId: string;
 			spanId: string;
@@ -339,7 +348,12 @@ describe("langfuse v5 local runtime", () => {
 				output: "generated answer",
 				usageDetails: { input: 4, output: 6, total: 10 },
 			});
-			tool.end({ isError: true, statusMessage: "tool failed" });
+			tool.end({
+				isError: true,
+				statusMessage: "tool failed",
+				usageDetails: { input: 2, output: 1, total: 3 },
+				costDetails: { total: 0.02 },
+			});
 			turn.end({ output: "final answer" });
 			prompt.end({ output: "final answer" });
 
@@ -375,9 +389,9 @@ describe("langfuse v5 local runtime", () => {
 			expect(attributeOf(root, "langfuse.trace.output")).toBe("final answer");
 			const generationSpan = spans.find((span) => span.name === "llm-response");
 			if (!generationSpan) throw new Error("replay is missing the generation");
-			expect(attributeOf(generationSpan, "langfuse.observation.model.name")).toBe(
-				"fallback-model",
-			);
+			expect(
+				attributeOf(generationSpan, "langfuse.observation.model.name"),
+			).toBe("fallback-model");
 			expect(
 				attributeOf(generationSpan, "langfuse.observation.usage_details"),
 			).toBe(JSON.stringify({ input: 4, output: 6, total: 10 }));
@@ -387,12 +401,17 @@ describe("langfuse v5 local runtime", () => {
 			expect(attributeOf(toolSpan, "langfuse.observation.status_message")).toBe(
 				"tool failed",
 			);
+			// SPAN-type observations keep usage and cost through the replay.
+			expect(attributeOf(toolSpan, "langfuse.observation.usage_details")).toBe(
+				JSON.stringify({ input: 2, output: 1, total: 3 }),
+			);
+			expect(attributeOf(toolSpan, "langfuse.observation.cost_details")).toBe(
+				JSON.stringify({ total: 0.02 }),
+			);
 			// The replay must be visible to the same v2 observations endpoint the
 			// fallback checks for completeness.
 			expect(
-				requests.some(({ url }) =>
-					url.includes("/api/public/v2/observations"),
-				),
+				requests.some(({ url }) => url.includes("/api/public/v2/observations")),
 			).toBe(true);
 			expect(JSON.stringify(spans)).not.toContain("sk-local-test");
 		} finally {
@@ -404,7 +423,12 @@ describe("langfuse v5 local runtime", () => {
 		}
 	});
 
-it("stamps trace identity on child spans before the prompt root exports", async () => {
+	it("stamps trace identity on child spans before the prompt root exports", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 200,
+			traceVisibilityMs: 25,
+			pollIntervalMs: 1,
+		});
 		const requests: Array<{ url: string; body: string }> = [];
 		const server = createServer((request, response) => {
 			const chunks: Buffer[] = [];
@@ -462,6 +486,7 @@ it("stamps trace identity on child spans before the prompt root exports", async 
 			expect(otelPayload).toContain(trace.id);
 		} finally {
 			await shutdownClient();
+			restoreTimeouts();
 			await new Promise<void>((resolve, reject) => {
 				server.close((error) => (error ? reject(error) : resolve()));
 			});
@@ -629,19 +654,22 @@ it("stamps trace identity on child spans before the prompt root exports", async 
 			const root = spans.find((span) => span.name === "agent.prompt");
 			if (!root) throw new Error("prompt root was not exported");
 			const attributes = otelBodies
-				.map((body) => JSON.parse(body) as {
-					resourceSpans?: Array<{
-						scopeSpans?: Array<{
-							spans?: Array<{
-								spanId?: string;
-								attributes?: Array<{
-									key?: string;
-									value?: { boolValue?: boolean };
+				.map(
+					(body) =>
+						JSON.parse(body) as {
+							resourceSpans?: Array<{
+								scopeSpans?: Array<{
+									spans?: Array<{
+										spanId?: string;
+										attributes?: Array<{
+											key?: string;
+											value?: { boolValue?: boolean };
+										}>;
+									}>;
 								}>;
 							}>;
-						}>;
-					}>;
-				})
+						},
+				)
 				.flatMap((payload) =>
 					(payload.resourceSpans ?? []).flatMap((resource) =>
 						(resource.scopeSpans ?? []).flatMap((scope) => scope.spans ?? []),

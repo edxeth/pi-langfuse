@@ -1,12 +1,9 @@
+import type { LangfuseClient } from "@langfuse/client";
+import { SpanKind, SpanStatusCode, TraceFlags } from "@opentelemetry/api";
 import { ExportResultCode, timeInputToHrTime } from "@opentelemetry/core";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
+import { JsonTraceSerializer } from "@opentelemetry/otlp-transformer";
 import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
-import {
-	SpanKind,
-	SpanStatusCode,
-	TraceFlags,
-} from "@opentelemetry/api";
-import type { LangfuseClient } from "@langfuse/client";
 
 export type RestFallbackMetadata = Record<string, unknown>;
 
@@ -109,8 +106,20 @@ export interface RestFallbackDeps {
 
 const MAX_REST_BATCH_BYTES = 3_500_000;
 const MAX_REPORTED_FAILURE_REASONS = 3;
-const MAX_FALLBACK_ATTEMPTS = 3;
-const MAX_RETAINED_FALLBACK_BYTES = 32_000_000;
+export const MAX_FALLBACK_ATTEMPTS = 3;
+let maxRetainedFallbackBytes = 32_000_000;
+
+/**
+ * Overrides the retention budget for tests; the drain treats the previous
+ * budget as restored once the returned function runs.
+ */
+export function setRestFallbackRetentionForTest(maxBytes: number) {
+	const previous = maxRetainedFallbackBytes;
+	maxRetainedFallbackBytes = maxBytes;
+	return () => {
+		maxRetainedFallbackBytes = previous;
+	};
+}
 const MAX_VISIBILITY_PAGES = 5;
 const FALLBACK_RESOURCE = { attributes: { "service.name": "pi-langfuse" } };
 const FALLBACK_SCOPE = {
@@ -404,11 +413,7 @@ function replaySpan(
 		if (traceOutput !== undefined) {
 			attributes["langfuse.trace.output"] = traceOutput;
 		}
-		setFlattenedMetadata(
-			attributes,
-			"langfuse.trace.metadata",
-			trace.metadata,
-		);
+		setFlattenedMetadata(attributes, "langfuse.trace.metadata", trace.metadata);
 		if (trace.public) attributes["langfuse.trace.public"] = true;
 	}
 	const startTime = timeInputToHrTime(new Date(observation.startTime));
@@ -465,10 +470,82 @@ function buildReplaySpans(trace: RestFallbackTrace): ReadableSpan[] {
 	);
 }
 
-function replaySpanBytes(span: ReadableSpan) {
-	// Approximation: the exporter's protobuf frame adds negligible overhead
-	// against a 3.5 MB budget, and the attribute payload dominates.
-	return Buffer.byteLength(JSON.stringify(span), "utf8");
+// Exact transmitted-size accounting. All replay spans share one resource and
+// scope, so the serialized OTLP envelope is a constant. It is derived once
+// from three probe serializations (envelope = wire(a) + wire(b) -
+// wire(a, b) + 1, the +1 being the comma between the two probe spans), and a
+// span's wire size is its own single-span serialization minus the envelope.
+// A chunk's transmitted size is then exactly the envelope plus the spans'
+// wire sizes plus one comma per additional span. This counts every array
+// element and key/value frame the way the server receives it, and the cost
+// is bounded: three tiny probe serializations per process plus one
+// serialization per span per drain.
+const FALLBACK_WIRE_PROBE_SPAN_IDS = ["p".repeat(32), "q".repeat(32)];
+
+function wireProbeSpan(id: string): ReadableSpan {
+	return {
+		name: "pi-langfuse-rest-fallback-probe",
+		kind: SpanKind.INTERNAL,
+		spanContext: () => ({
+			traceId: id,
+			spanId: "0".repeat(16),
+			traceFlags: TraceFlags.SAMPLED,
+			isRemote: false,
+		}),
+		startTime: [0, 0],
+		endTime: [0, 0],
+		status: { code: SpanStatusCode.UNSET },
+		attributes: {},
+		links: [],
+		events: [],
+		duration: [0, 0],
+		ended: true,
+		resource: FALLBACK_RESOURCE as unknown as ReadableSpan["resource"],
+		instrumentationScope: FALLBACK_SCOPE,
+		droppedAttributesCount: 0,
+		droppedEventsCount: 0,
+		droppedLinksCount: 0,
+	};
+}
+
+function serializeWire(spans: ReadableSpan[]): number {
+	const serialized = JsonTraceSerializer.serializeRequest(spans);
+	if (!serialized) {
+		throw new Error("fallback span serialization produced no bytes");
+	}
+	return serialized.byteLength;
+}
+
+let replayEnvelopeCache: number | undefined;
+
+function replayEnvelopeBytes(): number {
+	if (replayEnvelopeCache === undefined) {
+		const [probeA, probeB] = FALLBACK_WIRE_PROBE_SPAN_IDS.map(wireProbeSpan);
+		replayEnvelopeCache =
+			serializeWire([probeA]) +
+			serializeWire([probeB]) -
+			serializeWire([probeA, probeB]) +
+			1;
+	}
+	return replayEnvelopeCache;
+}
+
+const spanWireBytesCache = new WeakMap<ReadableSpan, number>();
+
+/**
+ * Wire cost of one span including its list-comma slot, so a chunk's
+ * transmitted size is exactly envelope + sum of costs - 1.
+ */
+function replaySpanWireCost(span: ReadableSpan): number {
+	const cached = spanWireBytesCache.get(span);
+	if (cached !== undefined) return cached;
+	const cost = serializeWire([span]) - replayEnvelopeBytes() + 1;
+	spanWireBytesCache.set(span, cost);
+	return cost;
+}
+
+function replayChunkWireBytes(costSum: number, spanCount: number) {
+	return replayEnvelopeBytes() + costSum - (spanCount > 0 ? 1 : 0);
 }
 
 function boundedEventList(ids: string[], max = MAX_REPORTED_FAILURE_REASONS) {
@@ -482,14 +559,14 @@ function enforceRetentionBound(
 	built: Array<{ trace: RestFallbackTrace; spans: ReadableSpan[] }>,
 ): string[] {
 	const bytesOf = (entry: { spans: ReadableSpan[] }) =>
-		entry.spans.reduce((sum, span) => sum + replaySpanBytes(span), 0);
+		entry.spans.reduce((sum, span) => sum + replaySpanWireCost(span), 0);
 	let total = 0;
 	for (const entry of built) total += bytesOf(entry);
 	const discarded: string[] = [];
 	// FIFO: the store Map preserves insertion order, so the oldest completed
 	// traces give up their recovery copies first when the budget is exceeded.
 	for (const entry of built) {
-		if (total <= MAX_RETAINED_FALLBACK_BYTES) break;
+		if (total <= maxRetainedFallbackBytes) break;
 		total -= bytesOf(entry);
 		discarded.push(entry.trace.id);
 		retireTrace(store, entry.trace);
@@ -499,7 +576,8 @@ function enforceRetentionBound(
 
 export interface BuiltReplayChunks {
 	chunks: ReadableSpan[][];
-	oversizedSpanLabels: string[];
+	/** Trace id plus rendered label for every dropped oversized span. */
+	oversizedSpans: Array<{ traceId: string; label: string }>;
 	/** Trace ids carried by each chunk, aligned with `chunks`. */
 	chunkTraceIds: Array<Set<string>>;
 }
@@ -508,41 +586,45 @@ function buildReplayChunks(
 	entries: Array<{ trace: RestFallbackTrace; spans: ReadableSpan[] }>,
 ): BuiltReplayChunks {
 	const chunks: ReadableSpan[][] = [];
-	const oversizedSpanLabels: string[] = [];
+	const oversizedSpans: Array<{ traceId: string; label: string }> = [];
 	const chunkTraceIds: Array<Set<string>> = [];
 	let current: ReadableSpan[] = [];
-	let currentBytes = 0;
+	let currentCost = 0;
 	let currentOwners = new Set<string>();
 	const closeCurrent = () => {
 		if (current.length === 0) return;
 		chunks.push(current);
 		chunkTraceIds.push(currentOwners);
 		current = [];
-		currentBytes = 0;
+		currentCost = 0;
 		currentOwners = new Set();
 	};
 	for (const { trace, spans } of entries) {
 		for (const span of spans) {
-			const bytes = replaySpanBytes(span);
-			// One span above the request limit cannot be delivered by any
-			// chunking, so it is dropped and reported instead of poisoning the
-			// whole chunk that carries it.
-			if (bytes > MAX_REST_BATCH_BYTES) {
-				oversizedSpanLabels.push(
-					`span ${span.spanContext().spanId} (${bytes} bytes)`,
-				);
+			const cost = replaySpanWireCost(span);
+			// One span whose transmitted size exceeds the request limit cannot
+			// be delivered by any chunking, so it is dropped and reported
+			// instead of poisoning the whole chunk that carries it.
+			if (replayChunkWireBytes(cost, 1) > MAX_REST_BATCH_BYTES) {
+				oversizedSpans.push({
+					traceId: trace.id,
+					label: `span ${span.spanContext().spanId} (${replayChunkWireBytes(cost, 1)} bytes)`,
+				});
 				continue;
 			}
-			if (currentBytes + bytes > MAX_REST_BATCH_BYTES) {
+			if (
+				replayChunkWireBytes(currentCost + cost, current.length + 1) >
+				MAX_REST_BATCH_BYTES
+			) {
 				closeCurrent();
 			}
 			current.push(span);
-			currentBytes += bytes;
+			currentCost += cost;
 			currentOwners.add(trace.id);
 		}
 	}
 	closeCurrent();
-	return { chunks, oversizedSpanLabels, chunkTraceIds };
+	return { chunks, oversizedSpans, chunkTraceIds };
 }
 
 async function withTimeout<T>(
@@ -695,6 +777,22 @@ function retireTrace(store: RestFallbackStore, trace: RestFallbackTrace) {
 	store.traces.delete(trace.id);
 }
 
+export interface RestFallbackDrainResult {
+	/**
+	 * Round diagnostics in reporting order; when joined they form the single
+	 * bounded line the runtime error boundary reports for this drain.
+	 */
+	problems: string[];
+	/**
+	 * Permanently lost recovery content retired during this round:
+	 * attempt-exhausted discards, retention-budget evictions, and traces
+	 * retired while carrying undeliverable oversized spans. These survive a
+	 * later round that recovers other traces and must be reported at the end
+	 * of a teardown even when the final round is clean.
+	 */
+	terminalLosses: string[];
+}
+
 export async function drainCompletedRestFallback(
 	store: RestFallbackStore,
 	deps: RestFallbackDeps,
@@ -703,29 +801,27 @@ export async function drainCompletedRestFallback(
 		visibilityTimeoutMs: number;
 		pollIntervalMs: number;
 	},
-) {
+): Promise<RestFallbackDrainResult> {
+	const result: RestFallbackDrainResult = { problems: [], terminalLosses: [] };
+	const { problems, terminalLosses } = result;
 	const candidates = [...store.traces.values()].filter(
 		(trace) => trace.completed,
 	);
-	if (candidates.length === 0) return;
+	if (candidates.length === 0) return result;
 	const built = candidates.map((trace) => ({
 		trace,
 		spans: buildReplaySpans(trace),
 	}));
 
-	const problems: string[] = [];
 	const evicted = enforceRetentionBound(store, built);
 	if (evicted.length > 0) {
-		problems.push(
-			`REST fallback discarded ${evicted.length} trace(s) beyond the ${MAX_RETAINED_FALLBACK_BYTES}-byte retention budget: ${boundedEventList(evicted)}`,
-		);
+		const message = `REST fallback discarded ${evicted.length} trace(s) beyond the ${maxRetainedFallbackBytes}-byte retention budget: ${boundedEventList(evicted)}`;
+		problems.push(message);
+		terminalLosses.push(message);
 	}
-	const retained = built.filter((entry) =>
-		store.traces.has(entry.trace.id),
-	);
+	const retained = built.filter((entry) => store.traces.has(entry.trace.id));
 	if (retained.length === 0) {
-		if (problems.length > 0) throw new Error(problems.join("; "));
-		return;
+		return result;
 	}
 
 	const checked = await Promise.all(
@@ -741,12 +837,10 @@ export async function drainCompletedRestFallback(
 		.filter(({ complete }) => !complete)
 		.map(({ entry }) => entry);
 	if (replay.length === 0) {
-		if (problems.length > 0) throw new Error(problems.join("; "));
-		return;
+		return result;
 	}
 
-	const { chunks, oversizedSpanLabels, chunkTraceIds } =
-		buildReplayChunks(replay);
+	const { chunks, oversizedSpans, chunkTraceIds } = buildReplayChunks(replay);
 	const results = await Promise.allSettled(
 		chunks.map((spans) =>
 			withTimeout(
@@ -765,33 +859,76 @@ export async function drainCompletedRestFallback(
 		for (const id of chunkTraceIds[index] ?? []) failedTraceIds.add(id);
 	});
 
+	// An accepted POST is not proof of delivery: the OTLP exporter reports
+	// success even when the response carried partialSuccess rejections, and an
+	// ambiguous failure may still have persisted data. Delivery is confirmed
+	// only by the authoritative v2 completeness check; anything unconfirmed
+	// consumes a retry attempt exactly like a failed chunk.
+	const unconfirmed = (
+		await Promise.all(
+			replay.map(async (entry) => {
+				if (failedTraceIds.has(entry.trace.id)) return undefined;
+				const confirmed = await traceIsCompleteOnServer(
+					deps,
+					entry.trace,
+					options,
+				);
+				return confirmed ? undefined : entry;
+			}),
+		)
+	).filter((entry) => entry !== undefined);
+	for (const entry of unconfirmed) failedTraceIds.add(entry.trace.id);
+
+	const sentTraceIds = new Set<string>();
+	for (const ids of chunkTraceIds) {
+		for (const id of ids) sentTraceIds.add(id);
+	}
+
 	if (failures.length > 0) {
 		const reasons = Array.from(
-			new Set(failures.map((failure) => fallbackFailureMessage(failure.reason))),
+			new Set(
+				failures.map((failure) => fallbackFailureMessage(failure.reason)),
+			),
 		);
 		// Cap the joined reasons so one terminal line stays constant-bounded even
 		// when every chunk fails for a different reason.
 		const shown = reasons.slice(0, MAX_REPORTED_FAILURE_REASONS);
 		const omitted = reasons.length - shown.length;
-		const keptForRetry = replay.filter(
-			(entry) =>
-				failedTraceIds.has(entry.trace.id) &&
-				entry.trace.attempts + 1 < MAX_FALLBACK_ATTEMPTS,
-		).length;
 		problems.push(
-			`REST fallback ingestion failed for ${failures.length}/${chunks.length} batch(es): ${shown.join("; ")}${omitted > 0 ? ` (+${omitted} more)` : ""}${keptForRetry > 0 ? `; retaining ${keptForRetry} trace(s) for a later drain` : ""}`,
+			`REST fallback ingestion failed for ${failures.length}/${chunks.length} batch(es): ${shown.join("; ")}${omitted > 0 ? ` (+${omitted} more)` : ""}`,
 		);
 	}
-	if (oversizedSpanLabels.length > 0) {
+	const unconfirmedSent = unconfirmed.filter((entry) =>
+		sentTraceIds.has(entry.trace.id),
+	);
+	const unconfirmedUndeliverable = unconfirmed.filter(
+		(entry) => !sentTraceIds.has(entry.trace.id),
+	);
+	if (unconfirmedSent.length > 0) {
 		problems.push(
-			`REST fallback ingestion dropped ${oversizedSpanLabels.length} oversized span(s) beyond the ${MAX_REST_BATCH_BYTES}-byte limit: ${boundedEventList(oversizedSpanLabels)}`,
+			`REST fallback replay for ${unconfirmedSent.length} trace(s) was sent but not confirmed by the observations API: ${boundedEventList(unconfirmedSent.map((entry) => entry.trace.id))}`,
+		);
+	}
+	if (unconfirmedUndeliverable.length > 0) {
+		problems.push(
+			`REST fallback replay for ${unconfirmedUndeliverable.length} trace(s) could not be delivered because no sendable span remained: ${boundedEventList(unconfirmedUndeliverable.map((entry) => entry.trace.id))}`,
+		);
+	}
+	if (oversizedSpans.length > 0) {
+		problems.push(
+			`REST fallback ingestion dropped ${oversizedSpans.length} oversized span(s) beyond the ${MAX_REST_BATCH_BYTES}-byte limit: ${boundedEventList(oversizedSpans.map((span) => span.label))}`,
 		);
 	}
 
-	// Settle every replayed trace: delivered traces retire, failed traces
-	// consume one attempt and are either kept for a later drain or discarded
-	// with an explicit loss diagnostic once the retry budget is spent.
+	// Settle every replayed trace: confirmed traces retire, failed or
+	// unconfirmed traces consume one attempt and are either kept for a later
+	// drain or discarded with an explicit loss diagnostic once the retry
+	// budget is spent.
+	// A trace whose spans could never be sent still consumes attempts as
+	// unconfirmed and ends in the exhaustion discard below; the oversized
+	// listing in this round's problems names exactly what no request carried.
 	const exhausted: string[] = [];
+	let keptForRetry = 0;
 	for (const { trace } of replay) {
 		if (!failedTraceIds.has(trace.id)) {
 			retireTrace(store, trace);
@@ -801,12 +938,17 @@ export async function drainCompletedRestFallback(
 		if (trace.attempts >= MAX_FALLBACK_ATTEMPTS) {
 			exhausted.push(trace.id);
 			retireTrace(store, trace);
+		} else {
+			keptForRetry += 1;
 		}
 	}
-	if (exhausted.length > 0) {
-		problems.push(
-			`REST fallback discarded ${exhausted.length} trace(s) after ${MAX_FALLBACK_ATTEMPTS} failed attempts: ${boundedEventList(exhausted)}`,
-		);
+	if (keptForRetry > 0) {
+		problems.push(`retaining ${keptForRetry} trace(s) for a later drain`);
 	}
-	if (problems.length > 0) throw new Error(problems.join("; "));
+	if (exhausted.length > 0) {
+		const message = `REST fallback discarded ${exhausted.length} trace(s) after ${MAX_FALLBACK_ATTEMPTS} failed attempts: ${boundedEventList(exhausted)}`;
+		problems.push(message);
+		terminalLosses.push(message);
+	}
+	return result;
 }

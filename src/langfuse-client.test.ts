@@ -1,3 +1,4 @@
+import { JsonTraceSerializer } from "@opentelemetry/otlp-transformer";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "./config.js";
 import {
@@ -8,6 +9,7 @@ import {
 	setRuntimeTimeoutsForTest,
 	shutdownClient,
 } from "./langfuse-client.js";
+import { setRestFallbackRetentionForTest } from "./rest-fallback.js";
 
 const mocks = vi.hoisted(() => {
 	const records: Array<Record<string, unknown>> = [];
@@ -63,7 +65,7 @@ const mocks = vi.hoisted(() => {
 
 	const exportedSpans: Array<Array<Record<string, unknown>>> = [];
 	let exportResult: { code: number; error?: Error } | "hang" = { code: 0 };
-	const OTLPTraceExporter = vi.fn(() => ({
+	const defaultExporterImplementation = () => ({
 		export: vi.fn(
 			(
 				spans: Array<Record<string, unknown>>,
@@ -71,19 +73,32 @@ const mocks = vi.hoisted(() => {
 			) => {
 				// "hang" never calls back so the drain's outer timeout fires.
 				if (exportResult === "hang") return;
-				exportedSpans.push(spans);
+				// Only accepted sends reach the fake server's index.
+				if (exportResult.code === 0) exportedSpans.push(spans);
 				callback(exportResult);
 			},
 		),
-	}));
+	});
+	const OTLPTraceExporter = vi.fn(defaultExporterImplementation);
 	const observationsGetMany = vi.fn(
-		async (): Promise<{
+		async (_request: {
+			traceId: string;
+		}): Promise<{
 			data?: Array<{ id: string }>;
 			meta?: { cursor?: string };
 		}> => ({ data: [], meta: {} }),
 	);
+	const scoresCreate = vi.fn(
+		async (
+			_body: Record<string, unknown>,
+			_options?: unknown,
+		): Promise<{ id: string }> => ({ id: "created-score" }),
+	);
 	const client = {
-		api: { observations: { getMany: observationsGetMany } },
+		api: {
+			observations: { getMany: observationsGetMany },
+			scores: { create: scoresCreate },
+		},
 		score: {
 			create: vi.fn(),
 			flush: vi.fn(async () => undefined),
@@ -163,7 +178,9 @@ const mocks = vi.hoisted(() => {
 		BasicTracerProvider,
 		AsyncHooksContextManager,
 		OTLPTraceExporter,
+		defaultExporterImplementation,
 		observationsGetMany,
+		scoresCreate,
 		exportedSpans,
 		setExportResult(result: { code: number; error?: Error } | "hang") {
 			exportResult = result;
@@ -263,6 +280,26 @@ describe("langfuse v5 runtime facade", () => {
 		);
 		if (!span) throw new Error(`exported span ${name}/${id} was not found`);
 		return span;
+	};
+
+	/**
+	 * Makes the observations view reflect received replay spans, with optional
+	 * pre-seeded ids, like a real indexing server.
+	 */
+	const observeExportedSpans = (seed?: Map<string, Set<string>>) => {
+		mocks.observationsGetMany.mockImplementation(
+			async (request: { traceId: string }) => {
+				const ids = new Set(seed?.get(request.traceId) ?? []);
+				for (const span of mocks.exportedSpans.flat() as unknown as Array<{
+					spanContext(): { traceId: string; spanId: string };
+				}>) {
+					if (span.spanContext().traceId === request.traceId) {
+						ids.add(span.spanContext().spanId);
+					}
+				}
+				return { data: [...ids].map((id) => ({ id })), meta: {} };
+			},
+		);
 	};
 
 	it("sanitizes trace, span, generation, and update/end payloads before OTel calls", async () => {
@@ -390,6 +427,7 @@ describe("langfuse v5 runtime facade", () => {
 	it("rejects a conflicting configuration while the active runtime holds observations", async () => {
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 		try {
+			observeExportedSpans();
 			const first = await getRuntime(config);
 			const trace = first.trace({ name: "pi-agent" });
 			const prompt = first.span({ name: "agent.prompt", traceId: trace.id });
@@ -445,20 +483,68 @@ describe("langfuse v5 runtime facade", () => {
 		expect(root.traceId).not.toBe(external.traceId);
 	});
 
-	it("sends the configured environment with scores", async () => {
-		const lf = await getRuntime({ ...config, environment: "staging" });
-		lf.score({ name: "tool_success_rate", value: 1, traceId: "trace-1" });
-		expect(mocks.client.score.create).toHaveBeenCalledTimes(1);
-		expect(mocks.client.score.create).toHaveBeenCalledWith(
-			expect.objectContaining({ environment: "staging" }),
-		);
+	it("sends scores through the supported scores endpoint with environment", async () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			const lf = await getRuntime({ ...config, environment: "staging" });
+			lf.score({ name: "tool_success_rate", value: 1, traceId: "trace-1" });
+			expect(mocks.scoresCreate).toHaveBeenCalledTimes(1);
+			expect(mocks.scoresCreate).toHaveBeenCalledWith(
+				expect.objectContaining({
+					environment: "staging",
+					name: "tool_success_rate",
+					value: 1,
+					traceId: "trace-1",
+				}),
+				expect.objectContaining({ maxRetries: 0 }),
+			);
 
-		const unset = await getRuntime(config);
-		unset.score({ name: "tool_success_rate", value: 1, traceId: "trace-2" });
-		const lastScore = (
-			mocks.client.score.create.mock.calls.at(-1)?.[0] ?? {}
-		) as Record<string, unknown>;
-		expect(lastScore.environment).toBeUndefined();
+			const unset = await getRuntime(config);
+			unset.score({ name: "tool_success_rate", value: 1, traceId: "trace-2" });
+			const lastScore = (mocks.scoresCreate.mock.calls.at(-1)?.[0] ??
+				{}) as Record<string, unknown>;
+			expect(lastScore.environment).toBeUndefined();
+
+			// The SDK's LANGFUSE_TRACING_ENVIRONMENT fallback must survive the
+			// direct endpoint switch, with configuration winning when both exist.
+			const previousEnv = process.env.LANGFUSE_TRACING_ENVIRONMENT;
+			process.env.LANGFUSE_TRACING_ENVIRONMENT = "env-var-env";
+			try {
+				const envOnly = await getRuntime(config);
+				envOnly.score({ name: "s", value: 1, traceId: "trace-4" });
+				const envOnlyScore = (mocks.scoresCreate.mock.calls.at(-1)?.[0] ??
+					{}) as Record<string, unknown>;
+				expect(envOnlyScore.environment).toBe("env-var-env");
+
+				const both = await getRuntime({
+					...config,
+					environment: "config-env",
+				});
+				both.score({ name: "s", value: 1, traceId: "trace-5" });
+				const bothScore = (mocks.scoresCreate.mock.calls.at(-1)?.[0] ??
+					{}) as Record<string, unknown>;
+				expect(bothScore.environment).toBe("config-env");
+			} finally {
+				if (previousEnv === undefined) {
+					delete process.env.LANGFUSE_TRACING_ENVIRONMENT;
+				} else {
+					process.env.LANGFUSE_TRACING_ENVIRONMENT = previousEnv;
+				}
+			}
+
+			// Delivery failures are explicit diagnostics, never silent drops.
+			mocks.scoresCreate.mockRejectedValueOnce(new Error("HTTP 401 denied"));
+			lf.score({ name: "failing_score", value: 0, traceId: "trace-3" });
+			await flushClient();
+			expect(getLastRuntimeError()?.message).toContain("401");
+			expect(
+				warn.mock.calls.some(([message]) =>
+					String(message).includes("Failed to send score"),
+				),
+			).toBe(true);
+		} finally {
+			warn.mockRestore();
+		}
 	});
 
 	it("applies the public flag on the OTel path without ever unpublishing", async () => {
@@ -538,10 +624,19 @@ describe("langfuse v5 runtime facade", () => {
 				mocks.observationsGetMany
 					.mockReset()
 					.mockResolvedValue({ data: [], meta: {} });
+				mocks.scoresCreate.mockReset().mockResolvedValue({ id: "score" });
 				const lf = await getRuntime(config);
 				const trace = lf.trace({ name: "pi-agent" });
 				const prompt = lf.span({ name: "agent.prompt", traceId: trace.id });
 				prompt.end({ output: "done" });
+				if (dependency === "score flush") {
+					// Hang the delivery before issuing so the in-flight promise is
+					// genuinely pending when the bounded step awaits it.
+					mocks.scoresCreate.mockImplementation(
+						() => new Promise<never>(() => {}),
+					);
+					lf.score({ name: "hanging_score", value: 1, traceId: trace.id });
+				}
 				const provider =
 					mocks.tracerProviders[mocks.tracerProviders.length - 1];
 				if (!provider) throw new Error("tracer provider was not created");
@@ -550,9 +645,7 @@ describe("langfuse v5 runtime facade", () => {
 						() => new Promise<never>(() => {}),
 					);
 				} else if (dependency === "score flush") {
-					mocks.client.flush.mockImplementation(
-						() => new Promise<never>(() => {}),
-					);
+					// A hanging in-flight score delivery must be bounded.
 				} else if (dependency === "client shutdown") {
 					mocks.client.shutdown.mockImplementation(
 						() => new Promise<never>(() => {}),
@@ -565,7 +658,6 @@ describe("langfuse v5 runtime facade", () => {
 				const startedAt = Date.now();
 				await shutdownClient();
 				expect(Date.now() - startedAt).toBeLessThan(180);
-				expect(mocks.client.flush).toHaveBeenCalledTimes(1);
 				expect(mocks.client.shutdown).toHaveBeenCalledTimes(1);
 				expect(provider.forceFlush).toHaveBeenCalledTimes(1);
 				expect(provider.shutdown).toHaveBeenCalledTimes(1);
@@ -626,6 +718,8 @@ describe("langfuse v5 runtime facade", () => {
 				output: `tool output ${secret}`,
 				isError: true,
 				statusMessage: "tool failed",
+				usageDetails: { input: 2, output: 1, total: 3 },
+				costDetails: { total: 0.02 },
 			});
 			turn.end({ output: "final answer" });
 			prompt.end({ output: "final answer" });
@@ -661,12 +755,16 @@ describe("langfuse v5 runtime facade", () => {
 			);
 			expect(
 				JSON.parse(
-					String(generationSpan.attributes["langfuse.observation.usage_details"]),
+					String(
+						generationSpan.attributes["langfuse.observation.usage_details"],
+					),
 				),
 			).toEqual({ input: 4, output: 6, total: 10 });
 			expect(
 				JSON.parse(
-					String(generationSpan.attributes["langfuse.observation.cost_details"]),
+					String(
+						generationSpan.attributes["langfuse.observation.cost_details"],
+					),
 				),
 			).toEqual({ total: 0.1 });
 			const toolSpan = exportedSpan("tool:bash", tool.id);
@@ -675,6 +773,17 @@ describe("langfuse v5 runtime facade", () => {
 			expect(toolSpan.attributes["langfuse.observation.status_message"]).toBe(
 				"tool failed",
 			);
+			// SPAN-type observations keep usage and cost through the replay.
+			expect(
+				JSON.parse(
+					String(toolSpan.attributes["langfuse.observation.usage_details"]),
+				),
+			).toEqual({ input: 2, output: 1, total: 3 });
+			expect(
+				JSON.parse(
+					String(toolSpan.attributes["langfuse.observation.cost_details"]),
+				),
+			).toEqual({ total: 0.02 });
 			expect(JSON.stringify(spans)).not.toContain(secret);
 		} finally {
 			warn.mockRestore();
@@ -734,9 +843,6 @@ describe("langfuse v5 runtime facade", () => {
 		});
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 		try {
-			mocks.observationsGetMany
-				.mockReset()
-				.mockResolvedValue({ data: [], meta: {} });
 			const lf = await getRuntime(config);
 			const trace = lf.trace({ id: "a".repeat(32), name: "pi-agent" });
 			const prompt = lf.span({ name: "agent.prompt", traceId: trace.id });
@@ -750,11 +856,12 @@ describe("langfuse v5 runtime facade", () => {
 
 			// The server knows only the root observation; the child span was
 			// lost by a failed export batch. Partial visibility must not skip
-			// the fallback replay for the missing observation.
-			mocks.observationsGetMany.mockResolvedValue({
-				data: [{ id: prompt.id }],
-				meta: {},
-			});
+			// the fallback replay for the missing observation, and the replay
+			// must be confirmed through the same view once it lands.
+			const seededRoot = new Map<string, Set<string>>([
+				[trace.id, new Set([prompt.id])],
+			]);
+			observeExportedSpans(seededRoot);
 
 			await flushClient();
 
@@ -780,14 +887,40 @@ describe("langfuse v5 runtime facade", () => {
 			pollIntervalMs: 1,
 		});
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		const sentIdentities: string[][] = [];
 		try {
-			mocks.observationsGetMany
-				.mockReset()
-				.mockResolvedValue({ data: [], meta: {} });
-			mocks.setExportResult({
-				code: 1,
-				error: new Error("HTTP 503 unavailable"),
-			});
+			observeExportedSpans();
+			const exporter = mocks.OTLPTraceExporter as unknown as {
+				mockImplementation: (impl: () => unknown) => void;
+			};
+			exporter.mockImplementation(() => ({
+				export: vi.fn(
+					(
+						spans: Array<Record<string, unknown>>,
+						callback: (result: { code: number; error?: Error }) => void,
+					) => {
+						sentIdentities.push(
+							spans
+								.map((span) =>
+									(
+										span as {
+											spanContext(): { traceId: string; spanId: string };
+										}
+									).spanContext(),
+								)
+								.map((ctx) => `${ctx.traceId}:${ctx.spanId}`)
+								.sort(),
+						);
+						if (sentIdentities.length === 1) {
+							callback({ code: 1, error: new Error("HTTP 503 unavailable") });
+							return;
+						}
+						// The accepted retry reaches the fake server's index.
+						mocks.exportedSpans.push(spans);
+						callback({ code: 0 });
+					},
+				),
+			}));
 			const lf = await getRuntime(config);
 			const trace = lf.trace({
 				id: "a".repeat(32),
@@ -798,27 +931,26 @@ describe("langfuse v5 runtime facade", () => {
 			prompt.end({ output: "done" });
 
 			await flushClient();
-			expect(mocks.exportedSpans.length).toBe(1);
+			expect(sentIdentities.length).toBe(1);
 
-			mocks.setExportResult({ code: 0 });
 			await flushClient();
-			expect(mocks.exportedSpans.length).toBe(2);
-
-			const identity = (round: number) =>
-				(mocks.exportedSpans[round] as unknown as ExportedSpan[])
-					.map((span) => `${span.spanContext().traceId}:${span.spanContext().spanId}`)
-					.sort();
+			expect(sentIdentities.length).toBe(2);
 			// The retry must reuse the original trace and span ids so the
 			// server can deduplicate an ambiguous first delivery.
-			expect(identity(1)).toEqual(identity(0));
-			expect(
-				JSON.stringify(mocks.exportedSpans[1]),
-			).toContain("retry prompt");
+			expect(sentIdentities[1]).toEqual(sentIdentities[0]);
+			expect(JSON.stringify(mocks.exportedSpans)).toContain("retry prompt");
 
 			const sendsAfterRecovery = mocks.OTLPTraceExporter.mock.calls.length;
 			await flushClient();
-			expect(mocks.OTLPTraceExporter.mock.calls.length).toBe(sendsAfterRecovery);
+			expect(mocks.OTLPTraceExporter.mock.calls.length).toBe(
+				sendsAfterRecovery,
+			);
 		} finally {
+			// Restore the shared exporter double for later tests.
+			const exporter = mocks.OTLPTraceExporter as unknown as {
+				mockImplementation: (impl: () => unknown) => void;
+			};
+			exporter.mockImplementation(mocks.defaultExporterImplementation);
 			warn.mockRestore();
 			restoreTimeouts();
 		}
@@ -862,6 +994,409 @@ describe("langfuse v5 runtime facade", () => {
 
 			await flushClient();
 			expect(mocks.OTLPTraceExporter.mock.calls.length).toBe(sendsAfterBudget);
+		} finally {
+			warn.mockRestore();
+			restoreTimeouts();
+		}
+	});
+
+	it("retries unconfirmed traces during shutdown until delivery is confirmed", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 50,
+			traceVisibilityMs: 10,
+			pollIntervalMs: 1,
+		});
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			// The observations view starts empty and reflects spans once the
+			// exporter accepts them, like a real indexing server.
+			mocks.observationsGetMany.mockImplementation(
+				async (request: { traceId: string }) => ({
+					data: mocks.exportedSpans
+						.flat()
+						.filter(
+							(span) =>
+								(span as { spanContext(): { traceId: string } }).spanContext()
+									.traceId === request.traceId,
+						)
+						.map((span) => ({
+							id: (span as { spanContext(): { spanId: string } }).spanContext()
+								.spanId,
+						})),
+					meta: {},
+				}),
+			);
+			let deliveries = 0;
+			const failingExporter = mocks.OTLPTraceExporter as unknown as {
+				mockImplementation: (impl: () => unknown) => void;
+			};
+			failingExporter.mockImplementation(() => ({
+				export: vi.fn(
+					(
+						spans: Array<Record<string, unknown>>,
+						callback: (result: { code: number; error?: Error }) => void,
+					) => {
+						deliveries += 1;
+						// The flush and the first shutdown round fail; the second
+						// shutdown round must confirm delivery and clear the
+						// transient failure instead of reporting it at the end.
+						if (deliveries <= 2) {
+							callback({ code: 1, error: new Error("HTTP 503") });
+							return;
+						}
+						mocks.exportedSpans.push(spans);
+						callback({ code: 0 });
+					},
+				),
+			}));
+			const lf = await getRuntime(config);
+			const trace = lf.trace({
+				id: "a".repeat(32),
+				name: "pi-agent",
+				input: "shutdown retry prompt",
+			});
+			const prompt = lf.span({ name: "agent.prompt", traceId: trace.id });
+			prompt.end({ output: "done" });
+
+			// A single flush fails and retains the trace; shutdown must keep
+			// retrying inside the same teardown until the server confirms.
+			await flushClient();
+			expect(deliveries).toBe(1);
+			const warnsBeforeShutdown = warn.mock.calls.length;
+
+			await shutdownClient();
+			expect(deliveries).toBe(3);
+			// The shutdown recovered the trace: it must not re-report the
+			// transient first-round failure, and must not report loss.
+			const shutdownWarnings = warn.mock.calls.slice(warnsBeforeShutdown);
+			expect(shutdownWarnings).toEqual([]);
+			const discardWarning = warn.mock.calls.find(([message]) =>
+				String(message).includes("discarded"),
+			);
+			expect(discardWarning).toBeUndefined();
+			const sendsAfterShutdown = deliveries;
+			await flushClient();
+			expect(deliveries).toBe(sendsAfterShutdown);
+		} finally {
+			// Restore the shared exporter double for later tests.
+			const exporter = mocks.OTLPTraceExporter as unknown as {
+				mockImplementation: (impl: () => unknown) => void;
+			};
+			exporter.mockImplementation(mocks.defaultExporterImplementation);
+			warn.mockRestore();
+			restoreTimeouts();
+		}
+	});
+
+	it("reports terminal loss once when one trace is discarded and another recovers", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 50,
+			traceVisibilityMs: 10,
+			pollIntervalMs: 1,
+		});
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			observeExportedSpans();
+			// B's first shutdown replay fails; the second confirms. Trace A's
+			// only span exceeds the wire limit, so it is never sendable.
+			let sends = 0;
+			const exporter = mocks.OTLPTraceExporter as unknown as {
+				mockImplementation: (impl: () => unknown) => void;
+			};
+			exporter.mockImplementation(() => ({
+				export: vi.fn(
+					(
+						spans: Array<Record<string, unknown>>,
+						callback: (result: { code: number; error?: Error }) => void,
+					) => {
+						sends += 1;
+						if (sends === 1) {
+							callback({ code: 1, error: new Error("HTTP 503") });
+							return;
+						}
+						mocks.exportedSpans.push(spans);
+						callback({ code: 0 });
+					},
+				),
+			}));
+			const lf = await getRuntime({
+				...config,
+				redactionEnabled: false,
+				payloadMaxStringChars: Infinity,
+				payloadMaxToolChars: Infinity,
+				payloadMaxDepth: Infinity,
+				payloadMaxArrayItems: Infinity,
+				payloadMaxObjectKeys: Infinity,
+				payloadMaxNodes: Infinity,
+			});
+			const doomedTrace = lf.trace({
+				id: "a".repeat(32),
+				name: "doomed-oversized",
+				input: "z".repeat(3_550_000),
+			});
+			lf.span({ name: "agent.prompt", traceId: doomedTrace.id }).end({});
+			await flushClient();
+			await flushClient();
+
+			const recoverableTrace = lf.trace({
+				id: "b".repeat(32),
+				name: "recoverable",
+			});
+			lf.span({
+				name: "agent.prompt",
+				traceId: recoverableTrace.id,
+			}).end({ output: "ok" });
+
+			const warnsBeforeShutdown = warn.mock.calls.length;
+			await shutdownClient();
+
+			// B recovered and reached the server; A never did.
+			const deliveredTraceIds = new Set(
+				allExportedSpans().map((span) => span.spanContext().traceId),
+			);
+			expect(deliveredTraceIds.has(doomedTrace.id)).toBe(false);
+			expect(deliveredTraceIds.has(recoverableTrace.id)).toBe(true);
+			// THE FINDING: the terminal discard must survive the clean round
+			// that recovered B.
+			const shutdownWarnings = warn.mock.calls
+				.slice(warnsBeforeShutdown)
+				.map(([message]) => String(message))
+				.join("\n");
+			expect(shutdownWarnings).toContain(
+				"discarded 1 trace(s) after 3 failed attempts",
+			);
+			expect(shutdownWarnings).toContain(doomedTrace.id);
+			expect(
+				warn.mock.calls
+					.slice(warnsBeforeShutdown)
+					.filter(([message]) =>
+						String(message).includes("discarded 1 trace(s)"),
+					),
+			).toHaveLength(1);
+			expect(getLastRuntimeError()?.message).toContain(
+				"discarded 1 trace(s) after 3 failed attempts",
+			);
+		} finally {
+			const exporter = mocks.OTLPTraceExporter as unknown as {
+				mockImplementation: (impl: () => unknown) => void;
+			};
+			exporter.mockImplementation(mocks.defaultExporterImplementation);
+			warn.mockRestore();
+			restoreTimeouts();
+		}
+	});
+
+	it("reports irreversible loss at shutdown when the retry budget exhausts", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 50,
+			traceVisibilityMs: 10,
+			pollIntervalMs: 1,
+		});
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			mocks.observationsGetMany
+				.mockReset()
+				.mockResolvedValue({ data: [], meta: {} });
+			mocks.setExportResult({
+				code: 1,
+				error: new Error("HTTP 503 unavailable"),
+			});
+			const lf = await getRuntime(config);
+			const trace = lf.trace({
+				id: "b".repeat(32),
+				name: "pi-agent",
+				input: "shutdown loss prompt",
+			});
+			const prompt = lf.span({ name: "agent.prompt", traceId: trace.id });
+			prompt.end({ output: "done" });
+
+			await shutdownClient();
+			const discardWarning = warn.mock.calls.find(([message]) =>
+				String(message).includes("discarded"),
+			);
+			expect(discardWarning).toBeDefined();
+			expect(String(discardWarning?.[0])).toContain(trace.id);
+			expect(String(discardWarning?.[0])).toContain("3 failed");
+			const sendsAtEnd = mocks.OTLPTraceExporter.mock.calls.length;
+			await flushClient();
+			expect(mocks.OTLPTraceExporter.mock.calls.length).toBe(sendsAtEnd);
+		} finally {
+			warn.mockRestore();
+			restoreTimeouts();
+		}
+	});
+
+	it("keeps an unconfirmed replay for retry instead of retiring it", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 20,
+			traceVisibilityMs: 10,
+			pollIntervalMs: 1,
+		});
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			// The server accepts the HTTP request but never reports the
+			// observation, so delivery stays unconfirmed (partial rejection).
+			mocks.observationsGetMany
+				.mockReset()
+				.mockResolvedValue({ data: [], meta: {} });
+			const lf = await getRuntime(config);
+			const trace = lf.trace({
+				id: "a".repeat(32),
+				name: "pi-agent",
+				input: "unconfirmed prompt",
+			});
+			const prompt = lf.span({ name: "agent.prompt", traceId: trace.id });
+			prompt.end({ output: "done" });
+
+			await flushClient();
+			expect(mocks.exportedSpans.length).toBe(1);
+			// A later drain retries the same identity instead of treating the
+			// ambiguous success as delivered.
+			await flushClient();
+			expect(mocks.exportedSpans.length).toBe(2);
+			const identity = (round: number) =>
+				(
+					mocks.exportedSpans[round] as unknown as Array<{
+						spanContext(): { spanId: string };
+					}>
+				)
+					.map((span) => span.spanContext().spanId)
+					.sort();
+			expect(identity(1)).toEqual(identity(0));
+			const unconfirmedWarning = warn.mock.calls.find(([message]) =>
+				String(message).includes("not confirmed"),
+			);
+			expect(unconfirmedWarning).toBeDefined();
+		} finally {
+			warn.mockRestore();
+			restoreTimeouts();
+		}
+	});
+
+	it("reports retention eviction at shutdown even when another trace recovers", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 50,
+			traceVisibilityMs: 10,
+			pollIntervalMs: 1,
+		});
+		const restoreRetention = setRestFallbackRetentionForTest(100_000);
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			observeExportedSpans();
+			let sends = 0;
+			const exporter = mocks.OTLPTraceExporter as unknown as {
+				mockImplementation: (impl: () => unknown) => void;
+			};
+			exporter.mockImplementation(() => ({
+				export: vi.fn(
+					(
+						spans: Array<Record<string, unknown>>,
+						callback: (result: { code: number; error?: Error }) => void,
+					) => {
+						sends += 1;
+						if (sends === 1) {
+							callback({ code: 1, error: new Error("HTTP 503") });
+							return;
+						}
+						mocks.exportedSpans.push(spans);
+						callback({ code: 0 });
+					},
+				),
+			}));
+			const lf = await getRuntime(config);
+			// A is the oldest candidate and the largest; the 100 KB budget
+			// evicts A and keeps B.
+			const evictedTrace = lf.trace({
+				id: "a".repeat(32),
+				name: "evicted",
+				input: "x ".repeat(60_000),
+			});
+			lf.span({ name: "agent.prompt", traceId: evictedTrace.id }).end({});
+			const recoverableTrace = lf.trace({
+				id: "b".repeat(32),
+				name: "recoverable",
+			});
+			lf.span({
+				name: "agent.prompt",
+				traceId: recoverableTrace.id,
+			}).end({ output: "ok" });
+
+			await shutdownClient();
+
+			const deliveredTraceIds = new Set(
+				allExportedSpans().map((span) => span.spanContext().traceId),
+			);
+			expect(deliveredTraceIds.has(evictedTrace.id)).toBe(false);
+			expect(deliveredTraceIds.has(recoverableTrace.id)).toBe(true);
+			const shutdownWarnings = warn.mock.calls
+				.map(([message]) => String(message))
+				.join("\n");
+			expect(shutdownWarnings).toContain("retention budget");
+			expect(shutdownWarnings).toContain(evictedTrace.id);
+			expect(getLastRuntimeError()?.message).toContain("retention budget");
+		} finally {
+			const exporter = mocks.OTLPTraceExporter as unknown as {
+				mockImplementation: (impl: () => unknown) => void;
+			};
+			exporter.mockImplementation(mocks.defaultExporterImplementation);
+			warn.mockRestore();
+			restoreRetention();
+			restoreTimeouts();
+		}
+	});
+
+	it("reports unsendable traces truthfully without claiming a send", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 50,
+			traceVisibilityMs: 10,
+			pollIntervalMs: 1,
+		});
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			mocks.observationsGetMany
+				.mockReset()
+				.mockResolvedValue({ data: [], meta: {} });
+			const lf = await getRuntime({
+				...config,
+				redactionEnabled: false,
+				payloadMaxStringChars: Infinity,
+				payloadMaxToolChars: Infinity,
+				payloadMaxDepth: Infinity,
+				payloadMaxArrayItems: Infinity,
+				payloadMaxObjectKeys: Infinity,
+				payloadMaxNodes: Infinity,
+			});
+			// The trace's only span exceeds the wire limit, so no request can
+			// ever carry it.
+			const doomedTrace = lf.trace({
+				id: "a".repeat(32),
+				name: "doomed-oversized",
+				input: "z".repeat(3_550_000),
+			});
+			lf.span({ name: "agent.prompt", traceId: doomedTrace.id }).end({});
+
+			await flushClient();
+			// Round diagnostics name the drop and never claim a send.
+			const flushWarnings = warn.mock.calls
+				.map(([message]) => String(message))
+				.join("\n");
+			expect(flushWarnings).toContain("oversized span(s)");
+			expect(flushWarnings).toContain(
+				"could not be delivered because no sendable span remained",
+			);
+			expect(flushWarnings).not.toContain("was sent but not confirmed");
+
+			await shutdownClient();
+
+			// The terminal discard at shutdown is explicit about the loss.
+			const shutdownWarnings = warn.mock.calls
+				.map(([message]) => String(message))
+				.join("\n");
+			expect(shutdownWarnings).toContain(
+				"discarded 1 trace(s) after 3 failed attempts",
+			);
+			expect(shutdownWarnings).toContain(doomedTrace.id);
+			expect(shutdownWarnings).not.toContain("was sent but not confirmed");
 		} finally {
 			warn.mockRestore();
 			restoreTimeouts();
@@ -923,6 +1458,160 @@ describe("langfuse v5 runtime facade", () => {
 				String(message).includes("REST fallback ingestion"),
 			);
 			expect(String(fallbackWarning?.[0])).toContain("oversized");
+			// Settle retained traces inside the shortened test windows.
+			await shutdownClient();
+		} finally {
+			warn.mockRestore();
+			restoreTimeouts();
+		}
+	});
+
+	it("bounds replay chunks by actual serialized wire size", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 20,
+			traceVisibilityMs: 10,
+			pollIntervalMs: 1,
+		});
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			observeExportedSpans();
+			const fallbackConfig = {
+				...config,
+				redactionEnabled: false,
+				payloadMaxStringChars: Infinity,
+				payloadMaxToolChars: Infinity,
+				payloadMaxDepth: Infinity,
+				payloadMaxArrayItems: Infinity,
+				payloadMaxObjectKeys: Infinity,
+				payloadMaxNodes: Infinity,
+			};
+			const lf = await getRuntime(fallbackConfig);
+			// Just under the raw cap but over it once wire framing is counted.
+			const nearLimitTrace = lf.trace({
+				id: "1".repeat(32),
+				name: "pi-agent",
+				// Raw span JSON sits just under the cap; wire framing crosses it.
+				// "y " pairs survive redaction (plain text, not base64-shaped).
+				input: "y ".repeat(874_950),
+			});
+			const nearLimitPrompt = lf.span({
+				name: "agent.prompt",
+				traceId: nearLimitTrace.id,
+			});
+			nearLimitPrompt.end({ output: "done" });
+			// Comfortably under the cap even with wire framing.
+			const fittedTrace = lf.trace({
+				id: "2".repeat(32),
+				name: "pi-agent",
+				input: "y ".repeat(862_000),
+			});
+			const fittedPrompt = lf.span({
+				name: "agent.prompt",
+				traceId: fittedTrace.id,
+			});
+			fittedPrompt.end({ output: "fitted answer" });
+			const siblingTrace = lf.trace({
+				id: "3".repeat(32),
+				name: "pi-agent",
+				input: "sibling prompt",
+			});
+			const siblingPrompt = lf.span({
+				name: "agent.prompt",
+				traceId: siblingTrace.id,
+			});
+			siblingPrompt.end({ output: "sibling answer" });
+			await flushClient();
+
+			// The actual serializer defines the wire truth: every delivered
+			// request must respect the documented 3.5 MB limit.
+			for (const spans of mocks.exportedSpans) {
+				const wire = JsonTraceSerializer.serializeRequest(spans as never);
+				if (!wire) throw new Error("serialization produced no bytes");
+				expect(wire.byteLength).toBeLessThanOrEqual(3_500_000);
+			}
+			console.time("post");
+			const sent = JSON.stringify(mocks.exportedSpans);
+			expect(sent).toContain("fitted answer");
+			expect(sent).toContain("sibling answer");
+			// The near-limit span was dropped, not delivered over the wire.
+			const deliveredTraceIds = new Set(
+				allExportedSpans().map((span) => span.spanContext().traceId),
+			);
+			expect(deliveredTraceIds.has(nearLimitTrace.id)).toBe(false);
+			expect(deliveredTraceIds.has(fittedTrace.id)).toBe(true);
+			expect(deliveredTraceIds.has(siblingTrace.id)).toBe(true);
+			expect(getLastRuntimeError()?.message).toContain("oversized");
+			// Settle retained traces inside the shortened test windows.
+			await shutdownClient();
+		} finally {
+			warn.mockRestore();
+			restoreTimeouts();
+		}
+	});
+
+	it("accounts array attributes exactly against the wire limit", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 20,
+			traceVisibilityMs: 10,
+			pollIntervalMs: 1,
+		});
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			observeExportedSpans();
+			const fallbackConfig = {
+				...config,
+				redactionEnabled: false,
+				payloadMaxStringChars: Infinity,
+				payloadMaxToolChars: Infinity,
+				payloadMaxDepth: Infinity,
+				payloadMaxArrayItems: Infinity,
+				payloadMaxObjectKeys: Infinity,
+				payloadMaxNodes: Infinity,
+			};
+			const lf = await getRuntime(fallbackConfig);
+			// The runtime facade accepts arbitrary tag arrays; 100 tags add
+			// per-element wire framing that a per-attribute estimate misses.
+			const tags = Array.from({ length: 100 }, (_, i) => `tag-${i}`);
+			const tagTrace = lf.trace({
+				id: "1".repeat(32),
+				name: "pi-agent",
+				tags,
+				input: "y ".repeat(875_200),
+			});
+			const tagPrompt = lf.span({
+				name: "agent.prompt",
+				traceId: tagTrace.id,
+			});
+			tagPrompt.end({ output: "done" });
+			const smallTrace = lf.trace({
+				id: "2".repeat(32),
+				name: "pi-agent",
+				tags,
+				input: "small prompt",
+			});
+			const smallPrompt = lf.span({
+				name: "agent.prompt",
+				traceId: smallTrace.id,
+			});
+			smallPrompt.end({ output: "small answer" });
+
+			await flushClient();
+
+			// The installed serializer defines the wire truth for every
+			// delivered request, whatever the attribute shapes are.
+			for (const spans of mocks.exportedSpans) {
+				const wire = JsonTraceSerializer.serializeRequest(spans as never);
+				if (!wire) throw new Error("serialization produced no bytes");
+				expect(wire.byteLength).toBeLessThanOrEqual(3_500_000);
+			}
+			const deliveredTraceIds = new Set(
+				allExportedSpans().map((span) => span.spanContext().traceId),
+			);
+			expect(deliveredTraceIds.has(tagTrace.id)).toBe(false);
+			expect(deliveredTraceIds.has(smallTrace.id)).toBe(true);
+			expect(getLastRuntimeError()?.message).toContain("oversized");
+			// Settle retained traces inside the shortened test windows.
+			await shutdownClient();
 		} finally {
 			warn.mockRestore();
 			restoreTimeouts();
@@ -970,6 +1659,8 @@ describe("langfuse v5 runtime facade", () => {
 			expect(getLastRuntimeError()?.message).toContain(
 				"REST fallback ingestion",
 			);
+			// Settle retained traces inside the shortened test windows.
+			await shutdownClient();
 		} finally {
 			mocks.setExportResult({ code: 0 });
 			warn.mockRestore();
@@ -1007,6 +1698,8 @@ describe("langfuse v5 runtime facade", () => {
 			expect(fallbackWarning).toHaveLength(1);
 			expect(String(fallbackWarning?.[0])).toContain("invalid observation");
 			expect(getLastRuntimeError()?.message).toContain("invalid observation");
+			// Settle retained traces inside the shortened test windows.
+			await shutdownClient();
 		} finally {
 			mocks.setExportResult({ code: 0 });
 			warn.mockRestore();
@@ -1046,6 +1739,8 @@ describe("langfuse v5 runtime facade", () => {
 			expect(warningText).toContain("HTTP 413");
 			expect(warningText).not.toContain("\n");
 			expect(warningText.length).toBeLessThan(700);
+			// Settle retained traces inside the shortened test windows.
+			await shutdownClient();
 		} finally {
 			mocks.setExportResult({ code: 0 });
 			warn.mockRestore();
@@ -1080,6 +1775,8 @@ describe("langfuse v5 runtime facade", () => {
 			expect(getLastRuntimeError()?.message).toContain(
 				"REST fallback ingestion",
 			);
+			// Settle retained traces inside the shortened test windows.
+			await shutdownClient();
 		} finally {
 			mocks.setExportResult({ code: 0 });
 			warn.mockRestore();
@@ -1143,6 +1840,8 @@ describe("langfuse v5 runtime facade", () => {
 			expect(warningText).toContain("more)");
 			expect(warningText).not.toContain("\n");
 			expect(warningText.length).toBeLessThan(1_800);
+			// Settle retained traces inside the shortened test windows.
+			await shutdownClient();
 		} finally {
 			warn.mockRestore();
 			restoreTimeouts();

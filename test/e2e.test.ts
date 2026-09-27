@@ -6,19 +6,7 @@ import {
 	getRuntime,
 	shutdownClient,
 } from "../src/langfuse-client.js";
-
-interface LangfuseTraceResponse {
-	name: string;
-	id: string;
-	tags: string[];
-	observations: Array<{
-		name: string;
-		model?: string;
-		usage?: {
-			total?: number;
-		};
-	}>;
-}
+import { pollForTraceObservations } from "../src/operator-telemetry.js";
 
 const skipE2E =
 	process.env.RUN_LANGFUSE_E2E !== "1" ||
@@ -64,11 +52,17 @@ describe.runIf(!skipE2E)("Langfuse E2E Integration", () => {
 		});
 
 		span.end({ output: "done" });
+		// End the prompt root so the trace is complete before flushing.
+		trace.end?.({ output: "done" });
 
 		// 2. Force flush to server
 		await flushClient();
 
-		// 3. Poll Langfuse API to verify retrieval
+		// 3. Poll the supported v2 observations API to verify retrieval. The
+		// legacy trace read endpoint is unavailable on Langfuse server v4,
+		// while the v2 observations endpoint is shared by v3 and v4. The poll
+		// waits for the expected observations, because a 200 with an empty
+		// page just means indexing has not caught up yet.
 		// Langfuse API uses Basic Auth with public_key:secret_key
 		const auth = Buffer.from(
 			`${config.publicKey}:${config.secretKey}`,
@@ -76,47 +70,24 @@ describe.runIf(!skipE2E)("Langfuse E2E Integration", () => {
 		const baseUrl = config.host.endsWith("/")
 			? config.host.slice(0, -1)
 			: config.host;
-		const apiUrl = `${baseUrl}/api/public/traces/${testId}`;
 
-		let retrievedTrace: LangfuseTraceResponse | null = null;
-		let attempts = 0;
-		const maxAttempts = 10;
-
-		console.log(`Polling for trace ${testId} at ${apiUrl}...`);
-
-		while (attempts < maxAttempts) {
-			const response = await fetch(apiUrl, {
-				headers: {
-					Authorization: `Basic ${auth}`,
-					"Content-Type": "application/json",
-				},
-			});
-
-			if (response.ok) {
-				retrievedTrace = (await response.json()) as LangfuseTraceResponse;
-				break;
-			}
-
-			attempts++;
-			await new Promise((resolve) => setTimeout(resolve, 2000)); // Wait 2s
-		}
-
-		expect(retrievedTrace).toBeDefined();
-		if (!retrievedTrace) throw new Error(`Trace ${testId} was not retrieved`);
-		expect(retrievedTrace.name).toBe("e2e-pi-test");
-		expect(retrievedTrace.id).toBe(testId);
-		expect(retrievedTrace.tags).toContain("env:e2e-test");
+		const observations = await pollForTraceObservations({
+			auth,
+			baseUrl,
+			traceId: testId,
+			expectedNames: ["test.parent", "test.generation"],
+		});
 
 		// Check observations count (Span + Generation)
-		expect(retrievedTrace.observations).toBeDefined();
-		expect(retrievedTrace.observations.length).toBeGreaterThanOrEqual(2);
+		expect(observations.length).toBeGreaterThanOrEqual(2);
 
-		const genObs = retrievedTrace.observations.find(
-			(o) => o.name === "test.generation",
-		);
+		const parentSpan = observations.find((o) => o.name === "test.parent");
+		expect(parentSpan).toBeDefined();
+		expect(parentSpan?.type).toBe("SPAN");
+		const genObs = observations.find((o) => o.name === "test.generation");
 		expect(genObs).toBeDefined();
 		if (!genObs) throw new Error("Generation observation was not retrieved");
 		expect(genObs.model).toBe("gpt-3.5-turbo");
-		expect(genObs?.usage?.total).toBe(10);
+		expect(genObs?.usageDetails?.total).toBe(10);
 	}, 30000); // 30s timeout for E2E
 });

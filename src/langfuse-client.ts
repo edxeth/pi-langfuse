@@ -25,6 +25,7 @@ import {
 	drainCompletedRestFallback,
 	endObservation,
 	type FallbackReplayTransport,
+	MAX_FALLBACK_ATTEMPTS,
 	type RestFallbackObservationBody,
 	type RestFallbackStore,
 	recordObservation,
@@ -174,6 +175,8 @@ interface RuntimeState {
 	readonly traces: Map<string, RuntimeTrace>;
 	readonly fallbackStore: RestFallbackStore;
 	readonly fallbackTransport: FallbackReplayTransport;
+	/** In-flight direct score deliveries, awaited on flush and shutdown. */
+	readonly pendingScores: Set<Promise<void>>;
 }
 
 class RuntimeIdGenerator {
@@ -758,14 +761,40 @@ function wrapRuntime(rt: RuntimeState, config: Config): LangfuseRuntime {
 		},
 		score(body) {
 			try {
-				// Mirror the span path: config environment wins, the SDK fills its
-				// LANGFUSE_TRACING_ENVIRONMENT fallback when unset.
-				rt.scoreClient.score.create(
-					sanitizeForTelemetry(config, {
-						environment: config.environment || undefined,
-						...body,
-					}),
-				);
+				// The SDK's queued score.create flushes through the legacy
+				// /api/public/ingestion endpoint and swallows delivery failures,
+				// so scores go directly through the supported scores endpoint and
+				// every delivery is tracked until it settles.
+				const scoresApi = rt.scoreClient.api?.scores;
+				if (!scoresApi?.create) {
+					throw new Error("Langfuse: score API is unavailable");
+				}
+				// Mirror the SDK's score precedence: configuration wins, the
+				// LANGFUSE_TRACING_ENVIRONMENT variable fills the rest, matching
+				// the environment the span processor stamps on spans.
+				const shaped = sanitizeForTelemetry(config, {
+					environment:
+						config.environment ||
+						process.env.LANGFUSE_TRACING_ENVIRONMENT ||
+						undefined,
+					...body,
+				}) as Parameters<typeof scoresApi.create>[0];
+				const delivery = scoresApi
+					.create(shaped, {
+						timeoutInSeconds: Math.max(shutdownStepTimeoutMs / 1000, 0.001),
+						maxRetries: 0,
+					})
+					.then(
+						() => undefined,
+						(error) => {
+							recordRuntimeError(error);
+							console.warn("📊 Langfuse: Failed to send score", error);
+						},
+					);
+				rt.pendingScores.add(delivery);
+				void delivery.finally(() => {
+					rt.pendingScores.delete(delivery);
+				});
 			} catch (error) {
 				recordRuntimeError(error);
 				console.warn("📊 Langfuse: Failed to send score", error);
@@ -810,6 +839,7 @@ function createRuntime(config: Config): RuntimeState {
 			publicKey: config.publicKey,
 			secretKey: config.secretKey,
 		}),
+		pendingScores: new Set(),
 	};
 }
 
@@ -838,16 +868,25 @@ async function withTimeout<T>(
 	}
 }
 
-async function shutdownRuntime(rt: RuntimeState) {
-	finalizeOpenTraces(rt);
-	try {
-		await withTimeout("OTel force flush", rt.tracerProvider.forceFlush());
-	} catch (error) {
-		recordRuntimeError(error);
-		console.warn("📊 Langfuse: Failed to flush OpenTelemetry spans", error);
-	}
-	try {
-		await drainCompletedRestFallback(
+/**
+ * Drains completed fallback traces with bounded retries so a shutdown or
+ * configuration replacement cannot discard copies it still claims to retain.
+ * Each round lets the drain's own attempt accounting discard exhausted
+ * traces. Permanent losses (exhausted discards, retention evictions, traces
+ * retired with undeliverable spans) are tracked separately from transient
+ * round errors and reported once at the end, so a later round that recovers
+ * other traces cannot erase them, while a teardown that ends fully
+ * delivered stays silent.
+ */
+async function drainUntilSettled(rt: RuntimeState) {
+	const terminalLosses: string[] = [];
+	let lastRoundProblems: string[] | undefined;
+	for (let round = 0; round < MAX_FALLBACK_ATTEMPTS; round += 1) {
+		const hasCandidates = Array.from(rt.fallbackStore.traces.values()).some(
+			(trace) => trace.completed,
+		);
+		if (!hasCandidates) break;
+		const result = await drainCompletedRestFallback(
 			rt.fallbackStore,
 			{ client: rt.scoreClient, transport: rt.fallbackTransport },
 			{
@@ -856,12 +895,51 @@ async function shutdownRuntime(rt: RuntimeState) {
 				pollIntervalMs: traceVisibilityPollIntervalMs,
 			},
 		);
-	} catch (error) {
+		terminalLosses.push(...result.terminalLosses);
+		// A round that ends clean makes any earlier round's transient failure
+		// stale; only the final round's problems remain candidates for
+		// reporting, and never as loss claims.
+		lastRoundProblems =
+			result.problems.length > 0 ? result.problems : undefined;
+	}
+	const remaining = Array.from(rt.fallbackStore.traces.values()).filter(
+		(trace) => trace.completed,
+	);
+	const finalMessages = [...terminalLosses];
+	if (remaining.length > 0) {
+		// The attempt budget should have discarded everything by now; report
+		// any survivor as an explicit loss instead of dropping it silently.
+		finalMessages.push(
+			`Langfuse: ${remaining.length} completed trace(s) could not be confirmed or delivered before shutdown and were discarded: ${remaining.map((trace) => trace.id).join(", ")}`,
+		);
+	}
+	if (finalMessages.length > 0) {
+		const error = new Error(finalMessages.join("; "));
+		recordRuntimeError(error);
+		console.warn(`📊 Langfuse: ${runtimeErrorMessage(error)}`);
+		return;
+	}
+	if (lastRoundProblems !== undefined) {
+		// The store is empty, so these are round diagnostics whose traces all
+		// settled (for example a final round's failed sends elsewhere); report
+		// them without loss claims.
+		const error = new Error(lastRoundProblems.join("; "));
 		recordRuntimeError(error);
 		console.warn(`📊 Langfuse: ${runtimeErrorMessage(error)}`);
 	}
+}
+
+async function shutdownRuntime(rt: RuntimeState) {
+	finalizeOpenTraces(rt);
 	try {
-		await withTimeout("Langfuse score flush", rt.scoreClient.flush());
+		await withTimeout("OTel force flush", rt.tracerProvider.forceFlush());
+	} catch (error) {
+		recordRuntimeError(error);
+		console.warn("📊 Langfuse: Failed to flush OpenTelemetry spans", error);
+	}
+	await drainUntilSettled(rt);
+	try {
+		await withTimeout("Langfuse score flush", Promise.all(rt.pendingScores));
 	} catch (error) {
 		recordRuntimeError(error);
 		console.warn("📊 Langfuse: Failed to flush Langfuse scores", error);
@@ -911,7 +989,7 @@ export function flushClient() {
 			console.warn("📊 Langfuse: Failed to flush OpenTelemetry spans", error);
 		}
 		try {
-			await drainCompletedRestFallback(
+			const result = await drainCompletedRestFallback(
 				runtime.fallbackStore,
 				{ client: runtime.scoreClient, transport: runtime.fallbackTransport },
 				{
@@ -920,12 +998,22 @@ export function flushClient() {
 					pollIntervalMs: traceVisibilityPollIntervalMs,
 				},
 			);
+			if (result.problems.length > 0) {
+				const error = new Error(result.problems.join("; "));
+				recordRuntimeError(error);
+				console.warn(`📊 Langfuse: ${runtimeErrorMessage(error)}`);
+			}
 		} catch (error) {
+			// The drain only throws on internal defects; round diagnostics are
+			// carried by the typed result.
 			recordRuntimeError(error);
 			console.warn(`📊 Langfuse: ${runtimeErrorMessage(error)}`);
 		}
 		try {
-			await withTimeout("Langfuse score flush", runtime.scoreClient.flush());
+			await withTimeout(
+				"Langfuse score flush",
+				Promise.all(runtime.pendingScores),
+			);
 		} catch (error) {
 			recordRuntimeError(error);
 			console.warn("📊 Langfuse: Failed to flush Langfuse scores", error);

@@ -36,6 +36,7 @@ interface FakeTelemetryState {
 	scores: Array<Record<string, unknown>>;
 	flushes: number;
 	shutdowns: number;
+	received: Array<{ traceId: string; spanId: string }>;
 }
 
 const telemetry = vi.hoisted(() => {
@@ -45,6 +46,7 @@ const telemetry = vi.hoisted(() => {
 		scores: [],
 		flushes: 0,
 		shutdowns: 0,
+		received: [],
 	};
 	let nextId = 0;
 	let activeSpan: { id: string; traceId: string } | undefined;
@@ -80,6 +82,11 @@ const telemetry = vi.hoisted(() => {
 			parentObservationId: parent?.id,
 		});
 		state.observations.push(record);
+		// Index the span like a server that received the normal export.
+		state.received.push({
+			traceId: String(record.traceId),
+			spanId: String(record.id),
+		});
 		if (!parent) {
 			if (body.input !== undefined) owningTrace.input = body.input;
 			if (body.output !== undefined) owningTrace.output = body.output;
@@ -163,6 +170,22 @@ const telemetry = vi.hoisted(() => {
 	}
 
 	const client = {
+		api: {
+			observations: {
+				getMany: vi.fn(async (request: { traceId: string }) => ({
+					data: state.received
+						.filter((span) => span.traceId === request.traceId)
+						.map((span) => ({ id: span.spanId })),
+					meta: {},
+				})),
+			},
+			scores: {
+				create: vi.fn(async (body: Record<string, unknown>) => {
+					state.scores.push(body);
+					return { id: `score-${state.scores.length}` };
+				}),
+			},
+		},
 		score: {
 			create: vi.fn((body: Record<string, unknown>) => {
 				state.scores.push(body);
@@ -274,6 +297,7 @@ const telemetry = vi.hoisted(() => {
 			state.traces.length = 0;
 			state.observations.length = 0;
 			state.scores.length = 0;
+			state.received.length = 0;
 			state.flushes = 0;
 			state.shutdowns = 0;
 			nextId = 0;
@@ -316,7 +340,20 @@ vi.mock("@opentelemetry/sdk-trace-base", () => ({
 vi.mock("@opentelemetry/exporter-trace-otlp-http", () => ({
 	OTLPTraceExporter: vi.fn(() => ({
 		export: vi.fn(
-			(_spans: unknown, callback: (result: { code: number }) => void) => {
+			(
+				spans: Array<{
+					spanContext(): { traceId: string; spanId: string };
+				}>,
+				callback: (result: { code: number }) => void,
+			) => {
+				// Replayed spans index like any accepted delivery.
+				for (const span of spans) {
+					const ctx = span.spanContext();
+					telemetry.state.received.push({
+						traceId: ctx.traceId,
+						spanId: ctx.spanId,
+					});
+				}
 				callback({ code: 0 });
 			},
 		),
@@ -776,6 +813,7 @@ describe("executable compatibility contract", () => {
 			scores: telemetry.state.scores,
 			flushes: telemetry.state.flushes,
 			shutdowns: telemetry.state.shutdowns,
+			received: telemetry.state.received,
 		};
 		expect(() => assertTraceHierarchy(telemetry.state)).not.toThrow();
 		expect(() => assertTraceHierarchy(incompatible)).toThrow(/pi-agent/);
