@@ -55,14 +55,14 @@
 		"image": "https://raw.githubusercontent.com/edxeth/pi-langfuse/main/docs/screenshot-trace.png"
 	},
 	"dependencies": {
-		"@langfuse/client": "^5.9.1",
-		"@langfuse/otel": "^5.9.1",
-		"@langfuse/tracing": "^5.9.1",
+		"@langfuse/client": "^5.11.1",
+		"@langfuse/otel": "^5.11.1",
+		"@langfuse/tracing": "^5.11.1",
 		"@opentelemetry/api": "^1.9.1",
-		"@opentelemetry/context-async-hooks": "^2.9.0",
-		"@opentelemetry/core": "^2.9.0",
+		"@opentelemetry/context-async-hooks": "^2.11.0",
+		"@opentelemetry/core": "^2.11.0",
 		"@opentelemetry/exporter-trace-otlp-http": "^0.220.0",
-		"@opentelemetry/sdk-trace-base": "^2.9.0"
+		"@opentelemetry/sdk-trace-base": "^2.11.0"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.3.5",
@@ -75,7 +75,7 @@
 	},
 	"peerDependencies": {
 		"@axnic/pi-extension-settings": "^0.2.0",
-		"@earendil-works/pi-coding-agent": "*"
+		"@earendil-works/pi-coding-agent": ">=0.87.1"
 	},
 	"peerDependenciesMeta": {
 		"@axnic/pi-extension-settings": {
