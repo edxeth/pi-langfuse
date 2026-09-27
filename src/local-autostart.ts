@@ -24,7 +24,10 @@ function warnOnce(message: string) {
 	console.warn(`📊 Langfuse: ${message}`);
 }
 
-export async function ensureLocalLangfuseStarted(config: Config) {
+export async function ensureLocalLangfuseStarted(
+	config: Config,
+	spawnImpl: typeof spawn = spawn,
+) {
 	if (!config.localAutostart) return;
 	if (process.env.PI_LANGFUSE_AUTOSTART === "0") return;
 	if (attempted) return;
@@ -47,10 +50,15 @@ export async function ensureLocalLangfuseStarted(config: Config) {
 	}
 
 	try {
-		const child = spawn("docker", ["compose", "up", "-d"], {
+		const child = spawnImpl("docker", ["compose", "up", "-d"], {
 			cwd: config.localAutostartDir,
 			detached: true,
 			stdio: "ignore",
+		});
+		// Spawn failures surface asynchronously; without this listener an
+		// ENOENT becomes an unhandled 'error' event that terminates Pi.
+		child.on("error", (error) => {
+			warnOnce(`failed to autostart local Langfuse: ${String(error)}`);
 		});
 		child.unref();
 	} catch (error) {
