@@ -286,6 +286,49 @@ describe("index (extension entry)", () => {
 		expect(providerRequest).not.toHaveProperty("messagesSummary");
 	});
 
+	it("applies tool capture policy to nested blocks in full raw requests", async () => {
+		process.env.PI_LANGFUSE_CAPTURE_POLICY = "conversations";
+		const records = await captureRawProviderRequestRecords({
+			mode: "full",
+			messages: [
+				{
+					role: "assistant",
+					content: [
+						{ type: "text", text: "NESTED-answer" },
+						{
+							type: "tool_use",
+							id: "call_1",
+							name: "bash",
+							input: { command: "NESTED-tool arguments" },
+						},
+					],
+				},
+				{
+					role: "user",
+					content: [
+						{
+							type: "tool_result",
+							tool_use_id: "call_1",
+							content: [
+								{ type: "text", text: "NESTED-tool output" },
+							],
+						},
+					],
+				},
+			] as Array<Record<string, unknown>>,
+		});
+		const providerRequest = records.find(
+			(record) => record.type === "provider_request",
+		);
+
+		expect(providerRequest).toMatchObject({ captureMode: "full" });
+		const recordJson = JSON.stringify(providerRequest);
+		expect(recordJson).not.toContain("NESTED-tool arguments");
+		expect(recordJson).not.toContain("NESTED-tool output");
+		expect(recordJson).toContain("NESTED-answer");
+		expect(recordJson).toContain("call_1");
+	});
+
 	it("omits provider_request records when explicitly disabled", async () => {
 		const records = await captureRawProviderRequestRecords({
 			mode: "off",

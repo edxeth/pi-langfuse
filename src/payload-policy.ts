@@ -307,6 +307,22 @@ function toolCallItemField(key: string): CaptureField | undefined {
 	return key === "arguments" || key === "input" ? "toolInput" : undefined;
 }
 
+/** Wire content-block types that carry tool-call request data. */
+const TOOL_USE_BLOCK_TYPES = new Set(["tool_use"]);
+
+/** Wire content-block types that carry tool result data. */
+const TOOL_RESULT_BLOCK_TYPES = new Set(["tool_result"]);
+
+/** Fields that hold role message content and can nest tool blocks. */
+function isRoleContentField(field: CaptureField): boolean {
+	return (
+		field === "prompt" ||
+		field === "systemPrompt" ||
+		field === "assistantOutput" ||
+		field === "toolOutput"
+	);
+}
+
 /** Reasoning contents are never captured; id/type stay for correlation. */
 function reasoningItemField(key: string): CaptureField | "exclude" | undefined {
 	if (key === "summary" || key === "content" || key === "encrypted_content") {
@@ -371,6 +387,91 @@ function shapeMessageEntries(
 	return output;
 }
 
+/** Shape one message content block: tool blocks follow tool capture policy. */
+function shapeMessageContentBlock(
+	config: PayloadPolicyConfig,
+	defaultField: CaptureField,
+	block: Record<string, unknown>,
+	options: ShapeOptions,
+	limits: PayloadLimits,
+	state: ShapeState,
+): unknown {
+	if (state.nodes >= limits.maxNodes) return undefined;
+	state.nodes += 1;
+	const blockType = typeof block.type === "string" ? block.type : "";
+	const isToolUseBlock = TOOL_USE_BLOCK_TYPES.has(blockType);
+	const isToolResultBlock = TOOL_RESULT_BLOCK_TYPES.has(blockType);
+	if (!isToolUseBlock && !isToolResultBlock) {
+		return shapeValueWithState(
+			config,
+			defaultField,
+			block,
+			options,
+			limits,
+			state,
+		);
+	}
+	const output: Record<string, unknown> = {};
+	let contentKeys = 0;
+	for (const [key, item] of Object.entries(block)) {
+		if (state.nodes >= limits.maxNodes || contentKeys >= limits.maxObjectKeys)
+			break;
+		const field = isToolUseBlock
+			? (toolCallItemField(key) ?? "metadata")
+			: key === "content"
+				? "toolOutput"
+				: "metadata";
+		const shaped = shapeValueForKey(
+			config,
+			key,
+			field,
+			item,
+			options,
+			limits,
+			state,
+		);
+		if (shaped === undefined) continue;
+		output[key] = shaped;
+		contentKeys += 1;
+	}
+	return output;
+}
+
+/**
+ * Shape the content blocks of a role-bearing message. Recognized tool blocks
+ * (Anthropic tool_use/tool_result) are classified per key so nested tool data
+ * cannot bypass tool capture opt-outs; every other block keeps the enclosing
+ * message's field.
+ */
+function shapeMessageContentBlocks(
+	config: PayloadPolicyConfig,
+	field: CaptureField,
+	blocks: unknown[],
+	options: ShapeOptions,
+	limits: PayloadLimits,
+	state: ShapeState,
+): unknown[] {
+	const output: unknown[] = [];
+	const itemLimit = Math.min(blocks.length, limits.maxArrayItems);
+	for (let index = 0; index < itemLimit; index += 1) {
+		if (state.nodes >= limits.maxNodes) break;
+		const block = blocks[index];
+		const shaped =
+			block && typeof block === "object" && !Array.isArray(block)
+				? shapeMessageContentBlock(
+						config,
+						field,
+						block as Record<string, unknown>,
+						options,
+						limits,
+						state,
+					)
+				: shapeValueWithState(config, field, block, options, limits, state);
+		if (shaped !== undefined) output.push(shaped);
+	}
+	return output;
+}
+
 /** Shape one non-role key of a provider message; undefined means dropped. */
 function shapeMessageEntry(
 	config: PayloadPolicyConfig,
@@ -385,9 +486,22 @@ function shapeMessageEntry(
 	const itemField = itemType ? responsesItemField(itemType, key) : undefined;
 	if (itemField === "exclude") return undefined;
 	const field = itemField ?? messageField(role, key);
-	return field === "providerInput"
-		? shapeProviderInputValue(config, item, options, limits, state)
-		: shapeValueForKey(config, key, field, item, options, limits, state);
+	if (field === "providerInput") {
+		return shapeProviderInputValue(config, item, options, limits, state);
+	}
+	if (isRoleContentField(field) && Array.isArray(item)) {
+		if (!options.forceCapture && !isCaptureEnabled(config, field))
+			return undefined;
+		return shapeMessageContentBlocks(
+			config,
+			field,
+			item,
+			options,
+			limits,
+			state,
+		);
+	}
+	return shapeValueForKey(config, key, field, item, options, limits, state);
 }
 
 function shapeProviderInputValue<T>(

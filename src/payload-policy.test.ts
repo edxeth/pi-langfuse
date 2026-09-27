@@ -490,6 +490,80 @@ describe("payload policy", () => {
 		expect(JSON.stringify(shaped)).not.toContain("LEAK-nested");
 	});
 
+	// Role-bearing Anthropic messages carry tool data inside their content
+	// blocks (tool_use.input on assistant messages, tool_result content on
+	// user messages). Nested blocks must follow tool capture policy instead
+	// of the enclosing message's field.
+	const anthropicFullMessages = () => [
+		{
+			role: "user",
+			content: [{ type: "text", text: "ANTHROPIC-user text" }],
+		},
+		{
+			role: "assistant",
+			content: [
+				{ type: "text", text: "ANTHROPIC-answer" },
+				{
+					type: "tool_use",
+					id: "call_1",
+					name: "bash",
+					input: { command: "ANTHROPIC-tool-arguments" },
+				},
+			],
+		},
+		{
+			role: "user",
+			content: [
+				{
+					type: "tool_result",
+					tool_use_id: "call_1",
+					content: [{ type: "text", text: "ANTHROPIC-tool output" }],
+				},
+			],
+		},
+	];
+
+	it("honors tool opt-outs on nested Anthropic tool blocks in full raw records", () => {
+		const shaped = shapeRawTraceRecord(
+			{
+				...baseConfig,
+				capturePolicy: "conversations",
+				captureToolInput: false,
+				captureToolOutput: false,
+			},
+			{
+				type: "provider_request",
+				captureMode: "full",
+				messages: anthropicFullMessages(),
+			},
+			
+		);
+		const json = JSON.stringify(shaped);
+
+		expect(json).not.toContain("ANTHROPIC-tool-arguments");
+		expect(json).not.toContain("ANTHROPIC-tool output");
+		// Conversation text and block correlation stay.
+		expect(json).toContain("ANTHROPIC-answer");
+		expect(json).toContain("ANTHROPIC-user text");
+		expect(json).toContain("call_1");
+		expect(json).toContain("bash");
+	});
+
+	it("captures nested Anthropic tool blocks under full-debug", () => {
+		const shaped = shapeRawTraceRecord(
+			{ ...baseConfig },
+			{
+				type: "provider_request",
+				captureMode: "full",
+				messages: anthropicFullMessages(),
+			},
+		);
+		const json = JSON.stringify(shaped);
+
+		expect(json).toContain("ANTHROPIC-tool-arguments");
+		expect(json).toContain("ANTHROPIC-tool output");
+	});
+
 	it("excludes reasoning contents from full raw records at every policy", () => {
 		for (const capturePolicy of ["conversations", "full-debug"] as const) {
 			const shaped = shapeRawTraceRecord(
