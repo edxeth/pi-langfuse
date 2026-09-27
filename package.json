@@ -10,7 +10,8 @@
 	},
 	"files": [
 		"dist",
-		"docs"
+		"docs",
+		"src"
 	],
 	"scripts": {
 		"build": "tsc",
@@ -20,12 +21,13 @@
 		"test": "vitest run",
 		"test:e2e": "RUN_LANGFUSE_E2E=1 vitest run test/e2e.test.ts",
 		"test:watch": "vitest",
-		"prepare": "husky",
+		"prepare": "node scripts/prepare-husky.mjs",
 		"prepack": "npm run build",
 		"audit:production": "npm audit --omit=dev --omit=peer --audit-level=high",
 		"package:smoke": "node scripts/package-smoke.mjs",
+		"git-install:smoke": "node scripts/git-install-smoke.mjs",
 		"release": "release-it",
-		"verify:release": "npm run audit:production && npm run package:smoke"
+		"verify:release": "npm run audit:production && npm run package:smoke && npm run git-install:smoke"
 	},
 	"lint-staged": {
 		"src/**/*.{js,ts,json}": "biome check --write",
@@ -48,7 +50,7 @@
 	],
 	"pi": {
 		"extensions": [
-			"./dist/index.js"
+			"./src/index.ts"
 		],
 		"image": "https://raw.githubusercontent.com/edxeth/pi-langfuse/main/docs/screenshot.jpg"
 	},

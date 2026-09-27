@@ -6,7 +6,7 @@ Every prompt, turn, tool call, and streaming response is traced with cost and to
 
 ## Node.js 22+ release
 
-Version 2.0.0 requires Node.js 22 or newer. The package keeps `dist/index.js` as its Pi extension entrypoint. Existing trace names, raw-trace records, local Server v3 files, credentials, and volumes remain compatible.
+Version 2.0.0 requires Node.js 22 or newer. Registry installs load the compiled `dist/index.js`; Git checkouts load `src/index.ts` directly through Pi's TypeScript extension loader. Existing trace names, raw-trace records, local Server v3 files, credentials, and volumes remain compatible.
 
 See [Migration to 2.0](./docs/migration.md) before upgrading.
 
@@ -34,6 +34,8 @@ See [Migration to 2.0](./docs/migration.md) before upgrading.
 ```bash
 pi install git:github.com/edxeth/pi-langfuse
 ```
+
+Git installs run from TypeScript sources through Pi's extension loader, so no build step is required. Registry installs ship the compiled `dist/` build and behave identically at runtime. The `pi-langfuse-export` CLI is compiled at publish time; when working from a Git checkout, build it with a development install (`npm install && npm run build`).
 
 ### Local self-hosted (recommended)
 
