@@ -94,7 +94,7 @@ const MAX_REPORTED_FAILURE_REASONS = 3;
 const FALLBACK_METADATA = {
 	source: "pi-langfuse",
 	fallback: "rest-ingestion",
-	reason: "otel-trace-not-visible-after-flush",
+	reason: "otel-trace-incomplete-after-flush",
 };
 
 export function createRestFallbackStore(): RestFallbackStore {
@@ -418,13 +418,13 @@ function delay(ms: number) {
 	return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
-async function traceIsVisible(
+async function serverObservationIds(
 	client: LangfuseClient,
 	traceId: string,
 	timeoutMs: number,
-) {
+): Promise<Set<string> | undefined> {
 	const traceApi = client.api?.trace;
-	if (!traceApi?.get) return false;
+	if (!traceApi?.get) return undefined;
 	const controller = new AbortController();
 	try {
 		const response = await withTimeout(
@@ -437,32 +437,47 @@ async function traceIsVisible(
 			timeoutMs,
 			() => controller.abort(),
 		);
-		return response !== undefined;
+		const ids = new Set<string>();
+		for (const observation of response?.observations ?? []) {
+			if (typeof observation?.id === "string") ids.add(observation.id);
+		}
+		return ids;
 	} catch {
-		return false;
+		return undefined;
 	}
 }
 
-async function waitForTraceVisibility(
+/**
+ * A trace only counts as delivered when every recorded observation is
+ * confirmed on the server. Existence of the trace row alone is not enough:
+ * the exporter can split one trace across batches and reject some of them.
+ * A failed or unavailable check is reported as unconfirmed so the replay
+ * path re-sends with stable identities instead of silently skipping.
+ */
+async function traceIsCompleteOnServer(
 	client: LangfuseClient,
-	traceId: string,
+	trace: RestFallbackTrace,
 	options: {
 		requestTimeoutMs: number;
 		visibilityTimeoutMs: number;
 		pollIntervalMs: number;
 	},
 ) {
+	const expected = trace.observations.map((observation) => observation.id);
 	const deadline = Date.now() + options.visibilityTimeoutMs;
 	while (Date.now() < deadline) {
 		const remaining = deadline - Date.now();
-		if (
-			await traceIsVisible(
-				client,
-				traceId,
-				Math.min(options.requestTimeoutMs, remaining),
-			)
-		)
-			return true;
+		const serverIds = await serverObservationIds(
+			client,
+			trace.id,
+			Math.min(options.requestTimeoutMs, remaining),
+		);
+		if (serverIds !== undefined) {
+			if (expected.every((id) => serverIds.has(id))) return true;
+			// Reachable but not yet complete: keep polling, the export may still
+			// be settling server-side. A persistent gap is replayed after the
+			// deadline.
+		}
 		const sleepMs = Math.min(options.pollIntervalMs, deadline - Date.now());
 		if (sleepMs <= 0) break;
 		await delay(sleepMs);
@@ -561,14 +576,14 @@ export async function drainCompletedRestFallback(
 	if (candidates.length === 0) return;
 	for (const trace of candidates) trace.attempted = true;
 	try {
-		const visible = await Promise.all(
+		const checked = await Promise.all(
 			candidates.map(async (trace) => ({
 				trace,
-				visible: await waitForTraceVisibility(client, trace.id, options),
+				complete: await traceIsCompleteOnServer(client, trace, options),
 			})),
 		);
-		const missing = visible
-			.filter(({ visible: isVisible }) => !isVisible)
+		const missing = checked
+			.filter(({ complete }) => !complete)
 			.map(({ trace }) => trace);
 		if (missing.length === 0) return;
 		const { batches, oversizedEventLabels } = buildBatches(missing);

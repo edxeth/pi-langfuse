@@ -315,7 +315,7 @@ describe("langfuse v5 local runtime", () => {
 			);
 			expect(fallbackRequest.metadata).toMatchObject({
 				fallback: "rest-ingestion",
-				reason: "otel-trace-not-visible-after-flush",
+				reason: "otel-trace-incomplete-after-flush",
 			});
 			expect(fallbackRequest.batch).toEqual(
 				expect.arrayContaining([

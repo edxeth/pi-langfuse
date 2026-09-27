@@ -57,7 +57,11 @@ const mocks = vi.hoisted(() => {
 		return raw;
 	}
 
-	const traceGet = vi.fn(async () => ({ id: "visible-trace" }));
+	const traceGet = vi.fn(
+		async (): Promise<{ id: string; observations?: Array<{ id: string }> }> => ({
+			id: "visible-trace",
+		}),
+	);
 	const ingestionBatch = vi.fn(
 		async (): Promise<{ successes: unknown[]; errors: unknown[] }> => ({
 			successes: [],
@@ -656,6 +660,57 @@ describe("langfuse v5 runtime facade", () => {
 			await shutdownClient();
 			expect(mocks.ingestionBatch).toHaveBeenCalledTimes(calls.length);
 		} finally {
+			restoreTimeouts();
+		}
+	});
+
+	it("recovers a visible trace whose recorded observations are incomplete", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 20,
+			traceVisibilityMs: 10,
+			pollIntervalMs: 1,
+		});
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			mocks.ingestionBatch
+				.mockReset()
+				.mockResolvedValue({ successes: [], errors: [] });
+			const lf = await getRuntime(config);
+			const trace = lf.trace({ id: "a".repeat(32), name: "pi-agent" });
+			const prompt = lf.span({ name: "agent.prompt", traceId: trace.id });
+			const turn = lf.span({
+				name: "agent.turn",
+				traceId: trace.id,
+				parentObservationId: prompt.id,
+			});
+			turn.end({ output: "turn done" });
+			prompt.end({ output: "done" });
+
+			// The server knows the trace and its root, but the child span was
+			// lost by a failed export batch. Existence alone must not skip the
+			// fallback replay for the missing observation.
+			mocks.traceGet.mockReset().mockResolvedValue({
+				id: "visible-trace",
+				observations: [{ id: prompt.id }],
+			});
+
+			await flushClient();
+
+			expect(mocks.ingestionBatch).toHaveBeenCalledTimes(1);
+			const [request] = (mocks.ingestionBatch.mock.calls as unknown as Array<[
+				unknown,
+			]>)[0] ?? [];
+			if (!request) throw new Error("fallback request was not captured");
+			const sent = JSON.stringify(request);
+			expect(sent).toContain(turn.id);
+			// A successful replay of the missing child reports no failure.
+			const fallbackWarning = warn.mock.calls.find(([message]) =>
+				String(message).includes("REST fallback"),
+			);
+			expect(fallbackWarning).toBeUndefined();
+		} finally {
+			mocks.ingestionBatch.mockResolvedValue({ successes: [], errors: [] });
+			warn.mockRestore();
 			restoreTimeouts();
 		}
 	});
