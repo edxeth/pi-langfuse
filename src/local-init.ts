@@ -503,12 +503,14 @@ export async function runLangfuseInit(
 		}
 	}
 
+	let localBinding: LocalBinding | undefined;
 	if (options.mode === "local") {
 		const binding = parseLocalHostBinding(options.host);
 		if ("error" in binding) {
 			ctx.ui.notify(`Langfuse init refused: ${binding.error}`, "error");
 			return;
 		}
+		localBinding = binding;
 		options = { ...options, host: binding.url };
 	}
 
@@ -541,15 +543,10 @@ export async function runLangfuseInit(
 		return;
 	}
 
-	if (options.mode === "local") {
-		const binding = parseLocalHostBinding(options.host);
-		if ("error" in binding) {
-			ctx.ui.notify(`Langfuse init refused: ${binding.error}`, "error");
-			return;
-		}
+	if (options.mode === "local" && localBinding) {
 		await safeWrite(
 			join(options.dir, "docker-compose.yml"),
-			dockerComposeFile(binding.webPort),
+			dockerComposeFile(localBinding.webPort),
 		);
 		await safeWrite(join(options.dir, ".env"), envFile(options, keys));
 	}

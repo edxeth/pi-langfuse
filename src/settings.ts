@@ -337,7 +337,22 @@ function saveSettingsFile(values: Record<string, Record<string, unknown>>) {
 				unknown
 			>;
 		} catch {
-			fullContent = {};
+			// Rewriting from an empty object here would destroy unrelated
+			// preferences stored by other extensions in the shared file.
+			throw new Error(
+				`Refusing to update ${file}: existing settings.json is not valid JSON. Fix or remove the file by hand; its original bytes were not modified.`,
+			);
+		}
+		// Valid non-object documents (arrays, scalars) would silently drop the
+		// extension settings on write; refuse them like malformed JSON.
+		if (
+			typeof fullContent !== "object" ||
+			fullContent === null ||
+			Array.isArray(fullContent)
+		) {
+			throw new Error(
+				`Refusing to update ${file}: existing settings.json must contain a JSON object. Fix or remove the file by hand; its original bytes were not modified.`,
+			);
 		}
 	}
 

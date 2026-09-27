@@ -6,6 +6,7 @@ import {
 	EXTENSION_ID,
 	getSettingsValues,
 	getStoredSettingsValues,
+	setSettingsValues,
 } from "./settings.js";
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -22,6 +23,9 @@ vi.mock("node:fs", async (importOriginal) => {
 describe("settings", () => {
 	beforeEach(() => {
 		vi.mocked(fs.existsSync).mockReturnValue(false);
+		vi.mocked(fs.readFileSync).mockClear();
+		vi.mocked(fs.writeFileSync).mockClear();
+		vi.mocked(fs.mkdirSync).mockClear();
 		delete process.env.PI_CODING_AGENT_DIR;
 	});
 
@@ -75,5 +79,70 @@ describe("settings", () => {
 		};
 		const values = getStoredSettingsValues(mockPi as unknown as ExtensionAPI);
 		expect(values.enabled).toBe(false);
+	});
+
+	it("should merge written values with unrelated existing preferences", () => {
+		vi.mocked(fs.existsSync).mockReturnValue(true);
+		vi.mocked(fs.readFileSync).mockReturnValue(
+			JSON.stringify({
+				theme: "dark",
+				"extensions:settings": { "other-ext": { keep: true } },
+			}),
+		);
+
+		setSettingsValues({ enabled: false });
+
+		expect(fs.writeFileSync).toHaveBeenCalledOnce();
+		const written = JSON.parse(
+			vi.mocked(fs.writeFileSync).mock.calls[0][1] as string,
+		);
+		expect(written.theme).toBe("dark");
+		expect(written["extensions:settings"]["other-ext"]).toEqual({ keep: true });
+		expect(written["extensions:settings"][EXTENSION_ID]).toEqual({
+			enabled: false,
+		});
+	});
+
+	it("should refuse the write and keep original bytes when settings.json is malformed", () => {
+		const malformed = '{"theme":"dark","packages":{,,,}';
+		vi.mocked(fs.existsSync).mockReturnValue(true);
+		vi.mocked(fs.readFileSync).mockReturnValue(malformed);
+
+		let message = "";
+		try {
+			setSettingsValues({ enabled: false });
+		} catch (error) {
+			message = String((error as Error).message);
+		}
+
+		expect(message).toContain("settings.json");
+		expect(message).toContain("not valid JSON");
+		expect(fs.writeFileSync).not.toHaveBeenCalled();
+		// The only read was the parse attempt; no write ever rewrote the file.
+		expect(
+			vi
+				.mocked(fs.readFileSync)
+				.mock.results.every((r) => r.value === malformed),
+		).toBe(true);
+	});
+
+	it("should refuse non-object JSON documents with actionable errors", () => {
+		const nonObjects = ["[]", "42", "null", '"just a string"'];
+		for (const raw of nonObjects) {
+			vi.mocked(fs.writeFileSync).mockClear();
+			vi.mocked(fs.existsSync).mockReturnValue(true);
+			vi.mocked(fs.readFileSync).mockReturnValue(raw);
+
+			let message = "";
+			try {
+				setSettingsValues({ enabled: false });
+			} catch (error) {
+				message = String((error as Error).message);
+			}
+
+			expect(message).toContain("settings.json");
+			expect(message).toContain("JSON object");
+			expect(fs.writeFileSync).not.toHaveBeenCalled();
+		}
 	});
 });
