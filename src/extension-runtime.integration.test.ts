@@ -540,6 +540,11 @@ describe("registered Langfuse v5 runtime path", () => {
 					) || "{}",
 				),
 			).toEqual({ input: 0.04, output: 0.06, total: 0.1 });
+			// Scores must carry the configured environment, matching the
+			// environment stamped on spans.
+			for (const score of exportedScores(bodies)) {
+				expect(score.environment).toBe("extension-test");
+			}
 			expect(exportedScores(bodies)).toEqual(
 				expect.arrayContaining([
 					expect.objectContaining({

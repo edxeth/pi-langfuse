@@ -445,6 +445,22 @@ describe("langfuse v5 runtime facade", () => {
 		expect(root.traceId).not.toBe(external.traceId);
 	});
 
+	it("sends the configured environment with scores", async () => {
+		const lf = await getRuntime({ ...config, environment: "staging" });
+		lf.score({ name: "tool_success_rate", value: 1, traceId: "trace-1" });
+		expect(mocks.client.score.create).toHaveBeenCalledTimes(1);
+		expect(mocks.client.score.create).toHaveBeenCalledWith(
+			expect.objectContaining({ environment: "staging" }),
+		);
+
+		const unset = await getRuntime(config);
+		unset.score({ name: "tool_success_rate", value: 1, traceId: "trace-2" });
+		const lastScore = (
+			mocks.client.score.create.mock.calls.at(-1)?.[0] ?? {}
+		) as Record<string, unknown>;
+		expect(lastScore.environment).toBeUndefined();
+	});
+
 	it("applies the public flag on the OTel path without ever unpublishing", async () => {
 		const lf = await getRuntime(config);
 		const publicTrace = lf.trace({ name: "pi-agent", public: true });

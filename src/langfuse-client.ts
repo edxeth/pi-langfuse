@@ -758,7 +758,14 @@ function wrapRuntime(rt: RuntimeState, config: Config): LangfuseRuntime {
 		},
 		score(body) {
 			try {
-				rt.scoreClient.score.create(sanitizeForTelemetry(config, body));
+				// Mirror the span path: config environment wins, the SDK fills its
+				// LANGFUSE_TRACING_ENVIRONMENT fallback when unset.
+				rt.scoreClient.score.create(
+					sanitizeForTelemetry(config, {
+						environment: config.environment || undefined,
+						...body,
+					}),
+				);
 			} catch (error) {
 				recordRuntimeError(error);
 				console.warn("📊 Langfuse: Failed to send score", error);
