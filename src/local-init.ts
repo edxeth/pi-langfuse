@@ -400,9 +400,9 @@ async function safeWrite(path: string, content: string) {
 	if (existsSync(path)) {
 		throw new Error(`Refusing to overwrite existing file: ${path}`);
 	}
-	await writeFile(path, content, {
-		mode: path.endsWith(".env") ? 0o600 : 0o644,
-	});
+	// .env and pi-langfuse.json carry secrets; compose stays world-readable
+	const ownerOnly = path.endsWith(".env") || path.endsWith("pi-langfuse.json");
+	await writeFile(path, content, { mode: ownerOnly ? 0o600 : 0o644 });
 }
 
 export async function runLangfuseInit(
@@ -470,7 +470,8 @@ export async function runLangfuseInit(
 		return;
 	}
 
-	await mkdir(options.dir, { recursive: true });
+	// 0700 applies only to directories created here; existing dirs keep their mode
+	await mkdir(options.dir, { recursive: true, mode: 0o700 });
 	const keys =
 		options.mode === "local"
 			? {

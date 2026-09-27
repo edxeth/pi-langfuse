@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -61,6 +61,34 @@ describe("/langfuse-init", () => {
 		expect(notifications.at(-1)?.message).toContain(
 			"Local Langfuse initialized",
 		);
+	});
+
+	it("writes secret-bearing files with owner-only permissions", async () => {
+		await runLangfuseInit("--yes --no-start", createContext([]));
+
+		const dir = join(agentDir, "langfuse");
+		const configMode = (await stat(join(dir, "pi-langfuse.json"))).mode & 0o777;
+		const envMode = (await stat(join(dir, ".env"))).mode & 0o777;
+		const composeMode =
+			(await stat(join(dir, "docker-compose.yml"))).mode & 0o777;
+		const dirMode = (await stat(dir)).mode & 0o777;
+
+		// umask-independent: no access for group or other on secrets or the container dir
+		expect(configMode & 0o077).toBe(0);
+		expect(envMode & 0o077).toBe(0);
+		expect(dirMode & 0o077).toBe(0);
+		expect(composeMode & 0o022).toBe(0);
+	});
+
+	it("writes remote pi-langfuse.json with owner-only permissions", async () => {
+		await runLangfuseInit(
+			"--yes --remote --public-key pk-test --secret-key sk-test",
+			createContext([]),
+		);
+
+		const configMode =
+			(await stat(join(agentDir, "langfuse", "pi-langfuse.json"))).mode & 0o777;
+		expect(configMode & 0o077).toBe(0);
 	});
 
 	it("lets the interactive wizard choose remote setup", async () => {

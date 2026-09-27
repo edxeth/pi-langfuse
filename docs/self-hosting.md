@@ -16,7 +16,7 @@ The command creates `$PI_CODING_AGENT_DIR/langfuse/` with:
 - `.env` with generated database, storage, and Langfuse initialization secrets;
 - `pi-langfuse.json` with the generated project keys and local host.
 
-The generated services bind their published ports to localhost. The generated `.env` file uses mode `0600`. Treat `pi-langfuse.json` as a secret-bearing configuration file as well.
+The generated services bind their published ports to localhost. The generated `.env` and `pi-langfuse.json` files use mode `0600`, and a newly created init directory uses mode `0700`. Treat `pi-langfuse.json` as a secret-bearing configuration file as well.
 
 Init refuses a non-empty directory and does not overwrite existing files.
 
