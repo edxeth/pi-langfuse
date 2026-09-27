@@ -112,13 +112,15 @@ const TOOL_OUTPUT_ROLES = new Set(["tool", "tool_result", "toolResult"]);
  * Summarize one message's content under the capture policy for its role.
  * Summaries are flattened strings: once serialized into payload summaries the
  * internal roles are lost, so excluded tool output must be replaced here,
- * before flattening, or a tool-output opt-out could never hold.
+ * before flattening, or a tool-output opt-out could never hold. Pi system
+ * message sections render into the system summary so the observed request's
+ * system prompt is not lost to the empty content string.
  */
 function summarizeMessageForRole(
 	config: Config,
-	role: string | undefined,
-	content: unknown,
+	message: { role?: string; content?: unknown; sections?: unknown },
 ) {
+	const role = message.role;
 	if (
 		role !== undefined &&
 		TOOL_OUTPUT_ROLES.has(role) &&
@@ -126,17 +128,21 @@ function summarizeMessageForRole(
 	) {
 		return OMITTED_TOOL_OUTPUT;
 	}
-	return summarizeMessageContent(config, content);
+	const sectionsText =
+		role === "system" && isRecord(message)
+			? systemMessageSectionsText(message)
+			: undefined;
+	return summarizeMessageContent(config, sectionsText ?? message.content);
 }
 
 export function summarizeMessages(
 	config: Config,
-	messages: Array<{ role?: string; content?: unknown }>,
+	messages: Array<{ role?: string; content?: unknown; sections?: unknown }>,
 ) {
 	const limit = 40;
 	const selected = messages.slice(-limit).map((message) => ({
 		role: message.role || "unknown",
-		content: summarizeMessageForRole(config, message.role, message.content),
+		content: summarizeMessageForRole(config, message),
 	}));
 	if (messages.length > limit) {
 		selected.unshift({
@@ -159,11 +165,32 @@ export function summarizeProviderPayload(
 		model: typeof data.model === "string" ? data.model : fallbackModel,
 		// Only input-shaped payloads carry a source marker; Chat Completions
 		// summaries keep the legacy shape (no source key) unchanged.
-		source: contents && contents.field !== "messages" ? "input" : undefined,
+		source:
+			contents && contents.field !== "messages"
+				? providerRequestSourceMarker(contents.field)
+				: undefined,
 		messageCount: requestItemCount(contents),
-		messages: summarizeProviderRequestForDisplay(config, contents),
+		messages: summarizeProviderRequestForDisplay(
+			config,
+			contents,
+			systemInstructionFrom(data, contents),
+		),
 		keys: Object.keys(data).slice(0, 50),
 	};
+}
+
+/** Summary display marker for a recognized contents field. */
+function providerRequestSourceMarker(
+	field: ProviderRequestContents["field"],
+): string {
+	switch (field) {
+		case "contents":
+			return "contents";
+		case "context-messages":
+			return "context";
+		default:
+			return "input";
+	}
 }
 
 /** Wire item count of recognized contents: items length, one for text. */
@@ -176,18 +203,172 @@ function requestItemCount(contents: ProviderRequestContents | undefined) {
 function summarizeProviderRequestForDisplay(
 	config: Config,
 	contents: ProviderRequestContents | undefined,
+	systemInstruction?: string,
 ) {
 	if (!contents) return undefined;
-	if (contents.field === "messages") {
-		return summarizeMessages(
+	if (contents.field === "contents") {
+		return summarizeGoogleContents(config, contents.items, systemInstruction);
+	}
+	if (contents.field === "input-items") {
+		return summarizeProviderRequestInput(config, contents.items);
+	}
+	if (contents.field === "input-text") {
+		return summarizeProviderRequestInput(config, contents.text);
+	}
+	return withLeadingSystemInstruction(
+		config,
+		summarizeMessages(
 			config,
 			contents.items as Array<{ role?: string; content?: unknown }>,
-		);
-	}
-	return summarizeProviderRequestInput(
-		config,
-		contents.field === "input-items" ? contents.items : contents.text,
+		),
+		systemInstruction,
 	);
+}
+
+/**
+ * Summarize captured provider request contents for any recognized shape with
+ * the same per-item bounds and redaction chat messages receive. Used for raw
+ * provider_request summaries and generation inputs alike.
+ */
+export function summarizeProviderRequestContents(
+	config: Config,
+	contents: ProviderRequestContents | undefined,
+	systemInstruction?: string,
+) {
+	if (!contents) return undefined;
+	if (contents.field === "contents") {
+		return summarizeGoogleContents(config, contents.items, systemInstruction);
+	}
+	if (contents.field === "input-items") {
+		return summarizeProviderRequestInput(config, contents.items);
+	}
+	if (contents.field === "input-text") {
+		return summarizeProviderRequestInput(config, contents.text);
+	}
+	return withLeadingSystemInstruction(
+		config,
+		summarizeMessages(
+			config,
+			contents.items as Array<{ role?: string; content?: unknown }>,
+		),
+		systemInstruction,
+	);
+}
+
+/** Prepend a bounded system-instruction summary item when one was observed. */
+function withLeadingSystemInstruction(
+	config: Config,
+	summary: Array<{ role: string; content: string }> | undefined,
+	systemInstruction: string | undefined,
+) {
+	if (!summary || !systemInstruction) return summary;
+	summary.unshift({
+		role: "system",
+		content: telemetryText(
+			config,
+			systemInstruction,
+			config.traceInputMaxChars,
+		),
+	});
+	return summary;
+}
+
+const GOOGLE_CONTENTS_ITEM_WINDOW = 40;
+const GOOGLE_CONTENTS_PART_WINDOW = 20;
+
+/** Summarize one Google Generative AI part; tool and thought parts stay structural. */
+function summarizeGooglePart(part: unknown): string | undefined {
+	if (!part || typeof part !== "object") {
+		return typeof part === "string" ? part : undefined;
+	}
+	const data = part as Record<string, unknown>;
+	// Thought parts are model reasoning: shape only, never contents.
+	if (data.thought === true) return "[thought part]";
+	if (data.functionCall && typeof data.functionCall === "object") {
+		const name = (data.functionCall as Record<string, unknown>).name;
+		return `[functionCall: ${typeof name === "string" ? name : "unknown"}]`;
+	}
+	if (data.functionResponse && typeof data.functionResponse === "object") {
+		const name = (data.functionResponse as Record<string, unknown>).name;
+		return `[functionResponse: ${typeof name === "string" ? name : "unknown"}]`;
+	}
+	if (typeof data.text === "string") return data.text;
+	if (data.inlineData && typeof data.inlineData === "object") {
+		const mimeType = (data.inlineData as Record<string, unknown>).mimeType;
+		return `[inlineData: ${typeof mimeType === "string" ? mimeType : "unknown"}]`;
+	}
+	return undefined;
+}
+
+/** One Google Generative AI contents item: role plus bounded parts summary. */
+function summarizeGoogleContentsItem(
+	config: Config,
+	item: unknown,
+): { role: string; content: string } {
+	const role =
+		item &&
+		typeof item === "object" &&
+		typeof (item as Record<string, unknown>).role === "string"
+			? ((item as Record<string, unknown>).role as string)
+			: "unknown";
+	const parts =
+		item &&
+		typeof item === "object" &&
+		Array.isArray((item as Record<string, unknown>).parts)
+			? ((item as Record<string, unknown>).parts as unknown[])
+			: undefined;
+	if (!parts) {
+		return { role, content: "[contents item]" };
+	}
+	const lines: string[] = [];
+	let unrecognized = 0;
+	for (const part of parts.slice(0, GOOGLE_CONTENTS_PART_WINDOW)) {
+		const summarized = summarizeGooglePart(part);
+		if (summarized === undefined) unrecognized += 1;
+		else lines.push(summarized);
+	}
+	let content = lines.join("\n");
+	if (unrecognized > 0) {
+		content = `${content ? `${content}\n` : ""}[${unrecognized} part(s)]`;
+	}
+	if (!content) {
+		return { role, content: `[${parts.length} content item(s)]` };
+	}
+	return {
+		role,
+		content: telemetryText(config, content, config.traceInputMaxChars),
+	};
+}
+
+/**
+ * Summarize Google Generative AI request contents: per-item bounded, with the
+ * separate system instruction (when observed) as the leading system item.
+ */
+function summarizeGoogleContents(
+	config: Config,
+	items: unknown[],
+	systemInstruction: string | undefined,
+) {
+	const selected = items
+		.slice(-GOOGLE_CONTENTS_ITEM_WINDOW)
+		.map((item) => summarizeGoogleContentsItem(config, item));
+	if (items.length > GOOGLE_CONTENTS_ITEM_WINDOW) {
+		selected.unshift({
+			role: "system",
+			content: `[truncated ${items.length - GOOGLE_CONTENTS_ITEM_WINDOW} earlier item(s)]`,
+		});
+	}
+	if (systemInstruction) {
+		selected.unshift({
+			role: "system",
+			content: telemetryText(
+				config,
+				systemInstruction,
+				config.traceInputMaxChars,
+			),
+		});
+	}
+	return selected;
 }
 
 /**
@@ -209,18 +390,24 @@ export function providerRequestIdentity(payload: unknown): string | undefined {
 }
 
 /**
- * Recognizable request contents inside a provider payload. Responses-style
- * payloads carry `input` (an item array or a plain string) where Chat
- * Completions payloads carry `messages`.
+ * Recognizable request contents inside a provider payload. Chat Completions
+ * payloads carry `messages`; Google Generative AI payloads carry `contents`
+ * (plus a separate `config.systemInstruction`); pi-protocol payloads carry
+ * `context.messages`; Responses-style payloads carry `input` (an item array or
+ * a plain string).
  */
 export type ProviderRequestContents =
 	| { field: "messages"; items: unknown[] }
+	| { field: "contents"; items: unknown[] }
+	| { field: "context-messages"; items: unknown[] }
 	| { field: "input-items"; items: unknown[] }
 	| { field: "input-text"; text: string };
 
 /** Provenance of the contents recorded on a provider_request trace. */
 export type ProviderRequestSource =
 	| "payload.messages"
+	| "payload.contents"
+	| "payload.context"
 	| "payload.input"
 	| "context";
 
@@ -233,6 +420,90 @@ export interface CapturedProviderRequest {
 	messageCount: number | undefined;
 	/** Wire byte estimate derived only from captured contents, never context. */
 	estimatedBytes: number | undefined;
+	/**
+	 * System instruction observed outside the captured contents. Only the
+	 * Google shape keeps its system prompt beside the contents
+	 * (`config.systemInstruction`); it is recorded as its own field, never
+	 * counted into the wire metrics of the contents.
+	 */
+	systemInstruction: string | undefined;
+}
+
+/** Google requests keep the system prompt in `config.systemInstruction`. */
+function googleSystemInstruction(
+	payload: Record<string, unknown>,
+): string | undefined {
+	const config = payload.config;
+	if (!config || typeof config !== "object" || Array.isArray(config)) {
+		return undefined;
+	}
+	const instruction = (config as Record<string, unknown>).systemInstruction;
+	return typeof instruction === "string" && instruction.length > 0
+		? instruction
+		: undefined;
+}
+
+/**
+ * Anthropic requests keep the system prompt top-level in `system`, either as
+ * a plain string or as an array of text blocks carrying cache-control hints.
+ * The text blocks are the wire units of one prompt; their texts join in order.
+ */
+function anthropicSystemInstruction(
+	payload: Record<string, unknown>,
+): string | undefined {
+	const value = payload.system;
+	if (typeof value === "string") return value.length > 0 ? value : undefined;
+	if (!Array.isArray(value)) return undefined;
+	const parts: string[] = [];
+	for (const block of value) {
+		if (!isRecord(block)) continue;
+		if (block.type === "text" && typeof block.text === "string" && block.text) {
+			parts.push(block.text);
+		}
+	}
+	return parts.length > 0 ? parts.join("\n\n") : undefined;
+}
+
+/**
+ * The separate system instruction observed beside the recognized contents,
+ * if the shape keeps one: Google `config.systemInstruction` or the Anthropic
+ * top-level `system`. It is recorded as its own field, never counted into
+ * the wire metrics of the contents.
+ */
+function systemInstructionFrom(
+	payload: Record<string, unknown> | undefined,
+	contents: ProviderRequestContents | undefined,
+): string | undefined {
+	if (!payload || !contents) return undefined;
+	if (contents.field === "contents") {
+		return googleSystemInstruction(payload);
+	}
+	if (contents.field === "messages") {
+		return anthropicSystemInstruction(payload);
+	}
+	return undefined;
+}
+
+/**
+ * Pi system messages carry their prompt in named `sections` beside an often
+ * empty `content`. The effective system text is the content plus the non-null
+ * section values joined by blank lines, mirroring how the installed adapters
+ * render the message for the request.
+ */
+function systemMessageSectionsText(
+	message: Record<string, unknown>,
+): string | undefined {
+	const sections = message.sections;
+	if (!sections || typeof sections !== "object" || Array.isArray(sections)) {
+		return undefined;
+	}
+	const parts: string[] = [];
+	const content = message.content;
+	if (typeof content === "string" && content.length > 0) parts.push(content);
+	for (const value of Object.values(sections as Record<string, unknown>)) {
+		if (typeof value === "string" && value.length > 0) parts.push(value);
+	}
+	return parts.length > 0 ? parts.join("\n\n") : undefined;
 }
 
 /**
@@ -258,6 +529,7 @@ export function captureProviderRequest(
 				? 1
 				: undefined,
 		estimatedBytes: estimateJsonBytes(captured),
+		systemInstruction: systemInstructionFrom(payload, contents),
 	};
 }
 
@@ -276,13 +548,28 @@ export function providerRequestProvenance(
 	return {
 		fallbackMessages,
 		requestSource: capture.contents
-			? capture.contents.field === "messages"
-				? "payload.messages"
-				: "payload.input"
+			? providerRequestSource(capture.contents.field)
 			: fallbackMessages
 				? ("context" as const)
 				: undefined,
 	};
+}
+
+/** Provenance label for a recognized contents field. */
+function providerRequestSource(
+	field: ProviderRequestContents["field"],
+): ProviderRequestSource {
+	switch (field) {
+		case "messages":
+			return "payload.messages";
+		case "contents":
+			return "payload.contents";
+		case "context-messages":
+			return "payload.context";
+		case "input-items":
+		case "input-text":
+			return "payload.input";
+	}
 }
 
 export interface ProviderRequestTraceInput {
@@ -296,6 +583,11 @@ export interface ProviderRequestTraceInput {
 	requestSource: ProviderRequestSource | undefined;
 	/** Captured payload contents and their wire metrics. */
 	capture: CapturedProviderRequest;
+	/**
+	 * System instruction observed beside the contents (Google), bounded by the
+	 * caller for summary mode; recorded under the record's systemPrompt field.
+	 */
+	systemInstruction: string | undefined;
 	/** Whether the configured capture policy stores full payloads. */
 	payloadCaptured: boolean;
 	/** Bounded serialized payload summary, when payload capture is enabled. */
@@ -322,8 +614,17 @@ export function providerRequestTraceRecord(
 		payloadCaptured: input.payloadCaptured,
 		payloadSummary: input.payloadSummary,
 	};
+	const systemPrompt =
+		input.systemInstruction !== undefined
+			? { systemPrompt: input.systemInstruction }
+			: undefined;
 	if (input.captureMode === "full") {
-		return { ...base, captureMode: "full", messages: input.capture.captured };
+		return {
+			...base,
+			captureMode: "full",
+			messages: input.capture.captured,
+			...systemPrompt,
+		};
 	}
 	return {
 		...base,
@@ -331,6 +632,7 @@ export function providerRequestTraceRecord(
 		messagesSummary: input.messagesSummary,
 		fullMessagesOmitted:
 			input.capture.captured !== undefined ? true : undefined,
+		...systemPrompt,
 	};
 }
 
@@ -340,6 +642,20 @@ export function providerRequestContents(
 	if (!payload) return undefined;
 	if (Array.isArray(payload.messages))
 		return { field: "messages", items: payload.messages };
+	if (Array.isArray(payload.contents))
+		return { field: "contents", items: payload.contents };
+	const context = payload.context;
+	if (
+		context &&
+		typeof context === "object" &&
+		!Array.isArray(context) &&
+		Array.isArray((context as Record<string, unknown>).messages)
+	) {
+		return {
+			field: "context-messages",
+			items: (context as Record<string, unknown>).messages as unknown[],
+		};
+	}
 	if (typeof payload.input === "string")
 		return { field: "input-text", text: payload.input };
 	if (Array.isArray(payload.input))

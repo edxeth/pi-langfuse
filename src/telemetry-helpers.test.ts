@@ -506,6 +506,307 @@ describe("provider payload summaries", () => {
 	});
 });
 
+describe("installed provider payload shapes", () => {
+	// Exact wire shapes produced by the installed Pi adapters: Google
+	// Generative AI buildParams and the pi-protocol messages adapter.
+	const googlePayload = () => ({
+		model: "gemini-3.2-pro",
+		contents: [
+			{ role: "user", parts: [{ text: "GOOGLE-user turn" }] },
+			{
+				role: "model",
+				parts: [
+					{ thought: true, text: "GOOGLE-thought" },
+					{ text: "GOOGLE-answer" },
+				],
+			},
+			{
+				role: "model",
+				parts: [
+					{
+						functionCall: {
+							name: "read",
+							args: { path: "/tmp/GOOGLE-args" },
+							id: "call_1",
+						},
+					},
+				],
+			},
+			{
+				role: "user",
+				parts: [
+					{
+						functionResponse: {
+							name: "read",
+							response: { output: "GOOGLE-tool output" },
+						},
+					},
+				],
+			},
+		],
+		config: {
+			systemInstruction: "GOOGLE-system instruction",
+			temperature: 0.4,
+		},
+	});
+
+	it("recognizes Google contents and the separate system instruction", () => {
+		const capture = captureProviderRequest(googlePayload());
+
+		expect(capture.contents?.field).toBe("contents");
+		expect(capture.messageCount).toBe(4);
+		expect(typeof capture.estimatedBytes).toBe("number");
+		expect(capture.systemInstruction).toBe("GOOGLE-system instruction");
+	});
+
+	it("claims no system instruction for payloads without one", () => {
+		expect(
+			captureProviderRequest({
+				model: "m",
+				contents: [{ role: "user", parts: [{ text: "x" }] }],
+			}).systemInstruction,
+		).toBeUndefined();
+		expect(
+			captureProviderRequest({ model: "m", input: "text" }).systemInstruction,
+		).toBeUndefined();
+	});
+
+	it("summarizes Google contents structurally without tool or thought data", () => {
+		const summary = summarizeProviderPayload(
+			config,
+			googlePayload(),
+			"fallback-model",
+		);
+
+		expect(summary.source).toBe("contents");
+		expect(summary.messageCount).toBe(4);
+		const json = JSON.stringify(summary.messages);
+		expect(json).toContain("GOOGLE-system instruction");
+		expect(json).toContain("GOOGLE-user turn");
+		expect(json).toContain("GOOGLE-answer");
+		expect(json).toContain("functionCall: read");
+		expect(json).toContain("functionResponse: read");
+		expect(json).toContain("[thought part]");
+		expect(json).not.toContain("GOOGLE-args");
+		expect(json).not.toContain("GOOGLE-tool output");
+		expect(json).not.toContain("GOOGLE-thought");
+	});
+
+	it("marks Google thought parts as reasoning even when every field is captured", () => {
+		const summary = summarizeProviderPayload(
+			{ ...config, capturePolicy: "full-debug" },
+			googlePayload(),
+			"fallback-model",
+		);
+
+		expect(JSON.stringify(summary.messages)).not.toContain("GOOGLE-thought");
+	});
+
+	it("recognizes Pi-protocol context.messages payloads", () => {
+		const payload = {
+			model: "test-model",
+			context: {
+				messages: [
+					{ role: "system", content: "PI-system" },
+					{ role: "user", content: "PI-turn" },
+					{
+						role: "toolResult",
+						toolCallId: "t1",
+						content: [{ type: "text", text: "PI-tool output" }],
+					},
+				],
+			},
+			options: { temperature: 0.2 },
+		};
+		const capture = captureProviderRequest(payload);
+
+		expect(capture.contents?.field).toBe("context-messages");
+		expect(capture.messageCount).toBe(3);
+		const summary = summarizeProviderPayload(config, payload, "fallback-model");
+		expect(summary.source).toBe("context");
+		expect(JSON.stringify(summary.messages)).toContain("PI-system");
+		expect(JSON.stringify(summary.messages)).toContain("PI-turn");
+		expect(JSON.stringify(summary.messages)).toContain("PI-tool output");
+	});
+
+	// The Anthropic Messages API keeps the system prompt top-level in
+	// `system` (string or text-block array); pi system messages keep the
+	// prompt text in named `sections` beside an often empty content string.
+	// Observed-request capture must include both.
+	const anthropicPayload = () => ({
+		model: "claude-fable-5",
+		system: [
+			{
+				type: "text",
+				text: "ANTHROPIC-system prompt",
+				cache_control: { type: "ephemeral" },
+			},
+		],
+		messages: [{ role: "user", content: "ANTHROPIC-user turn" }],
+		max_tokens: 128000,
+	});
+
+	it("extracts the Anthropic top-level system prompt", () => {
+		const capture = captureProviderRequest(anthropicPayload());
+
+		expect(capture.contents?.field).toBe("messages");
+		expect(capture.messageCount).toBe(1);
+		expect(capture.systemInstruction).toBe("ANTHROPIC-system prompt");
+	});
+
+	it("extracts string and multi-block Anthropic system prompts", () => {
+		expect(
+			captureProviderRequest({
+				model: "m",
+				system: "ANTHROPIC-plain system",
+				messages: [],
+			}).systemInstruction,
+		).toBe("ANTHROPIC-plain system");
+		expect(
+			captureProviderRequest({
+				model: "m",
+				system: [
+					{ type: "text", text: "ANTHROPIC-first part" },
+					{ type: "text", text: "ANTHROPIC-second part" },
+				],
+				messages: [],
+			}).systemInstruction,
+		).toBe("ANTHROPIC-first part\n\nANTHROPIC-second part");
+		expect(
+			captureProviderRequest({ model: "m", messages: [] }).systemInstruction,
+		).toBeUndefined();
+	});
+
+	it("summarizes Anthropic payloads with the system prompt as the leading item", () => {
+		const summary = summarizeProviderPayload(
+			config,
+			anthropicPayload(),
+			"fallback-model",
+		);
+
+		expect(summary.messages?.[0]).toEqual({
+			role: "system",
+			content: "ANTHROPIC-system prompt",
+		});
+		expect(summary.messages?.at(-1)).toEqual({
+			role: "user",
+			content: "ANTHROPIC-user turn",
+		});
+	});
+
+	const piSectionsSystemMessage = () => ({
+		role: "system",
+		content: "",
+		sections: {
+			preamble: "PISECTIONS-preamble text",
+			tools: "PISECTIONS-tools text",
+			skipped: null,
+		},
+	});
+
+	it("renders pi system message sections into the summary text", () => {
+		const summary = summarizeMessages(config, [
+			piSectionsSystemMessage(),
+			{ role: "user", content: "PI-user turn" },
+		] as Array<{ role?: string; content?: unknown }>);
+
+		expect(summary).toEqual([
+			{
+				role: "system",
+				content: "PISECTIONS-preamble text\n\nPISECTIONS-tools text",
+			},
+			{ role: "user", content: "PI-user turn" },
+		]);
+	});
+
+	it("keeps plain system messages unchanged while rendering sections", () => {
+		const summary = summarizeMessages(config, [
+			{ role: "system", content: "PLAIN-system text" },
+			{
+				role: "system",
+				content: "WITH-content",
+				sections: { extra: "SECTIONS-extra text" },
+			},
+		] as Array<{ role?: string; content?: unknown }>);
+
+		expect(summary).toEqual([
+			{ role: "system", content: "PLAIN-system text" },
+			{
+				role: "system",
+				content: "WITH-content\n\nSECTIONS-extra text",
+			},
+		]);
+	});
+
+	it("applies the tool-output policy to Pi context messages in summaries", () => {
+		const payload = {
+			model: "test-model",
+			context: {
+				messages: [
+					{
+						role: "toolResult",
+						toolCallId: "t1",
+						content: [{ type: "text", text: "PI-EXCLUDED-tool output" }],
+					},
+				],
+			},
+		};
+		const summary = summarizeProviderPayload(
+			conversationsConfig,
+			payload,
+			"fallback-model",
+		);
+
+		expect(JSON.stringify(summary.messages)).not.toContain(
+			"PI-EXCLUDED-tool output",
+		);
+	});
+
+	it("keeps the recent-item window and system instruction for Google contents", () => {
+		const items = Array.from({ length: 45 }, (_, index) => ({
+			role: "user",
+			parts: [{ text: `GOOGLE-windowed-${index}` }],
+		}));
+		const summary = summarizeProviderPayload(
+			config,
+			{ model: "gemini-3.2-pro", contents: items },
+			"fallback-model",
+		);
+
+		expect(summary.messageCount).toBe(45);
+		expect(summary.messages).toHaveLength(41);
+		expect(summary.messages?.[0]).toEqual({
+			role: "system",
+			content: "[truncated 5 earlier item(s)]",
+		});
+		expect(summary.messages?.at(-1)).toEqual({
+			role: "user",
+			content: "GOOGLE-windowed-44",
+		});
+	});
+
+	it("keeps messages recognition ahead of the newer shapes", () => {
+		expect(
+			captureProviderRequest({
+				model: "m",
+				messages: [{ role: "user", content: "CHAT" }],
+			}).contents?.field,
+		).toBe("messages");
+	});
+
+	it("returns no contents for payloads without recognized request fields", () => {
+		expect(
+			captureProviderRequest({ model: "m", config: {} }).contents,
+		).toBeUndefined();
+		expect(
+			captureProviderRequest({ model: "m", context: {} }).contents,
+		).toBeUndefined();
+		expect(
+			captureProviderRequest({ model: "m", contents: "text" }).contents,
+		).toBeUndefined();
+	});
+});
+
 describe("provider summary capture policy", () => {
 	// Chat Completions tool results and Pi-protocol toolResult messages both
 	// carry tool output as message content; excluded tool output must never

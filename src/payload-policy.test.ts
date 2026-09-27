@@ -536,7 +536,6 @@ describe("payload policy", () => {
 				captureMode: "full",
 				messages: anthropicFullMessages(),
 			},
-			
 		);
 		const json = JSON.stringify(shaped);
 
@@ -562,6 +561,269 @@ describe("payload policy", () => {
 
 		expect(json).toContain("ANTHROPIC-tool-arguments");
 		expect(json).toContain("ANTHROPIC-tool output");
+	});
+
+	// Installed Google Generative AI full-request shape: contents items carry
+	// role plus parts; functionCall/functionResponse parts are tool data and
+	// thought parts are reasoning; the system prompt rides in config.systemInstruction.
+	const googleFullMessages = () => [
+		{ role: "user", parts: [{ text: "GOOGLE-user text" }] },
+		{
+			role: "model",
+			parts: [
+				{ thought: true, text: "GOOGLE-thought" },
+				{ text: "GOOGLE-answer" },
+				{
+					functionCall: {
+						name: "read",
+						args: { path: "GOOGLE-tool-arguments" },
+						id: "call_1",
+					},
+				},
+			],
+		},
+		{
+			role: "user",
+			parts: [
+				{
+					functionResponse: {
+						name: "read",
+						response: { output: "GOOGLE-tool output" },
+					},
+				},
+			],
+		},
+	];
+
+	it("honors tool opt-outs on Google contents parts in full raw records", () => {
+		const shaped = shapeRawTraceRecord(
+			{
+				...baseConfig,
+				capturePolicy: "conversations",
+				captureToolInput: false,
+				captureToolOutput: false,
+			},
+			{
+				type: "provider_request",
+				captureMode: "full",
+				messages: googleFullMessages(),
+			},
+		);
+		const json = JSON.stringify(shaped);
+
+		expect(json).not.toContain("GOOGLE-tool-arguments");
+		expect(json).not.toContain("GOOGLE-tool output");
+		// Conversation text and tool identity stay.
+		expect(json).toContain("GOOGLE-user text");
+		expect(json).toContain("GOOGLE-answer");
+		expect(json).toContain("read");
+		expect(json).toContain("call_1");
+	});
+
+	it("excludes Google thought parts and honors the system-prompt field policy", () => {
+		const withInstruction = () => ({
+			type: "provider_request",
+			captureMode: "full",
+			messages: googleFullMessages(),
+			systemPrompt: "GOOGLE-system instruction",
+		});
+
+		const fullDebug = shapeRawTraceRecord({ ...baseConfig }, withInstruction());
+		const fullDebugJson = JSON.stringify(fullDebug);
+		expect(fullDebugJson).toContain("GOOGLE-system instruction");
+		expect(fullDebugJson).not.toContain("GOOGLE-thought");
+		expect(fullDebugJson).toContain("GOOGLE-tool-arguments");
+
+		const promptsOnly = shapeRawTraceRecord(
+			{ ...baseConfig, capturePolicy: "prompts-only" },
+			withInstruction(),
+		);
+		const promptsOnlyJson = JSON.stringify(promptsOnly);
+		// Prompts-only keeps prompt and system-prompt content while dropping
+		// model output and tool data.
+		expect(promptsOnlyJson).toContain("GOOGLE-user text");
+		expect(promptsOnlyJson).toContain("GOOGLE-system instruction");
+		expect(promptsOnlyJson).not.toContain("GOOGLE-answer");
+		expect(promptsOnlyJson).not.toContain("GOOGLE-tool-arguments");
+		expect(promptsOnlyJson).not.toContain("GOOGLE-tool output");
+	});
+
+	it("honors the tool-output opt-out on Pi toolResult context messages", () => {
+		const shaped = shapeRawTraceRecord(
+			{
+				...baseConfig,
+				capturePolicy: "conversations",
+				captureToolOutput: false,
+			},
+			{
+				type: "provider_request",
+				captureMode: "full",
+				messages: [
+					{ role: "user", content: "PI-user text" },
+					{
+						role: "toolResult",
+						toolCallId: "t1",
+						content: [{ type: "text", text: "PI-tool output" }],
+					},
+				],
+			},
+		);
+		const json = JSON.stringify(shaped);
+
+		expect(json).not.toContain("PI-tool output");
+		expect(json).toContain("PI-user text");
+		expect(json).toContain("t1");
+	});
+
+	// Native pi-protocol tool blocks ({type: "toolCall"}) carry the same
+	// tool-call data as Anthropic tool_use blocks and must follow the same
+	// capture policy; pi thinking blocks keep their visible text under the
+	// assistant-output policy, but the encrypted reasoning carrier
+	// (redacted_thinking.data) is never captured, like Responses encrypted
+	// reasoning and Google thought parts.
+	const piFullMessages = () => [
+		{ role: "user", content: "PI-user text" },
+		{
+			role: "assistant",
+			content: [
+				{
+					type: "thinking",
+					thinking: "PI-KEEP-thinking text",
+				},
+				{ type: "text", text: "PI-answer" },
+				{
+					type: "toolCall",
+					id: "call_1",
+					name: "bash",
+					arguments: { command: "PI-LEAK-tool arguments" },
+				},
+			],
+		},
+		{
+			role: "toolResult",
+			toolCallId: "call_1",
+			toolName: "bash",
+			content: [{ type: "text", text: "PI-LEAK-tool output" }],
+		},
+	];
+
+	it("honors the tool-input opt-out on native pi toolCall blocks", () => {
+		const shaped = shapeRawTraceRecord(
+			{
+				...baseConfig,
+				capturePolicy: "conversations",
+				captureToolInput: false,
+				captureToolOutput: false,
+			},
+			{
+				type: "provider_request",
+				captureMode: "full",
+				messages: piFullMessages(),
+			},
+		);
+		const json = JSON.stringify(shaped);
+
+		expect(json).not.toContain("PI-LEAK-tool arguments");
+		expect(json).not.toContain("PI-LEAK-tool output");
+		// Conversation text and block correlation stay.
+		expect(json).toContain("PI-answer");
+		expect(json).toContain("PI-KEEP-thinking text");
+		expect(json).toContain("call_1");
+		expect(json).toContain("bash");
+	});
+
+	it("captures native pi toolCall blocks and keeps thinking text under full-debug", () => {
+		const shaped = shapeRawTraceRecord(
+			{ ...baseConfig },
+			{
+				type: "provider_request",
+				captureMode: "full",
+				messages: [
+					{
+						role: "assistant",
+						content: [
+							{ type: "thinking", thinking: "PI-KEEP-thinking text" },
+							{
+								type: "toolCall",
+								id: "call_1",
+								name: "bash",
+								arguments: { command: "PI-KEEP-tool arguments" },
+							},
+						],
+					},
+				],
+			},
+		);
+		const json = JSON.stringify(shaped);
+
+		expect(json).toContain("PI-KEEP-tool arguments");
+		expect(json).toContain("PI-KEEP-thinking text");
+	});
+
+	it("never captures Anthropic redacted_thinking data at any policy", () => {
+		const messages = () => [
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "redacted_thinking",
+						data: "REDACTED-ENCRYPTED-blob",
+					},
+					{ type: "text", text: "ANTHROPIC-answer" },
+				],
+			},
+		];
+
+		for (const capturePolicy of ["conversations", "full-debug"] as const) {
+			const shaped = shapeRawTraceRecord(
+				{ ...baseConfig, capturePolicy },
+				{
+					type: "provider_request",
+					captureMode: "full",
+					messages: messages(),
+				},
+			);
+			const json = JSON.stringify(shaped);
+			expect(json).not.toContain("REDACTED-ENCRYPTED-blob");
+			// The block type stays for correlation; visible text is unchanged.
+			expect(json).toContain("redacted_thinking");
+			expect(json).toContain("ANTHROPIC-answer");
+		}
+	});
+
+	// Pi system messages keep the prompt text in named `sections`; the
+	// sections are system-prompt content and must follow the system-prompt
+	// capture field, not the metadata field.
+	it("classifies pi system message sections under the system-prompt policy", () => {
+		const record = () => ({
+			type: "provider_request",
+			captureMode: "full",
+			messages: [
+				{
+					role: "system",
+					content: "",
+					sections: { preamble: "PISECTIONS-preamble text" },
+				},
+				{ role: "user", content: "PI-user text" },
+			],
+		});
+
+		const fullDebug = shapeRawTraceRecord({ ...baseConfig }, record());
+		expect(JSON.stringify(fullDebug)).toContain("PISECTIONS-preamble text");
+
+		const promptsOnly = shapeRawTraceRecord(
+			{ ...baseConfig, capturePolicy: "prompts-only" },
+			record(),
+		);
+		expect(JSON.stringify(promptsOnly)).toContain("PISECTIONS-preamble text");
+
+		const metadataOnly = shapeRawTraceRecord(
+			{ ...baseConfig, capturePolicy: "metadata-only" },
+			record(),
+		);
+		// Metadata-only omits the provider-input messages wholesale (existing
+		// contract), which also drops the sections text.
+		expect(metadataOnly).not.toHaveProperty("messages");
 	});
 
 	it("excludes reasoning contents from full raw records at every policy", () => {

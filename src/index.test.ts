@@ -57,6 +57,7 @@ describe("index (extension entry)", () => {
 		process.env.PI_LANGFUSE_RAW_TRACE = "1";
 		process.env.PI_LANGFUSE_RAW_TRACE_DIR = rawTraceDir;
 		process.env.PI_LANGFUSE_SKIP_UNPERSISTED = "0";
+		delete process.env.PI_LANGFUSE_RAW_PROVIDER_REQUEST;
 		if (options.mode) {
 			process.env.PI_LANGFUSE_RAW_PROVIDER_REQUEST = options.mode;
 		}
@@ -309,9 +310,7 @@ describe("index (extension entry)", () => {
 						{
 							type: "tool_result",
 							tool_use_id: "call_1",
-							content: [
-								{ type: "text", text: "NESTED-tool output" },
-							],
+							content: [{ type: "text", text: "NESTED-tool output" }],
 						},
 					],
 				},
@@ -326,6 +325,41 @@ describe("index (extension entry)", () => {
 		expect(recordJson).not.toContain("NESTED-tool arguments");
 		expect(recordJson).not.toContain("NESTED-tool output");
 		expect(recordJson).toContain("NESTED-answer");
+		expect(recordJson).toContain("call_1");
+	});
+
+	it("applies tool and reasoning policy to pi-protocol blocks in full requests", async () => {
+		process.env.PI_LANGFUSE_CAPTURE_POLICY = "conversations";
+		const records = await captureRawProviderRequestRecords({
+			mode: "full",
+			messages: [
+				{
+					role: "assistant",
+					content: [
+						{ type: "text", text: "PIWIRE-answer" },
+						{
+							type: "redacted_thinking",
+							data: "PIWIRE-encrypted-blob",
+						},
+						{
+							type: "toolCall",
+							id: "call_1",
+							name: "bash",
+							arguments: { command: "PIWIRE-tool arguments" },
+						},
+					],
+				},
+			] as Array<Record<string, unknown>>,
+		});
+		const providerRequest = records.find(
+			(record) => record.type === "provider_request",
+		);
+
+		expect(providerRequest).toMatchObject({ captureMode: "full" });
+		const recordJson = JSON.stringify(providerRequest);
+		expect(recordJson).not.toContain("PIWIRE-tool arguments");
+		expect(recordJson).not.toContain("PIWIRE-encrypted-blob");
+		expect(recordJson).toContain("PIWIRE-answer");
 		expect(recordJson).toContain("call_1");
 	});
 
@@ -407,6 +441,88 @@ describe("index (extension entry)", () => {
 		expect(providerRequest?.messagesSummary).toEqual([
 			{ role: "user", content: "STRING-plain prompt" },
 		]);
+	});
+
+	it("captures Google contents as the wire request with system instruction provenance", async () => {
+		const googlePayload = () => ({
+			model: "gemini-3.2-pro",
+			contents: [
+				{ role: "user", parts: [{ text: "GOOGLE-wire turn" }] },
+				{
+					role: "model",
+					parts: [
+						{
+							functionCall: {
+								name: "read",
+								args: { path: "/tmp/GOOGLE-args" },
+								id: "call_1",
+							},
+						},
+					],
+				},
+			],
+			config: { systemInstruction: "GOOGLE-system instruction" },
+		});
+		const fullRecords = await captureRawProviderRequestRecords({
+			mode: "full",
+			contextMessages: [{ role: "user", content: "CTX-context only" }],
+			payload: googlePayload(),
+		});
+		const fullRecord = fullRecords.find(
+			(record) => record.type === "provider_request",
+		);
+		expect(fullRecord).toMatchObject({
+			captureMode: "full",
+			requestSource: "payload.contents",
+			messageCount: 2,
+			systemPrompt: "GOOGLE-system instruction",
+		});
+		const fullJson = JSON.stringify(fullRecord);
+		expect(fullJson).toContain("GOOGLE-wire turn");
+		expect(fullJson).toContain("GOOGLE-args");
+		expect(fullJson).not.toContain("CTX-context only");
+
+		const summaryRecords = await captureRawProviderRequestRecords({
+			payload: googlePayload(),
+		});
+		const summaryRecord = summaryRecords.find(
+			(record) => record.type === "provider_request",
+		);
+		expect(summaryRecord).toMatchObject({
+			requestSource: "payload.contents",
+			messageCount: 2,
+			systemPrompt: "GOOGLE-system instruction",
+		});
+		const summaryJson = JSON.stringify(summaryRecord?.messagesSummary);
+		expect(summaryJson).toContain("GOOGLE-wire turn");
+		// Tool arguments and reasoning stay structural in summaries.
+		expect(summaryJson).toContain("functionCall: read");
+		expect(summaryJson).not.toContain("GOOGLE-args");
+	});
+
+	it("captures Pi-protocol context payloads as the wire request", async () => {
+		const records = await captureRawProviderRequestRecords({
+			contextMessages: [{ role: "user", content: "CTX-context only" }],
+			payload: {
+				model: "test-model",
+				context: {
+					messages: [{ role: "user", content: "PI-wire turn" }],
+				},
+				options: { temperature: 0.2 },
+			},
+		});
+		const providerRequest = records.find(
+			(record) => record.type === "provider_request",
+		);
+
+		expect(providerRequest).toMatchObject({
+			requestSource: "payload.context",
+			messageCount: 1,
+			fullMessagesOmitted: true,
+		});
+		const summaryJson = JSON.stringify(providerRequest?.messagesSummary);
+		expect(summaryJson).toContain("PI-wire turn");
+		expect(summaryJson).not.toContain("CTX-context only");
 	});
 
 	it("never presents the context fallback as a captured wire request", async () => {
@@ -644,6 +760,35 @@ describe("index (extension entry)", () => {
 		);
 		expect(summaries).toContain("NULLISH-chat text");
 		expect(summaries).toContain("NULLISH-input text");
+	});
+
+	it("records the Anthropic top-level system prompt in full raw requests", async () => {
+		const records = await captureRawProviderRequestRecords({
+			mode: "full",
+			contextMessages: [{ role: "user", content: "CTX-context only" }],
+			payload: {
+				model: "claude-fable-5",
+				system: [
+					{
+						type: "text",
+						text: "ANTHROPIC-E2E-system prompt",
+					},
+				],
+				messages: [{ role: "user", content: "ANTHROPIC-E2E-user turn" }],
+			},
+		});
+		const providerRequest = records.find(
+			(record) => record.type === "provider_request",
+		);
+
+		expect(providerRequest).toMatchObject({
+			captureMode: "full",
+			requestSource: "payload.messages",
+			systemPrompt: "ANTHROPIC-E2E-system prompt",
+		});
+		expect(JSON.stringify(providerRequest?.messages)).toContain(
+			"ANTHROPIC-E2E-user turn",
+		);
 	});
 
 	it("captures Responses input items as the wire request in full mode", async () => {

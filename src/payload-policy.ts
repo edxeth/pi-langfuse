@@ -260,20 +260,27 @@ function shapeValueForKey<T>(
 }
 
 function messageField(role: string, key: string): CaptureField {
-	if (key === "content") {
+	if (key === "content" || key === "parts") {
 		switch (role) {
 			case "system":
 				return "systemPrompt";
 			case "user":
 				return "prompt";
 			case "assistant":
+			case "model":
 				return "assistantOutput";
 			case "tool":
 			case "tool_result":
+			case "toolResult":
 				return "toolOutput";
 			default:
 				return "providerInput";
 		}
+	}
+	// Pi system messages carry the prompt text in named sections; the
+	// sections are system-prompt content, not metadata.
+	if (key === "sections") {
+		return role === "system" ? "systemPrompt" : "metadata";
 	}
 	if (key === "tool_calls" || key === "arguments") return "toolInput";
 	return "metadata";
@@ -308,10 +315,25 @@ function toolCallItemField(key: string): CaptureField | undefined {
 }
 
 /** Wire content-block types that carry tool-call request data. */
-const TOOL_USE_BLOCK_TYPES = new Set(["tool_use"]);
+const TOOL_USE_BLOCK_TYPES = new Set(["tool_use", "toolCall"]);
 
 /** Wire content-block types that carry tool result data. */
 const TOOL_RESULT_BLOCK_TYPES = new Set(["tool_result"]);
+
+/**
+ * Wire content-block types that carry encrypted reasoning. Their opaque
+ * payloads are never captured, like Responses encrypted reasoning and Google
+ * thought parts; structural keys stay for correlation.
+ */
+const ENCRYPTED_REASONING_BLOCK_TYPES = new Set(["redacted_thinking"]);
+
+/** Encrypted-reasoning payload keys that must never be captured. */
+const ENCRYPTED_REASONING_DATA_KEYS = new Set(["data"]);
+
+/** True for JSON objects other than arrays. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
 
 /** Fields that hold role message content and can nest tool blocks. */
 function isRoleContentField(field: CaptureField): boolean {
@@ -401,7 +423,33 @@ function shapeMessageContentBlock(
 	const blockType = typeof block.type === "string" ? block.type : "";
 	const isToolUseBlock = TOOL_USE_BLOCK_TYPES.has(blockType);
 	const isToolResultBlock = TOOL_RESULT_BLOCK_TYPES.has(blockType);
-	if (!isToolUseBlock && !isToolResultBlock) {
+	const isEncryptedReasoningBlock =
+		ENCRYPTED_REASONING_BLOCK_TYPES.has(blockType);
+	// Google tool parts nest their data one level deeper than Anthropic
+	// blocks: functionCall.args is tool input, functionResponse.response is
+	// tool output.
+	const googleToolPart = isRecord(block.functionCall)
+		? {
+				key: "functionCall" as const,
+				dataKey: "args" as const,
+				dataField: "toolInput" as CaptureField,
+			}
+		: isRecord(block.functionResponse)
+			? {
+					key: "functionResponse" as const,
+					dataKey: "response" as const,
+					dataField: "toolOutput" as CaptureField,
+				}
+			: undefined;
+	// Google thought parts are model reasoning: never captured, regardless
+	// of policy or overrides, like Responses reasoning items.
+	if (
+		!isToolUseBlock &&
+		!isToolResultBlock &&
+		!googleToolPart &&
+		!isEncryptedReasoningBlock
+	) {
+		if (block.thought === true) return undefined;
 		return shapeValueWithState(
 			config,
 			defaultField,
@@ -416,11 +464,67 @@ function shapeMessageContentBlock(
 	for (const [key, item] of Object.entries(block)) {
 		if (state.nodes >= limits.maxNodes || contentKeys >= limits.maxObjectKeys)
 			break;
+		// Encrypted reasoning payloads are never captured, regardless of
+		// policy or overrides; the block type stays for correlation.
+		if (isEncryptedReasoningBlock && ENCRYPTED_REASONING_DATA_KEYS.has(key))
+			continue;
+		if (googleToolPart && key === googleToolPart.key) {
+			if (!isRecord(item)) continue;
+			const shapedPart = shapeGoogleToolPartData(
+				config,
+				item,
+				googleToolPart.dataKey,
+				googleToolPart.dataField,
+				options,
+				limits,
+				state,
+			);
+			if (shapedPart === undefined) continue;
+			output[key] = shapedPart;
+			contentKeys += 1;
+			continue;
+		}
 		const field = isToolUseBlock
 			? (toolCallItemField(key) ?? "metadata")
-			: key === "content"
-				? "toolOutput"
+			: isToolResultBlock
+				? key === "content"
+					? "toolOutput"
+					: "metadata"
 				: "metadata";
+		const shaped = shapeValueForKey(
+			config,
+			key,
+			field,
+			item,
+			options,
+			limits,
+			state,
+		);
+		if (shaped === undefined) continue;
+		output[key] = shaped;
+		contentKeys += 1;
+	}
+	return output;
+}
+
+/** Shape a Google functionCall/functionResponse payload's classified keys. */
+function shapeGoogleToolPartData(
+	config: PayloadPolicyConfig,
+	data: Record<string, unknown>,
+	contentKey: string,
+	contentField: CaptureField,
+	options: ShapeOptions,
+	limits: PayloadLimits,
+	state: ShapeState,
+): Record<string, unknown> | undefined {
+	if (state.nodes >= limits.maxNodes) return undefined;
+	state.nodes += 1;
+	const output: Record<string, unknown> = {};
+	let contentKeys = 0;
+	for (const [key, item] of Object.entries(data)) {
+		if (state.nodes >= limits.maxNodes || contentKeys >= limits.maxObjectKeys)
+			break;
+		const field = key === contentKey ? contentField : "metadata";
 		const shaped = shapeValueForKey(
 			config,
 			key,

@@ -33,7 +33,7 @@ import {
 	providerRequestIdentity,
 	providerRequestProvenance,
 	providerRequestTraceRecord,
-	summarizeProviderRequestInput,
+	summarizeProviderRequestContents,
 } from "./telemetry-helpers.js";
 
 export interface GenerationLifecycleDependencies {
@@ -623,16 +623,20 @@ export function createGenerationLifecycleHandlers(
 				capture,
 				prompt.lastContextMessages,
 			);
-			const summarizeRequestContents = () => {
-				if (capture.contents?.field === "input-items")
-					return summarizeProviderRequestInput(config, capture.contents.items);
-				if (capture.contents?.field === "input-text")
-					return summarizeProviderRequestInput(config, capture.contents.text);
-				return deps.summarizeProviderRequestMessages(
+			const summarySystemInstruction = () =>
+				capture.systemInstruction !== undefined
+					? deps.telemetryText(
+							config,
+							capture.systemInstruction,
+							config.traceInputMaxChars,
+						)
+					: undefined;
+			const summarizeRequestContents = () =>
+				summarizeProviderRequestContents(
 					config,
-					capture.captured ?? fallbackMessages,
-				);
-			};
+					capture.contents,
+					summarySystemInstruction(),
+				) ?? deps.summarizeProviderRequestMessages(config, fallbackMessages);
 			const writeProviderRequestTrace = () => {
 				if (config.rawTraceProviderRequestMode === "off") return undefined;
 				// When the payload carries no recognizable request contents, the
@@ -646,6 +650,10 @@ export function createGenerationLifecycleHandlers(
 					model: reqModel,
 					requestSource,
 					capture,
+					systemInstruction:
+						config.rawTraceProviderRequestMode === "full"
+							? capture.systemInstruction
+							: summarySystemInstruction(),
 					payloadCaptured: config.captureProviderPayload,
 					payloadSummary: config.captureProviderPayload
 						? payloadSummaryText
