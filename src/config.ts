@@ -102,7 +102,12 @@ function defaultLocalAutostartDir() {
 }
 
 export function getConfigFilePath() {
-	return join(defaultLocalAutostartDir(), "pi-langfuse.json");
+	// PI_LANGFUSE_CONFIG lets init target a custom directory that config
+	// loading can still find; unset keeps the historical default path.
+	return (
+		process.env.PI_LANGFUSE_CONFIG ||
+		join(defaultLocalAutostartDir(), "pi-langfuse.json")
+	);
 }
 
 function hasConfiguredValue(value: unknown) {

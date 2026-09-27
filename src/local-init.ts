@@ -388,6 +388,8 @@ function piLangfuseConfig(
 			captureProviderPayload: false,
 			providerPayloadMaxChars: 50_000,
 			localAutostart: options.mode === "local",
+			// Pin the stack directory so autostart follows the file once it is discovered.
+			...(options.mode === "local" ? { localAutostartDir: options.dir } : {}),
 			traceInputMaxChars: 20_000,
 			traceOutputMaxChars: 20_000,
 			toolArgsMaxChars: 10_000,
@@ -537,6 +539,12 @@ export async function runLangfuseInit(
 	if (options.mode === "local" && options.passwordGenerated) {
 		ctx.ui.notify(
 			"The local login password was generated for this install and is shown only in this message. Store it now.",
+			"warning",
+		);
+	}
+	if (options.dir !== defaultLangfuseDir()) {
+		ctx.ui.notify(
+			`Init wrote files outside the default search path. Set PI_LANGFUSE_CONFIG=${localConfigPath(options.dir)} before starting pi so this configuration is loaded.`,
 			"warning",
 		);
 	}

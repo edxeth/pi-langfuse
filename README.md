@@ -76,7 +76,7 @@ Remote mode creates only `$PI_CODING_AGENT_DIR/langfuse/pi-langfuse.json`. No Do
 You can also configure keys manually via env vars or settings. Configuration precedence:
 
 1. `/extensions:settings` if the optional settings extension is installed
-2. `$PI_CODING_AGENT_DIR/langfuse/pi-langfuse.json`
+2. `pi-langfuse.json` (default `$PI_CODING_AGENT_DIR/langfuse/pi-langfuse.json`; override the path with `PI_LANGFUSE_CONFIG`)
 3. `LANGFUSE_*` and `PI_LANGFUSE_*` environment variables
 4. Built-in defaults
 
@@ -86,6 +86,7 @@ The extension does not load an extension-local `config.json`. Use `pi-langfuse.j
 
 | Setting | Env Var | Default | Description |
 | :--- | :--- | :--- | :--- |
+| **Config File** | `PI_LANGFUSE_CONFIG` | `$PI_CODING_AGENT_DIR/langfuse/pi-langfuse.json` | Path of the `pi-langfuse.json` file the extension loads. |
 | **Enabled** | - | `true` | Global toggle for tracing. |
 | **Public Key** | `LANGFUSE_PUBLIC_KEY` | - | Langfuse project public key. |
 | **Secret Key** | `LANGFUSE_SECRET_KEY` | - | Langfuse project secret key. |
@@ -145,6 +146,8 @@ Flags:
 | `--no-start` | Write files without running Docker Compose. |
 
 Local mode writes `docker-compose.yml`, `.env`, and `pi-langfuse.json`. Remote mode writes only `pi-langfuse.json`. Init refuses a non-empty directory.
+
+With `--dir <path>`, files land outside the default search path. Set `PI_LANGFUSE_CONFIG=<path>/pi-langfuse.json` before starting `pi` so the extension discovers the configuration; local mode also pins `localAutostartDir` in the generated file.
 
 ### /langfuse:toggle
 

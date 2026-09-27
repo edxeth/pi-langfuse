@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { resolveConfig } from "./config.js";
+import { getConfigFilePath, resolveConfig } from "./config.js";
 import { DEFAULT_SETTINGS } from "./settings.js";
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -39,7 +39,38 @@ describe("resolveConfig", () => {
 		delete process.env.PI_LANGFUSE_PAYLOAD_MAX_OBJECT_KEYS;
 		delete process.env.PI_LANGFUSE_PAYLOAD_MAX_NODES;
 		delete process.env.PI_CODING_AGENT_DIR;
+		delete process.env.PI_LANGFUSE_CONFIG;
 	});
+	it("loads the config file from PI_LANGFUSE_CONFIG when set", () => {
+		process.env.PI_CODING_AGENT_DIR = "/tmp/agent-default";
+		process.env.PI_LANGFUSE_CONFIG = "/tmp/custom-dir/pi-langfuse.json";
+		vi.mocked(fs.existsSync).mockReturnValue(true);
+		vi.mocked(fs.readFileSync).mockImplementation(((path: unknown) => {
+			if (path === "/tmp/custom-dir/pi-langfuse.json") {
+				return JSON.stringify({
+					publicKey: "pk-custom",
+					secretKey: "sk-custom",
+					host: "http://localhost:3200",
+				});
+			}
+			return JSON.stringify({ publicKey: "pk-default" });
+		}) as never);
+
+		expect(getConfigFilePath()).toBe("/tmp/custom-dir/pi-langfuse.json");
+		const config = resolveConfig({});
+		expect(config.publicKey).toBe("pk-custom");
+		expect(config.secretKey).toBe("sk-custom");
+		expect(config.host).toBe("http://localhost:3200");
+	});
+
+	it("uses the default config path when PI_LANGFUSE_CONFIG is unset", () => {
+		process.env.PI_CODING_AGENT_DIR = "/tmp/agent-default";
+
+		expect(getConfigFilePath()).toBe(
+			"/tmp/agent-default/langfuse/pi-langfuse.json",
+		);
+	});
+
 	it("should use default settings when no input is provided", () => {
 		const config = resolveConfig({});
 		expect(config.enabled).toBe(DEFAULT_SETTINGS.enabled);

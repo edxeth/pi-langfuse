@@ -158,6 +158,24 @@ describe("/langfuse-init", () => {
 		const env = await readFile(join(agentDir, "langfuse", ".env"), "utf-8");
 		expect(env).toMatch(/LANGFUSE_INIT_USER_PASSWORD=.+/);
 	}, 15000);
+	it("points at PI_LANGFUSE_CONFIG when init targets a custom directory", async () => {
+		const notifications: Notification[] = [];
+		const customDir = join(agentDir, "custom-langfuse");
+
+		await runLangfuseInit(
+			`--yes --remote --dir ${customDir} --public-key pk-custom --secret-key sk-custom`,
+			createContext(notifications),
+		);
+
+		const messages = notifications.map((n) => n.message).join("\n");
+		expect(messages).toContain("PI_LANGFUSE_CONFIG");
+		expect(messages).toContain(join(customDir, "pi-langfuse.json"));
+
+		const config = JSON.parse(
+			await readFile(join(customDir, "pi-langfuse.json"), "utf-8"),
+		);
+		expect(config.publicKey).toBe("pk-custom");
+	});
 
 	it("lets the interactive wizard choose remote setup", async () => {
 		const notifications: Notification[] = [];
