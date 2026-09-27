@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Config } from "./config.js";
 import {
 	captureProviderRequest,
+	extractTextFromContent,
 	providerRequestIdentity,
 	summarizeMessages,
 	summarizeProviderPayload,
@@ -368,6 +369,81 @@ describe("provider payload summaries", () => {
 			"INPUT-named part",
 		]);
 		expect(JSON.stringify(summary.messages)).not.toContain("LEAK-");
+	});
+
+	// Regression: a nullish entry inside a content array crashed
+	// extractTextFromContent (item.type on null), and the diagnostic catch in
+	// beforeProviderRequest then silently dropped the whole request record.
+	// Nullish parts must be skipped like any other unexpanded part while
+	// recognized text keeps its order.
+	it("skips nullish content parts while keeping recognized text in order", () => {
+		const content = [
+			null,
+			{ type: "text", text: "INPUT-first" },
+			undefined,
+			{ type: "input_text", text: "LEAK-unnormalized" },
+			{ type: "text", text: "" },
+			{ type: "text", text: "INPUT-last" },
+		] as Array<{ type: string; text?: string }>;
+
+		expect(extractTextFromContent(content)).toBe("INPUT-first\nINPUT-last");
+	});
+
+	// Role-bearing chat and Responses messages funnel content arrays through
+	// extractTextFromContent; a throw inside summarizeProviderPayload would
+	// cost the entire request summary, so both wire fields must tolerate
+	// nullish parts and stay read-only.
+	it("summarizes role messages with nullish content parts without losing the request", () => {
+		const chatPayload = {
+			model: "grok-4.7",
+			messages: [
+				{
+					role: "user",
+					content: [null, { type: "text", text: "INPUT-chat after null" }, 42],
+				},
+			],
+		};
+		const responsesPayload = {
+			model: "grok-4.7",
+			input: [
+				{
+					role: "user",
+					content: [
+						undefined,
+						{
+							type: "input_text",
+							text: "INPUT-responses after undefined",
+						},
+					],
+				},
+			],
+		};
+		const chatSnapshot = structuredClone(chatPayload);
+		const responsesSnapshot = structuredClone(responsesPayload);
+
+		const chatSummary = summarizeProviderPayload(
+			config,
+			chatPayload,
+			"fallback-model",
+		);
+		const responsesSummary = summarizeProviderPayload(
+			config,
+			responsesPayload,
+			"fallback-model",
+		);
+
+		expect(chatSummary.messageCount).toBe(1);
+		expect(responsesSummary.messageCount).toBe(1);
+		expect(chatSummary.messages).toEqual([
+			{ role: "user", content: "INPUT-chat after null" },
+		]);
+		expect(responsesSummary.messages).toEqual([
+			{ role: "user", content: "INPUT-responses after undefined" },
+		]);
+		// Summarization is read-only: parts pass through in copies, the
+		// caller's payload is never normalized in place.
+		expect(chatPayload).toEqual(chatSnapshot);
+		expect(responsesPayload).toEqual(responsesSnapshot);
 	});
 
 	// The recent-item window keeps exactly the last 40 items: at the boundary

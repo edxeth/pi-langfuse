@@ -73,8 +73,10 @@ export function extractTextFromContent(
 	content: Array<{ type: string; text?: string }> | undefined,
 ) {
 	if (!content?.length) return "";
+	// Parts come from untrusted payloads: nullish entries must be skipped like
+	// any other unexpanded part, not crash the summarizer.
 	return content
-		.filter((item) => item.type === "text" && item.text)
+		.filter((item) => item?.type === "text" && item.text)
 		.map((item) => item.text)
 		.join("\n");
 }

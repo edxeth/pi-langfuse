@@ -517,6 +517,66 @@ describe("index (extension entry)", () => {
 		});
 	});
 
+	// Regression: nullish entries inside content arrays crashed payload
+	// summarization, and beforeProviderRequest's diagnostic catch silently
+	// dropped the whole provider_request record. Recording must survive.
+	it("still records provider requests whose content parts include nullish entries", async () => {
+		const records = await captureRawProviderRequestRecords({
+			drive: async (send) => {
+				await send("before_provider_request", {
+					payload: {
+						model: "test-model",
+						messages: [
+							{
+								role: "user",
+								content: [null, { type: "text", text: "NULLISH-chat text" }],
+							},
+						],
+					},
+				});
+				await send("before_provider_request", {
+					payload: {
+						model: "test-model",
+						input: [
+							{
+								role: "user",
+								content: [
+									undefined,
+									{
+										type: "input_text",
+										text: "NULLISH-input text",
+									},
+								],
+							},
+						],
+					},
+				});
+			},
+		});
+		const providerRequests = records.filter(
+			(record) => record.type === "provider_request",
+		);
+
+		// Each payload still produces its record with the surviving text
+		// summarized and provenance and wire metrics intact.
+		expect(providerRequests).toHaveLength(2);
+		expect(providerRequests[0]).toMatchObject({
+			model: "test-model",
+			requestSource: "payload.messages",
+			messageCount: 1,
+		});
+		expect(providerRequests[1]).toMatchObject({
+			model: "test-model",
+			requestSource: "payload.input",
+			messageCount: 1,
+		});
+		const summaries = JSON.stringify(
+			providerRequests.map((record) => record.messagesSummary),
+		);
+		expect(summaries).toContain("NULLISH-chat text");
+		expect(summaries).toContain("NULLISH-input text");
+	});
+
 	it("captures Responses input items as the wire request in full mode", async () => {
 		const input = [
 			{ role: "system", content: "INPUT-system prompt" },
