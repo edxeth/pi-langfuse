@@ -924,12 +924,17 @@ export function getRuntime(config: Config): Promise<LangfuseRuntime> {
 	return withRuntimeTransition(async () => {
 		try {
 			const key = runtimeKey(config);
-			if (
-				runtime &&
-				runtime.configKey !== key &&
-				runtime.observations.size === 0 &&
-				runtime.traces.size === 0
-			) {
+			if (runtime && runtime.configKey !== key) {
+				if (runtime.observations.size > 0 || runtime.traces.size > 0) {
+					// The installed Langfuse SDK binds export credentials to the
+					// processor and score client at construction and keeps one global
+					// tracer provider, so two differently-configured runtimes cannot
+					// be live at once. Wrapping the old runtime with the new config
+					// would send the request through the old project's destination.
+					throw new Error(
+						"Langfuse: a runtime with a different configuration is still active; its open prompts must finish before this configuration can be applied. The request was rejected so telemetry is not routed to the wrong project.",
+					);
+				}
 				const current = runtime;
 				runtime = null;
 				await shutdownRuntime(current);

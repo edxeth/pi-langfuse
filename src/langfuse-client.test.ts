@@ -330,16 +330,35 @@ describe("langfuse v5 runtime facade", () => {
 		expect(mocks.LangfuseClient).toHaveBeenCalledTimes(3);
 	});
 
-	it("defers replacement until the active runtime releases its observations", async () => {
-		const first = await getRuntime(config);
-		const trace = first.trace({ name: "pi-agent" });
-		const prompt = first.span({ name: "agent.prompt", traceId: trace.id });
-		const deferred = await getRuntime({ ...config, host: "http://deferred" });
-		expect(deferred).toBeDefined();
+	it("rejects a conflicting configuration while the active runtime holds observations", async () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			const first = await getRuntime(config);
+			const trace = first.trace({ name: "pi-agent" });
+			const prompt = first.span({ name: "agent.prompt", traceId: trace.id });
+			await expect(
+				getRuntime({ ...config, host: "http://deferred" }),
+			).rejects.toThrow(/different configuration/);
+			expect(mocks.LangfuseClient).toHaveBeenCalledTimes(1);
+			expect(getLastRuntimeError()?.message).toContain(
+				"different configuration",
+			);
+			// The conflicting request must not send telemetry through the old
+			// runtime: only the active prompt's own records exist.
+			expect(mocks.records).toHaveLength(1);
+
+			prompt.end({ output: "done" });
+			await getRuntime({ ...config, host: "http://deferred" });
+			expect(mocks.LangfuseClient).toHaveBeenCalledTimes(2);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("reuses the active runtime when the requested configuration is unchanged", async () => {
+		await getRuntime(config);
+		await getRuntime(config);
 		expect(mocks.LangfuseClient).toHaveBeenCalledTimes(1);
-		prompt.end({ output: "done" });
-		await getRuntime({ ...config, host: "http://deferred" });
-		expect(mocks.LangfuseClient).toHaveBeenCalledTimes(2);
 	});
 
 	it("releases ended observations from the shared runtime registry", async () => {
