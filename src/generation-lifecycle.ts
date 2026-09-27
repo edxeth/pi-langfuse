@@ -29,9 +29,11 @@ import type {
 	writeRawTrace,
 } from "./telemetry-helpers.js";
 import {
+	type CapturedProviderRequest,
 	captureProviderRequest,
 	providerRequestIdentity,
 	providerRequestProvenance,
+	providerRequestSource,
 	providerRequestTraceRecord,
 	summarizeProviderRequestContents,
 } from "./telemetry-helpers.js";
@@ -468,6 +470,36 @@ export function createGenerationLifecycleHandlers(
 		prompt.lastMessages ??
 		deps.telemetryText(config, prompt.userPrompt, config.traceInputMaxChars);
 
+	/**
+	 * Record the generation's input snapshot with explicit provenance. The
+	 * observed provider payload wins: its bounded, redacted contents summary
+	 * describes the actual request, including system instructions and any
+	 * request transforms. Only payloads without recognizable contents fall
+	 * back to the request-time prompt context, and the provenance metadata
+	 * marks that fallback so it is never mistaken for the wire request.
+	 */
+	const applyInputSnapshot = (
+		generationState: GenerationState,
+		prompt: PromptState,
+		config: Config,
+		capture?: CapturedProviderRequest,
+	) => {
+		if (generationState.inputSnapshot !== undefined) return;
+		if (capture?.contents) {
+			generationState.inputSnapshot = summarizeProviderRequestContents(
+				config,
+				capture.contents,
+				capture.systemInstruction,
+			);
+			generationState.metadata.requestSource = providerRequestSource(
+				capture.contents.field,
+			);
+			return;
+		}
+		generationState.inputSnapshot = snapshotInput(prompt, config);
+		generationState.metadata.requestSource = "context";
+	};
+
 	const updateGeneration = (
 		generationState: GenerationState,
 		body: Parameters<NonNullable<LangfuseGeneration["update"]>>[0],
@@ -581,6 +613,7 @@ export function createGenerationLifecycleHandlers(
 		event: BeforeProviderRequestEvent,
 		config: Config,
 		reqModel: string | undefined,
+		capture: CapturedProviderRequest,
 	) => {
 		if (!deps.canTrace(config) || !prompt.trace) return;
 		// Identity covers the complete payload; the truncated display
@@ -591,11 +624,10 @@ export function createGenerationLifecycleHandlers(
 			newRequest: true,
 			requestFingerprint: providerRequestIdentity(event.payload),
 		});
-		if (generationState) {
-			generationState.inputSnapshot = snapshotInput(prompt, config);
-			generationState.requestModel = reqModel;
-			generationState.modelParameters = extractModelParameters(event.payload);
-		}
+		if (!generationState) return;
+		applyInputSnapshot(generationState, prompt, config, capture);
+		generationState.requestModel = reqModel;
+		generationState.modelParameters = extractModelParameters(event.payload);
 	};
 
 	const beforeProviderRequest = async (
@@ -667,7 +699,15 @@ export function createGenerationLifecycleHandlers(
 			}
 
 			recordTurnRequest(config, turn, reqModel, payloadSummaryText);
-			trackGenerationRequest(prompt, turn, record, event, config, reqModel);
+			trackGenerationRequest(
+				prompt,
+				turn,
+				record,
+				event,
+				config,
+				reqModel,
+				capture,
+			);
 		} catch {
 			// Provider payload shaping is diagnostic-only and must not interrupt the request.
 		}
@@ -693,7 +733,7 @@ export function createGenerationLifecycleHandlers(
 			generationState.finishPromise
 		)
 			return;
-		generationState.inputSnapshot ??= snapshotInput(prompt, config);
+		applyInputSnapshot(generationState, prompt, config);
 		generationState.metadata = providerResponseMetadata(
 			record,
 			generationState.metadata,
@@ -729,7 +769,7 @@ export function createGenerationLifecycleHandlers(
 			generationState.messageStarted
 		)
 			return;
-		generationState.inputSnapshot ??= snapshotInput(prompt, config);
+		applyInputSnapshot(generationState, prompt, config);
 		generationState.messageStarted = true;
 		generationState.streamingText = "";
 		generationState.streamingThinking = "";
@@ -761,7 +801,7 @@ export function createGenerationLifecycleHandlers(
 			generationState.finishPromise
 		)
 			return;
-		generationState.inputSnapshot ??= snapshotInput(prompt, config);
+		applyInputSnapshot(generationState, prompt, config);
 		const assistantEvent = asRecord(event.assistantMessageEvent);
 		if (!assistantEvent) return;
 		if (assistantEvent.type === "text_delta") {
@@ -845,7 +885,7 @@ export function createGenerationLifecycleHandlers(
 					})
 				: undefined;
 		if (generationState) {
-			generationState.inputSnapshot ??= snapshotInput(prompt, config);
+			applyInputSnapshot(generationState, prompt, config);
 		}
 		const finalOutput =
 			outputText ||

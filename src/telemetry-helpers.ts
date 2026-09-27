@@ -556,7 +556,7 @@ export function providerRequestProvenance(
 }
 
 /** Provenance label for a recognized contents field. */
-function providerRequestSource(
+export function providerRequestSource(
 	field: ProviderRequestContents["field"],
 ): ProviderRequestSource {
 	switch (field) {

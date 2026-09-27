@@ -2194,10 +2194,10 @@ describe("executable compatibility contract", () => {
 		expect(generation2.parentObservationId).toBe(turn2.id);
 		expect(generation3.parentObservationId).toBe(turn3.id);
 		expect(generation4.parentObservationId).toBe(turn4.id);
-		expect(generation0.input).toEqual([
-			{ role: "system", content: "generation system" },
-			{ role: "user", content: "turn zero" },
-		]);
+		// The generation input describes the observed provider request (audit
+		// #2), not the earlier context event: the wire payload here carries no
+		// system message, so none may appear in the input.
+		expect(generation0.input).toEqual([{ role: "user", content: "turn zero" }]);
 		expect(generation0.end).toMatchObject({
 			output: "answer-0",
 			model: "generation-model-final-0",
