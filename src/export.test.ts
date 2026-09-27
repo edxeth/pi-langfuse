@@ -4,6 +4,7 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -311,6 +312,101 @@ describe("redacted export", () => {
 		} finally {
 			process.env.PATH = originalPath;
 			delete process.env.TRUFFLEHOG_BIN;
+		}
+	});
+
+	it("redacts truncated and deep-escaped secret tails so approval stays truthful", () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-langfuse-export-tail-test-"));
+		const sessions = join(root, "sessions");
+		const out = join(root, "export");
+		mkdirSync(sessions, { recursive: true });
+		const depth6 = '{"password":"SuperSecret9"}'.replace(
+			/"/g,
+			`${"\\".repeat(63)}"`,
+		);
+		writeFileSync(
+			join(sessions, "session.jsonl"),
+			// Second line simulates a truncated file tail: JSON.parse fails and
+			// the value ends mid-string with no closing quote anywhere. The
+			// third line carries a depth-6 escaped assignment.
+			`${JSON.stringify({ type: "message", content: "safe" })}\n${JSON.stringify(
+				{
+					type: "message",
+					content: 'log tail {"password":"SuperSecret9',
+				},
+			).slice(0, -2)}\n${JSON.stringify({
+				type: "message",
+				content: `see ${depth6}`,
+			})}\n`,
+		);
+
+		const report = exportRedactedData(
+			baseConfig,
+			`--sessions-only --sessions-dir ${join(root, "sessions")} --out ${out} --no-trufflehog`,
+		);
+
+		// Fail-closed redaction resolves both lines: the truncated line is
+		// hash-replaced via the quoted-value extent found against the outer
+		// JSONL quote, and the depth-6 line is structure-preservingly
+		// replaced. The derivative is clean and approval is truthful.
+		const exported = readFileSync(
+			join(out, "sessions", "session.jsonl"),
+			"utf-8",
+		);
+		expect(exported).not.toContain("SuperSecret9");
+		expect(exported).toContain("[REDACTED:password:");
+		expect(report.summary).toMatchObject({
+			files: 1,
+			approved: 1,
+			rejected: 0,
+		});
+	});
+
+	it("creates export artifacts with owner-only modes", () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-langfuse-export-modes-test-"));
+		const sessions = join(root, "sessions");
+		const out = join(root, "export");
+		mkdirSync(sessions, { recursive: true });
+		// The required scanner is unavailable, so the derivative is rejected;
+		// export artifacts must not be group/world readable regardless of
+		// approval state.
+		writeFileSync(
+			join(sessions, "session.jsonl"),
+			'{"type":"message","content":"safe"}\n',
+		);
+
+		const originalPath = process.env.PATH;
+		process.env.PATH = "";
+		const report = (() => {
+			try {
+				return exportRedactedData(
+					baseConfig,
+					`--sessions-only --sessions-dir ${sessions} --out ${out} --require-trufflehog`,
+				);
+			} finally {
+				process.env.PATH = originalPath;
+			}
+		})();
+
+		expect(report.summary).toMatchObject({
+			files: 1,
+			approved: 0,
+			rejected: 1,
+		});
+		expect(statSync(out).mode & 0o777).toBe(0o700);
+		expect(statSync(join(out, "sessions")).mode & 0o777).toBe(0o700);
+		expect(statSync(join(out, "sessions", "session.jsonl")).mode & 0o777).toBe(
+			0o600,
+		);
+		for (const artifact of [
+			"report.json",
+			"manifest.jsonl",
+			"approved.jsonl",
+			"rejected.jsonl",
+			"training-index.jsonl",
+			"REVIEW.md",
+		]) {
+			expect(statSync(join(out, artifact)).mode & 0o777).toBe(0o600);
 		}
 	});
 

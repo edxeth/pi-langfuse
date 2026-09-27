@@ -84,6 +84,13 @@ type CommandContext = {
 	};
 };
 
+// Export derivatives can carry residual secrets (rejected files especially),
+// so new export artifacts and directories are owner-only at creation,
+// consistent with the raw-trace privacy contract. Modes apply at creation
+// only; pre-existing files are never chmod'ed.
+const EXPORT_DIR_MODE = 0o700;
+const EXPORT_FILE_MODE = 0o600;
+
 /**
  * Refuse destinations the export must not touch: a nonempty directory may
  * hold unrelated user files (reusing a directory must never delete or mix
@@ -239,8 +246,11 @@ function copyRedactedFile(
 		relativePath,
 	);
 	const output = join(outRoot, outputPath);
-	mkdirSync(dirname(output), { recursive: true });
-	writeFileSync(output, sanitized, "utf-8");
+	mkdirSync(dirname(output), { recursive: true, mode: EXPORT_DIR_MODE });
+	writeFileSync(output, sanitized, {
+		encoding: "utf-8",
+		mode: EXPORT_FILE_MODE,
+	});
 
 	return {
 		layer,
@@ -348,7 +358,7 @@ export function exportRedactedData(
 			error: destinationError,
 		};
 	}
-	mkdirSync(outDir, { recursive: true });
+	mkdirSync(outDir, { recursive: true, mode: EXPORT_DIR_MODE });
 	onProgress?.({ phase: "discover", message: "discovering JSONL files" });
 
 	const sessionInputs = options.includeSessions
@@ -466,10 +476,12 @@ export function exportRedactedData(
 	writeFileSync(
 		join(outDir, "report.json"),
 		`${JSON.stringify({ ...report, outDir: "." }, null, 2)}\n`,
+		{ mode: EXPORT_FILE_MODE },
 	);
 	writeFileSync(
 		join(outDir, "manifest.jsonl"),
 		`${files.map((file) => JSON.stringify(file)).join("\n")}\n`,
+		{ mode: EXPORT_FILE_MODE },
 	);
 	writeFileSync(
 		join(outDir, "approved.jsonl"),
@@ -477,6 +489,7 @@ export function exportRedactedData(
 			.filter((file) => file.status === "approved")
 			.map((file) => JSON.stringify(file))
 			.join("\n")}\n`,
+		{ mode: EXPORT_FILE_MODE },
 	);
 	writeFileSync(
 		join(outDir, "rejected.jsonl"),
@@ -484,6 +497,7 @@ export function exportRedactedData(
 			.filter((file) => file.status === "rejected")
 			.map((file) => JSON.stringify(file))
 			.join("\n")}\n`,
+		{ mode: EXPORT_FILE_MODE },
 	);
 	writeFileSync(
 		join(outDir, "training-index.jsonl"),
@@ -497,10 +511,12 @@ export function exportRedactedData(
 				}),
 			)
 			.join("\n")}\n`,
+		{ mode: EXPORT_FILE_MODE },
 	);
 	writeFileSync(
 		join(outDir, "REVIEW.md"),
 		`# pi-langfuse redacted export\n\nStatus: ${exportStatus}\n\n- Files: ${report.summary.files}\n- Approved: ${report.summary.approved}\n- Rejected: ${report.summary.rejected}\n- TruffleHog: ${trufflehog ? `${trufflehog.enabled ? (trufflehog.available ? "ran" : "unavailable") : "skipped"}, required=${trufflehog.required}, findings=${trufflehog.findings}` : "not requested"}\n- Training index: training-index.jsonl\n\nThis export is local-only. Review approved files before using them for training or sharing.\n`,
+		{ mode: EXPORT_FILE_MODE },
 	);
 
 	ctx?.ui?.notify?.(
