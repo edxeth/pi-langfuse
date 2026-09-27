@@ -329,26 +329,54 @@ function batchSize(events: RestFallbackEvent[]) {
 	);
 }
 
-function buildBatches(traces: RestFallbackTrace[]) {
+function eventBytes(event: RestFallbackEvent) {
+	return Buffer.byteLength(JSON.stringify(event), "utf8");
+}
+
+function boundedEventList(ids: string[], max = MAX_REPORTED_FAILURE_REASONS) {
+	const shown = ids.slice(0, max);
+	const omitted = ids.length - shown.length;
+	return `${shown.join(", ")}${omitted > 0 ? ` (+${omitted} more)` : ""}`;
+}
+
+export interface BuiltFallbackBatches {
+	batches: RestFallbackEvent[][];
+	oversizedEventLabels: string[];
+}
+
+function buildBatches(traces: RestFallbackTrace[]): BuiltFallbackBatches {
 	const batches: RestFallbackEvent[][] = [];
+	const oversizedEventLabels: string[] = [];
 	let current: RestFallbackEvent[] = [];
 	for (const trace of traces) {
-		const events = [
+		// One event above the server's per-request limit cannot be delivered by
+		// any batching, so it is dropped and reported instead of poisoning the
+		// whole batch that carries it.
+		const sendable: RestFallbackEvent[] = [];
+		for (const event of [
 			fallbackTraceEvent(trace),
 			...trace.observations.map(fallbackObservationEvent),
-		];
+		]) {
+			if (eventBytes(event) > MAX_REST_BATCH_BYTES) {
+				oversizedEventLabels.push(
+					`${event.type} ${String(event.body.id ?? trace.id)} (${eventBytes(event)} bytes)`,
+				);
+				continue;
+			}
+			sendable.push(event);
+		}
 		if (
 			current.length > 0 &&
-			batchSize([...current, ...events]) > MAX_REST_BATCH_BYTES
+			batchSize([...current, ...sendable]) > MAX_REST_BATCH_BYTES
 		) {
 			batches.push(current);
 			current = [];
 		}
-		if (batchSize(events) <= MAX_REST_BATCH_BYTES) {
-			current.push(...events);
+		if (batchSize(sendable) <= MAX_REST_BATCH_BYTES) {
+			current.push(...sendable);
 			continue;
 		}
-		for (const event of events) {
+		for (const event of sendable) {
 			if (
 				current.length > 0 &&
 				batchSize([...current, event]) > MAX_REST_BATCH_BYTES
@@ -360,7 +388,7 @@ function buildBatches(traces: RestFallbackTrace[]) {
 		}
 	}
 	if (current.length > 0) batches.push(current);
-	return batches;
+	return { batches, oversizedEventLabels };
 }
 
 async function withTimeout<T>(
@@ -543,7 +571,7 @@ export async function drainCompletedRestFallback(
 			.filter(({ visible: isVisible }) => !isVisible)
 			.map(({ trace }) => trace);
 		if (missing.length === 0) return;
-		const batches = buildBatches(missing);
+		const { batches, oversizedEventLabels } = buildBatches(missing);
 		const results = await Promise.allSettled(
 			batches.map((events) =>
 				sendBatch(client, events, options.requestTimeoutMs),
@@ -552,19 +580,28 @@ export async function drainCompletedRestFallback(
 		const failures = results.filter(
 			(result): result is PromiseRejectedResult => result.status === "rejected",
 		);
-		if (failures.length > 0) {
-			const reasons = Array.from(
-				new Set(
-					failures.map((failure) => fallbackFailureMessage(failure.reason)),
-				),
-			);
-			// Cap the joined reasons so one terminal line stays constant-bounded even
-			// when every batch fails for a different reason.
-			const shown = reasons.slice(0, MAX_REPORTED_FAILURE_REASONS);
-			const omitted = reasons.length - shown.length;
-			throw new Error(
-				`REST fallback ingestion failed for ${failures.length}/${batches.length} batch(es): ${shown.join("; ")}${omitted > 0 ? ` (+${omitted} more)` : ""}`,
-			);
+		if (failures.length > 0 || oversizedEventLabels.length > 0) {
+			const problems: string[] = [];
+			if (failures.length > 0) {
+				const reasons = Array.from(
+					new Set(
+						failures.map((failure) => fallbackFailureMessage(failure.reason)),
+					),
+				);
+				// Cap the joined reasons so one terminal line stays constant-bounded even
+				// when every batch fails for a different reason.
+				const shown = reasons.slice(0, MAX_REPORTED_FAILURE_REASONS);
+				const omitted = reasons.length - shown.length;
+				problems.push(
+					`REST fallback ingestion failed for ${failures.length}/${batches.length} batch(es): ${shown.join("; ")}${omitted > 0 ? ` (+${omitted} more)` : ""}`,
+				);
+			}
+			if (oversizedEventLabels.length > 0) {
+				problems.push(
+					`REST fallback ingestion dropped ${oversizedEventLabels.length} oversized event(s) beyond the ${MAX_REST_BATCH_BYTES}-byte limit: ${boundedEventList(oversizedEventLabels)}`,
+				);
+			}
+			throw new Error(problems.join("; "));
 		}
 	} finally {
 		for (const trace of candidates) retireTrace(store, trace);

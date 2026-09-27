@@ -660,6 +660,77 @@ describe("langfuse v5 runtime facade", () => {
 		}
 	});
 
+	it("drops single fallback events that exceed the ingestion byte limit", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			shutdownStepMs: 20,
+			traceVisibilityMs: 10,
+			pollIntervalMs: 1,
+		});
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			mocks.traceGet.mockReset().mockRejectedValue(new Error("not visible"));
+			mocks.ingestionBatch
+				.mockReset()
+				.mockResolvedValue({ successes: [], errors: [] });
+			const fallbackConfig = {
+				...config,
+				payloadMaxStringChars: Infinity,
+				payloadMaxToolChars: Infinity,
+				payloadMaxDepth: Infinity,
+				payloadMaxArrayItems: Infinity,
+				payloadMaxObjectKeys: Infinity,
+				payloadMaxNodes: Infinity,
+			};
+			const lf = await getRuntime(fallbackConfig);
+			const oversizedTrace = lf.trace({
+				id: "9".repeat(32),
+				name: "pi-agent",
+				// "x " pairs survive redaction (plain text, not base64-shaped).
+				input: "x ".repeat(1_800_000),
+			});
+			const oversizedPrompt = lf.span({
+				name: "agent.prompt",
+				traceId: oversizedTrace.id,
+			});
+			oversizedPrompt.end({ output: "done" });
+			const healthyTrace = lf.trace({
+				id: "8".repeat(32),
+				name: "pi-agent",
+				input: "healthy prompt",
+			});
+			const healthyPrompt = lf.span({
+				name: "agent.prompt",
+				traceId: healthyTrace.id,
+			});
+			healthyPrompt.end({ output: "healthy answer" });
+
+			await flushClient();
+
+			const calls = mocks.ingestionBatch.mock.calls as unknown as Array<
+				[unknown]
+			>;
+			expect(calls.length).toBeGreaterThan(0);
+			for (const [request] of calls) {
+				expect(
+					Buffer.byteLength(JSON.stringify(request), "utf8"),
+				).toBeLessThanOrEqual(3_500_000);
+			}
+			const sent = JSON.stringify(calls.map(([request]) => request));
+			expect(sent).not.toContain("x".repeat(1_000));
+			expect(sent).toContain("healthy prompt");
+			expect(sent).toContain("healthy answer");
+			expect(getLastRuntimeError()?.message).toContain("oversized");
+			const fallbackWarning = warn.mock.calls.find(([message]) =>
+				String(message).includes("REST fallback ingestion"),
+			);
+			expect(String(fallbackWarning?.[0])).toContain("oversized");
+		} finally {
+			mocks.ingestionBatch.mockResolvedValue({ successes: [], errors: [] });
+			warn.mockRestore();
+			restoreTimeouts();
+		}
+	});
+
 	it("reports one diagnostic when multiple fallback batches time out", async () => {
 		const restoreTimeouts = setRuntimeTimeoutsForTest({
 			shutdownStepMs: 20,
