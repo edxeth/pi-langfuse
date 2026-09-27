@@ -86,8 +86,8 @@ export interface RestFallbackStore {
 /**
  * Connection facts for the supported OTLP ingestion endpoint. The legacy
  * `/api/public/ingestion` and trace read APIs are unavailable on Langfuse
- * server v4, so both the replay and the completeness check use the
- * OTLP/v2 surface that exists on v3 and v4 alike.
+ * server v4. Replay uses OTLP in both modes; confirmation selects the
+ * observations API supported by the server's write mode.
  */
 export interface RestFallbackConnection {
 	host: string;
@@ -654,58 +654,245 @@ function delay(ms: number) {
 	return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
+// Remember a successful read API per runtime client, not globally by
+// hostname: different projects can use different write modes on the same
+// server.
+const legacyObservationClients = new WeakSet<LangfuseClient>();
+type ObservationApi = "v1" | "v2";
+type ObservationPageView = {
+	ids: string[];
+	hasMore: boolean;
+	cursor?: string;
+};
+type ObservationPageResult =
+	| ({ status: "ok" } & ObservationPageView)
+	| { status: "unsupported" | "unavailable" };
+
+interface ObservationRequestOptions {
+	timeoutInSeconds: number;
+	maxRetries: number;
+	abortSignal: AbortSignal;
+}
+
+/** The Langfuse SDK surfaces HTTP failures as error values carrying a status code. */
+function isMissingEndpointError(error: unknown): boolean {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		"statusCode" in error &&
+		error.statusCode === 404
+	);
+}
+
 /**
- * Reads the observation ids the server reports for a trace through the
- * supported v2 observations endpoint. `undefined` means the check could not
- * produce an answer (endpoint missing, HTTP error, timeout).
+ * Fetches one observations page through `send` and projects the response.
+ * A 404 is classified as `unsupported` (the endpoint does not exist in the
+ * server's current write mode, the only failure that may negotiate API
+ * versions); every other error or a missing SDK surface is `unavailable`,
+ * so the completeness check stays honest instead of reading failure as
+ * missing observations.
+ */
+async function readObservationPage<T>(
+	send: (requestOptions: ObservationRequestOptions) => Promise<T> | undefined,
+	timeoutMs: number,
+	project: (response: T) => ObservationPageView,
+): Promise<ObservationPageResult> {
+	const controller = new AbortController();
+	const requestOptions: ObservationRequestOptions = {
+		timeoutInSeconds: Math.max(timeoutMs / 1000, 0.001),
+		maxRetries: 0,
+		abortSignal: controller.signal,
+	};
+	try {
+		const response = await withTimeout(
+			"Trace visibility check",
+			send(requestOptions),
+			timeoutMs,
+			() => controller.abort(),
+		);
+		if (!response) return { status: "unavailable" };
+		return { status: "ok", ...project(response) };
+	} catch (error) {
+		return {
+			status: isMissingEndpointError(error) ? "unsupported" : "unavailable",
+		};
+	}
+}
+
+/** The legacy v1 observations API: page-number pagination, 100 rows per page. */
+function observationV1Page(
+	client: LangfuseClient,
+	traceId: string,
+	page: number,
+	timeoutMs: number,
+): Promise<ObservationPageResult> {
+	return readObservationPage(
+		(requestOptions) =>
+			client.api?.legacy?.observationsV1?.getMany(
+				{ traceId, page: page + 1, limit: 100 },
+				requestOptions,
+			),
+		timeoutMs,
+		(response) => ({
+			ids: response.data.map((observation) => observation.id),
+			hasMore: page + 1 < response.meta.totalPages,
+		}),
+	);
+}
+
+/**
+ * Reads the v2 page payload defensively: a server answering 200 with a null
+ * `data` array is an empty page, not a crash, and stays unconfirmed.
+ */
+function v2ObservationPageView(response: {
+	data?: Array<{ id: string }>;
+	meta?: { cursor?: string };
+}): ObservationPageView {
+	const nextCursor = response.meta?.cursor;
+	return {
+		ids: (response.data ?? []).map((observation) => observation.id),
+		hasMore: Boolean(nextCursor),
+		cursor: nextCursor,
+	};
+}
+
+/** The v2 observations API: cursor pagination, 1000 rows per page. */
+function observationV2Page(
+	client: LangfuseClient,
+	traceId: string,
+	cursor: string | undefined,
+	timeoutMs: number,
+): Promise<ObservationPageResult> {
+	return readObservationPage(
+		(requestOptions) =>
+			client.api?.observations?.getMany(
+				{ traceId, fields: "core", limit: 1000, ...(cursor ? { cursor } : {}) },
+				requestOptions,
+			),
+		timeoutMs,
+		v2ObservationPageView,
+	);
+}
+
+function observationPage(
+	client: LangfuseClient,
+	api: ObservationApi,
+	traceId: string,
+	page: number,
+	cursor: string | undefined,
+	timeoutMs: number,
+): Promise<ObservationPageResult> {
+	return api === "v1"
+		? observationV1Page(client, traceId, page, timeoutMs)
+		: observationV2Page(client, traceId, cursor, timeoutMs);
+}
+
+/** The read API this client last confirmed working; fresh clients try v2 first. */
+function rememberedObservationApi(client: LangfuseClient): ObservationApi {
+	return legacyObservationClients.has(client) ? "v1" : "v2";
+}
+
+function rememberObservationApi(
+	client: LangfuseClient,
+	api: ObservationApi,
+): void {
+	if (api === "v1") legacyObservationClients.add(client);
+	else legacyObservationClients.delete(client);
+}
+
+/**
+ * v1 serves 100 rows per page against v2's 1000, so it gets ten times the
+ * page budget and the observation budget stays identical across versions.
+ * The budget follows the active version, because the first page may negotiate.
+ */
+function observationPageBudget(api: ObservationApi): number {
+	return MAX_VISIBILITY_PAGES * (api === "v1" ? 10 : 1);
+}
+
+/** Only well-formed ids count toward confirmation; a malformed row must not. */
+function addObservedIds(ids: Set<string>, candidates: string[]): void {
+	for (const id of candidates) {
+		if (typeof id === "string") ids.add(id);
+	}
+}
+
+/**
+ * Fetches one page, negotiating the API version when the server reports the
+ * preferred one missing (404). Only the very first page may negotiate, and
+ * only while time remains; later failures stay honest unavailability.
+ */
+async function negotiatedObservationPage(
+	client: LangfuseClient,
+	api: ObservationApi,
+	traceId: string,
+	page: number,
+	cursor: string | undefined,
+	deadline: number,
+): Promise<{ page: ObservationPageResult; api: ObservationApi }> {
+	let result = await observationPage(
+		client,
+		api,
+		traceId,
+		page,
+		cursor,
+		Math.max(1, deadline - Date.now()),
+	);
+	if (result.status === "unsupported" && page === 0 && Date.now() < deadline) {
+		api = api === "v1" ? "v2" : "v1";
+		result = await observationPage(
+			client,
+			api,
+			traceId,
+			page,
+			undefined,
+			Math.max(1, deadline - Date.now()),
+		);
+	}
+	return { page: result, api };
+}
+
+/**
+ * Reads the observation ids the server reports for a trace, through the read
+ * API the server's write mode supports. `undefined` means the check could not
+ * produce an answer (no usable endpoint, HTTP error, timeout); a returned set
+ * may legitimately be incomplete.
  */
 async function serverObservationIds(
 	client: LangfuseClient,
 	traceId: string,
-	expectedCount: number,
+	expectedIds: string[],
 	timeoutMs: number,
 ): Promise<Set<string> | undefined> {
-	const observationsApi = client.api?.observations;
-	if (!observationsApi?.getMany) return undefined;
+	let api = rememberedObservationApi(client);
 	const ids = new Set<string>();
 	let cursor: string | undefined;
-	for (let page = 0; page < MAX_VISIBILITY_PAGES; page += 1) {
-		const controller = new AbortController();
-		try {
-			const response = await withTimeout(
-				"Trace visibility check",
-				observationsApi.getMany(
-					{
-						traceId,
-						fields: "core",
-						limit: 1000,
-						...(cursor ? { cursor } : {}),
-					},
-					{
-						timeoutInSeconds: Math.max(timeoutMs / 1000, 0.001),
-						maxRetries: 0,
-						abortSignal: controller.signal,
-					},
-				),
-				timeoutMs,
-				() => controller.abort(),
-			);
-			for (const observation of response?.data ?? []) {
-				if (typeof observation?.id === "string") ids.add(observation.id);
-			}
-			if (ids.size >= expectedCount) return ids;
-			cursor = response?.meta?.cursor;
-			if (!cursor) return ids;
-		} catch {
-			return undefined;
-		}
+	const deadline = Date.now() + timeoutMs;
+	for (let page = 0; page < observationPageBudget(api); page += 1) {
+		const outcome = await negotiatedObservationPage(
+			client,
+			api,
+			traceId,
+			page,
+			cursor,
+			deadline,
+		);
+		api = outcome.api;
+		const { page: result } = outcome;
+		if (result.status !== "ok") return undefined;
+		rememberObservationApi(client, api);
+		addObservedIds(ids, result.ids);
+		// Other instrumentation may add observations to this trace. Row count
+		// alone cannot prove our IDs are present, even when it exceeds ours.
+		if (expectedIds.every((id) => ids.has(id)) || !result.hasMore) return ids;
+		if (Date.now() >= deadline) return undefined;
+		cursor = result.cursor;
 	}
 	return ids;
 }
 
 /**
  * A trace only counts as delivered when every recorded observation is
- * confirmed on the server through the v2 observations endpoint. Existence of
+ * confirmed through the server's supported observations endpoint. Existence of
  * the trace row alone is not enough: the exporter can split one trace across
  * batches and reject some of them. A failed or unavailable check is reported
  * as unconfirmed so the replay path re-sends with stable identities instead
@@ -732,7 +919,7 @@ async function traceIsCompleteOnServer(
 		const serverIds = await serverObservationIds(
 			deps.client,
 			trace.id,
-			expected.length,
+			expected,
 			Math.min(options.requestTimeoutMs, remaining),
 		);
 		if (serverIds !== undefined) {

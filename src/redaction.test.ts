@@ -499,6 +499,237 @@ describe("redaction", () => {
 		).toBe("sk-lf-test-secret-1234567890");
 	});
 
+	/** Env object whose property reads are counted: collectExactSecrets
+	 * scans the env via Object.entries, so each scan reads every entry once. */
+	function envWithReadCounter(entries: Record<string, string>) {
+		let reads = 0;
+		const env: NodeJS.ProcessEnv = {};
+		for (const [key, value] of Object.entries(entries)) {
+			Object.defineProperty(env, key, {
+				enumerable: true,
+				get() {
+					reads += 1;
+					return value;
+				},
+			});
+		}
+		return { env, reads: () => reads };
+	}
+
+	it("collects exact secrets once per sanitizeForTelemetry call, not per string", () => {
+		const { env, reads } = envWithReadCounter({
+			OPENAI_API_KEY: "sk-proj-thisisaverylongopenaitestkey",
+			INTERNAL_NOTES: "not a secret",
+		});
+		const payload = {
+			head: "first sk-proj-thisisaverylongopenaitestkey",
+			nested: { mid: "second sk-proj-thisisaverylongopenaitestkey" },
+			list: ["third sk-proj-thisisaverylongopenaitestkey", ""],
+			tail: "no secrets here",
+			empty: "",
+		};
+
+		const sanitized = sanitizeForTelemetry(config, payload, env);
+
+		// Output equivalence: every string still redacted.
+		expect(JSON.stringify(sanitized)).not.toContain(
+			"sk-proj-thisisaverylongopenaitestkey",
+		);
+		// Exactly one env scan (2 entries) for the whole payload regardless of
+		// the number of non-empty strings.
+		expect(reads()).toBe(2);
+	});
+
+	it("skips exact-secret collection for payloads without redactable strings", () => {
+		const { env, reads } = envWithReadCounter({
+			OPENAI_API_KEY: "sk-proj-thisisaverylongopenaitestkey",
+		});
+
+		sanitizeForTelemetry(
+			config,
+			{ count: 3, flag: true, nested: { deep: null } },
+			env,
+		);
+		expect(reads()).toBe(0);
+
+		sanitizeForTelemetry(
+			{ ...config, redactionEnabled: false },
+			{ text: "sk-proj-thisisaverylongopenaitestkey" },
+			env,
+		);
+		expect(reads()).toBe(0);
+	});
+
+	it("sees env and config changes between sanitizeForTelemetry calls", () => {
+		const env: NodeJS.ProcessEnv = {
+			FIRST_SECRET_TOKEN: "abcdefghijklmnop1234",
+		};
+		const freshConfig = {
+			redactionEnabled: true,
+			redactionAdditionalSecrets: ["qrstuvwxyz56789012"] as string[],
+		};
+
+		const first = JSON.stringify(
+			sanitizeForTelemetry(freshConfig, { text: "abcdefghijklmnop1234" }, env),
+		);
+		expect(first).not.toContain("abcdefghijklmnop1234");
+		expect(first).toContain("[REDACTED:first-secret-token:");
+
+		// Env entry added and configured secret swapped between calls; the
+		// next top-level call must observe both.
+		env.SECOND_SECRET_TOKEN = "bbbbccccdddd11112";
+		freshConfig.redactionAdditionalSecrets = ["eeeeffffgggg22223"];
+		const second = JSON.stringify(
+			sanitizeForTelemetry(
+				freshConfig,
+				{
+					text: "abcdefghijklmnop1234 bbbbccccdddd11112 eeeeffffgggg22223 qrstuvwxyz56789012",
+				},
+				env,
+			),
+		);
+		expect(second).not.toContain("abcdefghijklmnop1234");
+		expect(second).not.toContain("bbbbccccdddd11112");
+		expect(second).toContain("[REDACTED:second-secret-token:");
+		expect(second).toContain("[REDACTED:configured-secret:");
+		// The removed configured secret is no longer collected.
+		expect(second).toContain("qrstuvwxyz56789012");
+	});
+
+	it("keeps direct redactString calls fresh against env changes", () => {
+		const env: NodeJS.ProcessEnv = {
+			FIRST_SECRET_TOKEN: "abcdefghijklmnop1234",
+		};
+
+		const first = redactString(config, "abc abcdefghijklmnop1234", env);
+		expect(first).toContain("[REDACTED:first-secret-token:");
+
+		env.FIRST_SECRET_TOKEN = "bbbbccccdddd11112";
+		const second = redactString(config, "abc bbbbccccdddd11112", env);
+		expect(second).toContain("[REDACTED:first-secret-token:");
+		// The old env value is no longer collected, so it passes through.
+		const stale = redactString(config, "abc abcdefghijklmnop1234", env);
+		expect(stale).toContain("abcdefghijklmnop1234");
+	});
+
+	it("matches per-string redactString output across mixed nested fields", () => {
+		const env = {
+			OPENAI_API_KEY: "sk-proj-thisisaverylongopenaitestkey",
+			DEPLOY_TOKEN: "abcdefghijklmnop1234",
+		};
+		const payload = {
+			plain: "ordinary prose",
+			head: "first sk-proj-thisisaverylongopenaitestkey mid abcdefghijklmnop1234",
+			nested: {
+				list: [
+					"second sk-proj-thisisaverylongopenaitestkey",
+					"",
+					"ghp_abcdefghijklmnopqrstuvwxyz1234567890",
+				],
+				note: "keep me",
+			},
+		};
+
+		const sanitized = sanitizeForTelemetry(
+			config,
+			payload,
+			env,
+		) as typeof payload;
+		const walk = (expected: unknown, actual: unknown): void => {
+			if (typeof expected === "string") {
+				expect(actual).toBe(redactString(config, expected, env));
+				return;
+			}
+			if (Array.isArray(expected)) {
+				expected.forEach((item, index) => {
+					walk(item, (actual as unknown[])[index]);
+				});
+				return;
+			}
+			if (expected && typeof expected === "object") {
+				for (const [key, item] of Object.entries(expected)) {
+					walk(item, (actual as Record<string, unknown>)[key]);
+				}
+			}
+		};
+		walk(payload, sanitized);
+	});
+
+	it("redacts overlapping exact secrets longest-first with identical output", () => {
+		const env = { DEPLOY_TOKEN: "abcdefghijklmnop1234" };
+		const overlapConfig = {
+			redactionEnabled: true,
+			redactionAdditionalSecrets: ["abcdefghijklmnop1234xyz"],
+		};
+		const input = "abcdefghijklmnop1234xyz abcdefghijklmnop1234";
+
+		const expected = redactString(overlapConfig, input, env);
+		// Longer secret replaced first, so both placeholders survive intact.
+		expect(expected).toContain("[REDACTED:configured-secret:");
+		expect(expected).toContain("[REDACTED:deploy-token:");
+
+		const sanitized = sanitizeForTelemetry(
+			overlapConfig,
+			{ text: input },
+			env,
+		) as {
+			text: string;
+		};
+		expect(sanitized.text).toBe(expected);
+	});
+
+	it("keeps the configured-secret reason when the env duplicates it", () => {
+		const env = { DEPLOY_TOKEN: "abcdefghijklmnop1234" };
+		const dedupConfig = {
+			redactionEnabled: true,
+			redactionAdditionalSecrets: ["abcdefghijklmnop1234"],
+		};
+
+		const output = redactString(dedupConfig, "value abcdefghijklmnop1234", env);
+		// One entry per distinct value; the env reason wins (last collected).
+		const placeholders = output.match(/\[REDACTED:[^\]]*\]/g) ?? [];
+		expect(placeholders).toHaveLength(1);
+		expect(placeholders[0]).toMatch(/^\[REDACTED:deploy-token:[0-9a-f]{10}\]$/);
+
+		const sanitized = sanitizeForTelemetry(
+			dedupConfig,
+			{ text: "value abcdefghijklmnop1234" },
+			env,
+		) as {
+			text: string;
+		};
+		expect(sanitized.text).toBe(output);
+	});
+
+	it("redacts with limits identically to unbounded sanitize", () => {
+		const env = { DEPLOY_TOKEN: "abcdefghijklmnop1234" };
+		const payload = {
+			text: "abc abcdefghijklmnop1234",
+			more: "ghp_abcdefghijklmnopqrstuvwxyz1234567890",
+		};
+		const unbounded = sanitizeForTelemetry(
+			config,
+			payload,
+			env,
+		) as typeof payload;
+		const bounded = sanitizeForTelemetry(
+			config,
+			payload,
+			env,
+			new WeakSet<object>(),
+			{
+				maxStringChars: 400,
+				maxDepth: 10,
+				maxArrayItems: 10,
+				maxObjectKeys: 10,
+				maxNodes: 100,
+			},
+		) as typeof payload;
+		// Payload is small enough that bounds do not truncate; redaction must
+		// produce identical output with or without limits.
+		expect(bounded).toEqual(unbounded);
+	});
+
 	it("does not treat publicKey, paths, or token counters as sensitive field names", () => {
 		expect(isSensitiveKey("publicKey")).toBe(false);
 		expect(isSensitiveKey("cwd")).toBe(false);

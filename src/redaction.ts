@@ -566,11 +566,16 @@ function collectExactSecrets(
 	);
 }
 
-export function redactString(
+/**
+ * Redact one string against a precomputed exact-secret list. The list must
+ * come from `collectExactSecrets` for the same config/env pair; callers own
+ * its lifetime (see `sanitizeForTelemetry` for payload-granularity reuse).
+ */
+function redactStringWithSecrets(
 	config: RedactionConfig,
 	input: string,
-	env: NodeJS.ProcessEnv = process.env,
-) {
+	exactSecrets: ExactSecret[],
+): string {
 	if (!config.redactionEnabled || !input) return input;
 	// Secret assignments are parsed by one shared forward tokenization. When
 	// any value extent is unprovable, the whole string is omitted per the
@@ -603,7 +608,7 @@ export function redactString(
 		);
 	}
 
-	for (const secret of collectExactSecrets(config, env)) {
+	for (const secret of exactSecrets) {
 		if (output.includes(secret.value)) {
 			output = output
 				.split(secret.value)
@@ -618,6 +623,21 @@ export function redactString(
 	}
 
 	return output;
+}
+
+export function redactString(
+	config: RedactionConfig,
+	input: string,
+	env: NodeJS.ProcessEnv = process.env,
+) {
+	// Direct calls collect exact secrets fresh per string, so env/config
+	// changes are always visible at one-string granularity.
+	if (!config.redactionEnabled || !input) return input;
+	return redactStringWithSecrets(
+		config,
+		input,
+		collectExactSecrets(config, env),
+	);
 }
 
 const MAX_STRUCTURED_REDACTION_CHARS = 100_000;
@@ -670,15 +690,28 @@ export function sanitizeForTelemetry<T>(
 	if (!config.redactionEnabled && !limits) return value;
 	const nodes = { count: 0 };
 
+	// Exact secrets are collected lazily once per top-level call and reused
+	// for every string in the payload, so the O(env) collection runs once
+	// per payload instead of once per string. Env/config changes between
+	// top-level calls stay visible; mutations made while one synchronous
+	// traversal runs are not observed until the next call (payload-
+	// granularity snapshot).
+	let exactSecrets: ExactSecret[] | undefined;
+	const exactSecretsForPayload = (): ExactSecret[] => {
+		exactSecrets ??= collectExactSecrets(config, env);
+		return exactSecrets;
+	};
+
 	const sanitize = (current: unknown, depth: number): unknown => {
 		if (limits && nodes.count >= (limits.maxNodes ?? Infinity))
 			return undefined;
 		nodes.count += 1;
 
 		if (typeof current === "string") {
-			const redacted = config.redactionEnabled
-				? redactString(config, current, env)
-				: current;
+			const redacted =
+				config.redactionEnabled && current
+					? redactStringWithSecrets(config, current, exactSecretsForPayload())
+					: current;
 			const maxChars = limits?.maxStringChars ?? Infinity;
 			return Number.isFinite(maxChars) && redacted.length > maxChars
 				? redacted.slice(0, maxChars)
