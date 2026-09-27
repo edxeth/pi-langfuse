@@ -42,6 +42,41 @@ function localConfigPath(dir = defaultLangfuseDir()) {
 	return join(dir, "pi-langfuse.json");
 }
 
+type LocalBinding = { url: string; webPort: number };
+
+function parseLocalHostBinding(host: string): LocalBinding | { error: string } {
+	let parsed: URL;
+	try {
+		parsed = new URL(host);
+	} catch {
+		return {
+			error: `--host must be a valid URL (got "${host}"), e.g. http://localhost:3100.`,
+		};
+	}
+	if (parsed.protocol !== "http:") {
+		return {
+			error: `--host must use http:// for the local stack, which terminates no TLS (got "${host}").`,
+		};
+	}
+	// The generated stack publishes 127.0.0.1 only, so IPv6 loopback would be unreachable.
+	if (parsed.hostname === "[::1]") {
+		return {
+			error: `--host http://[::1] is not supported: the generated stack publishes IPv4 loopback (127.0.0.1) only. Use http://127.0.0.1:<port> instead.`,
+		};
+	}
+	const loopbackHosts = ["localhost", "127.0.0.1"];
+	if (!loopbackHosts.includes(parsed.hostname)) {
+		return {
+			error: `--host must be a loopback URL (localhost or 127.0.0.1) so the stack stays private (got "${host}").`,
+		};
+	}
+	const webPort = parsed.port ? Number(parsed.port) : 3100;
+	if (!Number.isInteger(webPort) || webPort < 1 || webPort > 65535) {
+		return { error: `--host port is not a valid TCP port (got "${host}").` };
+	}
+	return { url: `http://${parsed.hostname}:${webPort}`, webPort };
+}
+
 function token(bytes = 24) {
 	return randomBytes(bytes).toString("base64url");
 }
@@ -206,7 +241,7 @@ DIRECT_URL=postgresql://postgres:${postgresPassword}@postgres:5432/postgres
 `;
 }
 
-function dockerComposeFile() {
+function dockerComposeFile(webPort: number) {
 	return `services:
   langfuse-worker:
     image: docker.io/langfuse/langfuse-worker:3
@@ -273,7 +308,7 @@ function dockerComposeFile() {
     restart: always
     depends_on: *langfuse-depends-on
     ports:
-      - 127.0.0.1:3100:3000
+      - 127.0.0.1:${webPort}:3000
     environment:
       <<: *langfuse-worker-env
       NEXTAUTH_SECRET: \${NEXTAUTH_SECRET}
@@ -468,6 +503,15 @@ export async function runLangfuseInit(
 		}
 	}
 
+	if (options.mode === "local") {
+		const binding = parseLocalHostBinding(options.host);
+		if ("error" in binding) {
+			ctx.ui.notify(`Langfuse init refused: ${binding.error}`, "error");
+			return;
+		}
+		options = { ...options, host: binding.url };
+	}
+
 	if (await dirHasUserFiles(options.dir)) {
 		ctx.ui.notify(
 			`Langfuse init refused: ${options.dir} already contains files. Nothing was overwritten.`,
@@ -498,9 +542,14 @@ export async function runLangfuseInit(
 	}
 
 	if (options.mode === "local") {
+		const binding = parseLocalHostBinding(options.host);
+		if ("error" in binding) {
+			ctx.ui.notify(`Langfuse init refused: ${binding.error}`, "error");
+			return;
+		}
 		await safeWrite(
 			join(options.dir, "docker-compose.yml"),
-			dockerComposeFile(),
+			dockerComposeFile(binding.webPort),
 		);
 		await safeWrite(join(options.dir, ".env"), envFile(options, keys));
 	}

@@ -139,7 +139,7 @@ Flags:
 | :--- | :--- |
 | `--mode local\|remote` | Setup type. `--local`, `--remote`, and `--cloud` select the same modes. |
 | `--dir <path>` | Target directory. Default `$PI_CODING_AGENT_DIR/langfuse`. |
-| `--host <url>` | Langfuse API host. Defaults to `http://localhost:3100` (local) or `https://cloud.langfuse.com` (remote). |
+| `--host <url>` | Langfuse API host. Local mode requires an `http://` URL on `localhost` or `127.0.0.1` (IPv4 loopback; `[::1]` is refused because the stack publishes `127.0.0.1` only); the published web port comes from the URL (default `3100`). Remote mode accepts any Langfuse URL. |
 | `--email`, `--name`, `--password` | Local Langfuse login. A unique password is generated when `--password` is omitted. |
 | `--public-key`, `--secret-key` | Remote project keys. Also read from `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY`. |
 | `--yes`, `-y` | Skip interactive prompts. |

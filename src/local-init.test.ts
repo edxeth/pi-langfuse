@@ -177,6 +177,59 @@ describe("/langfuse-init", () => {
 		expect(config.publicKey).toBe("pk-custom");
 	});
 
+	it("derives the Compose web port from a custom loopback host", async () => {
+		await runLangfuseInit(
+			"--yes --local --no-start --host http://localhost:3200",
+			createContext([]),
+		);
+
+		const dir = join(agentDir, "langfuse");
+		await expect(
+			readFile(join(dir, "docker-compose.yml"), "utf-8"),
+		).resolves.toContain("127.0.0.1:3200:3000");
+		const config = JSON.parse(
+			await readFile(join(dir, "pi-langfuse.json"), "utf-8"),
+		);
+		expect(config.host).toBe("http://localhost:3200");
+		await expect(readFile(join(dir, ".env"), "utf-8")).resolves.toContain(
+			"NEXTAUTH_URL=http://localhost:3200",
+		);
+	});
+
+	it("rejects local hosts that are not loopback http URLs", async () => {
+		const notifications: Notification[] = [];
+
+		await runLangfuseInit(
+			"--yes --local --no-start --host http://0.0.0.0:3100",
+			createContext(notifications),
+		);
+		expect(notifications.at(-1)?.type).toBe("error");
+		expect(notifications.at(-1)?.message).toContain("loopback");
+		await expect(
+			readFile(join(agentDir, "langfuse", "pi-langfuse.json"), "utf-8"),
+		).rejects.toThrow();
+
+		await runLangfuseInit(
+			"--yes --local --no-start --host https://localhost:3100",
+			createContext(notifications),
+		);
+		expect(notifications.at(-1)?.type).toBe("error");
+		await expect(
+			readFile(join(agentDir, "langfuse", "pi-langfuse.json"), "utf-8"),
+		).rejects.toThrow();
+
+		// The generated stack publishes 127.0.0.1 only, so [::1] would be unreachable.
+		await runLangfuseInit(
+			"--yes --local --no-start --host http://[::1]:3100",
+			createContext(notifications),
+		);
+		expect(notifications.at(-1)?.type).toBe("error");
+		expect(notifications.at(-1)?.message).toContain("[::1]");
+		await expect(
+			readFile(join(agentDir, "langfuse", "pi-langfuse.json"), "utf-8"),
+		).rejects.toThrow();
+	});
+
 	it("lets the interactive wizard choose remote setup", async () => {
 		const notifications: Notification[] = [];
 		const inputs = ["https://cloud.langfuse.com", "pk-wizard", "sk-wizard"];
