@@ -21,7 +21,11 @@ import {
 	recordRuntimeError,
 	shutdownClient,
 } from "./langfuse-client.js";
-import type { PromptState } from "./lifecycle-types.js";
+import {
+	addIndirectUsage,
+	type PiUsage,
+	type PromptState,
+} from "./lifecycle-types.js";
 import { ensureLocalLangfuseStarted } from "./local-autostart.js";
 import { runLangfuseInit } from "./local-init.js";
 import { sendIsolatedTestTrace } from "./operator-telemetry.js";
@@ -328,6 +332,9 @@ export default async function (pi: ExtensionAPI) {
 		redactToolContent,
 		summarizeToolArgs,
 		summarizeToolResult,
+		standardUsageFromUsage,
+		usageDetailsFromUsage,
+		costDetailsFromUsage,
 		writeRawTrace,
 	});
 
@@ -600,10 +607,24 @@ export default async function (pi: ExtensionAPI) {
 
 	pi.on("agent_settled", agentLifecycle.agentSettled);
 
-	pi.on("session_compact", async (_event, ctx) => {
+	pi.on("session_compact", async (event, ctx) => {
 		const state = getTypedSessionState(ctx);
 		if (!state || state.promptState?.finalizing) return;
 		state.compactCount += 1;
+		const prompt = state.promptState;
+		const compactionEntry = (
+			event as { compactionEntry?: { id?: unknown; usage?: PiUsage } }
+		).compactionEntry;
+		if (prompt && compactionEntry?.usage) {
+			// Pi reports each compaction once, but the usage belongs to the entry,
+			// not the event: a repeated event for the same entry must not double it.
+			const entryId =
+				typeof compactionEntry.id === "string" ? compactionEntry.id : undefined;
+			if (!entryId || !prompt.countedCompactions.has(entryId)) {
+				if (entryId) prompt.countedCompactions.add(entryId);
+				addIndirectUsage(prompt, compactionEntry.usage);
+			}
+		}
 		writeRawTrace(resolveConfig(settings), state, {
 			type: "session_compact",
 			compactCount: state.compactCount,

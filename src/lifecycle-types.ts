@@ -32,6 +32,25 @@ export function getLifecycleFailure(value: {
 	};
 }
 
+/**
+ * Accumulate one indirect usage report (nested tool model work or a
+ * compaction summary) into the prompt totals. Callers deduplicate per
+ * source identity (toolCallId, compaction entry id) before calling.
+ */
+export function addIndirectUsage(
+	prompt: PromptState,
+	usage: PiUsage | undefined,
+): boolean {
+	if (!usage) return false;
+	prompt.indirectTokensIn +=
+		(usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
+	prompt.indirectTokensOut += usage.output ?? 0;
+	prompt.indirectCacheRead += usage.cacheRead ?? 0;
+	prompt.indirectCacheWrite += usage.cacheWrite ?? 0;
+	prompt.indirectCost += usage.cost?.total ?? 0;
+	return true;
+}
+
 export interface PromptState {
 	trace?: LangfuseTrace;
 	promptSpan?: LangfuseSpan;
@@ -46,6 +65,13 @@ export interface PromptState {
 	tokensOut: number;
 	cacheRead: number;
 	cacheWrite: number;
+	/** Usage reported by tools and compactions, kept separate from direct model generations. */
+	indirectTokensIn: number;
+	indirectTokensOut: number;
+	indirectCacheRead: number;
+	indirectCacheWrite: number;
+	indirectCost: number;
+	countedCompactions: Set<string>;
 	lastAssistantText: string;
 	startSignature: string;
 	lastUsage?: PiUsage;
@@ -114,6 +140,8 @@ export interface ToolState {
 	resultSeen?: boolean;
 	executionEndSeen?: boolean;
 	errorCounted?: boolean;
+	usage?: PiUsage;
+	usageCounted?: boolean;
 	turnIndex?: number;
 	parentObservationId?: string;
 	argsSummary: string;

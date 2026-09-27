@@ -20,7 +20,7 @@ Trace (name: "pi-agent")
 - **agent.prompt**: A span that wraps the entire multi-turn loop for a single prompt.
 - **agent.turn**: A span for each reasoning turn. A single prompt may have many turns if the agent is calling tools.
 - **llm-response**: A Langfuse Generation object. It captures a bounded summary of the prompt sent to the LLM, the streaming response (text + thinking), and the final token usage/cost.
-- **tool:<name>**: A span representing a tool execution (e.g., `bash`, `read_file`). It captures input arguments and the (truncated) result.
+- **tool:<name>**: A span representing a tool execution (e.g., `bash`, `read_file`). It captures input arguments and the (truncated) result. When a tool reports nested model work as `usage` on its result, the span carries that usage and the prompt trace aggregates it once per `toolCallId` under its separate indirect usage totals; compaction summaries that report `usage` are aggregated once per compaction entry id. Indirect totals stay separate from the direct usage of `llm-response` generations.
 
 ## Data Flow
 

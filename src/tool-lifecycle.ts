@@ -6,15 +6,20 @@ import type {
 import type { Config, canTrace } from "./config.js";
 import type { getRuntime, LangfuseSpan } from "./langfuse-client.js";
 import {
+	addIndirectUsage,
 	hasToolCompletion,
+	type PiUsage,
 	type PromptState,
 	type ToolState,
 } from "./lifecycle-types.js";
 import type { SessionContextLike, SessionState } from "./session-state.js";
 import type {
+	costDetailsFromUsage,
 	redactToolContent,
+	standardUsageFromUsage,
 	summarizeToolArgs,
 	summarizeToolResult,
+	usageDetailsFromUsage,
 	writeRawTrace,
 } from "./telemetry-helpers.js";
 
@@ -28,6 +33,9 @@ export interface ToolLifecycleDependencies {
 	redactToolContent: typeof redactToolContent;
 	summarizeToolArgs: typeof summarizeToolArgs;
 	summarizeToolResult: typeof summarizeToolResult;
+	standardUsageFromUsage: typeof standardUsageFromUsage;
+	usageDetailsFromUsage: typeof usageDetailsFromUsage;
+	costDetailsFromUsage: typeof costDetailsFromUsage;
 	writeRawTrace: typeof writeRawTrace;
 }
 
@@ -70,6 +78,19 @@ export interface ToolLifecycleHandlers {
 }
 
 type ToolEndBody = Parameters<LangfuseSpan["end"]>[0];
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+	return value && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+/** Nested model work inside a tool arrives as `usage` on the executed result. */
+function usageFromToolResult(result: unknown): PiUsage | undefined {
+	const usage = asRecord(result)?.usage;
+	if (!usage || Array.isArray(usage)) return undefined;
+	return usage as PiUsage;
+}
 
 function getLatestTurn(prompt: PromptState) {
 	return Array.from(prompt.activeTurns.values()).at(-1);
@@ -251,12 +272,22 @@ export function createToolLifecycleHandlers(
 		isError,
 		output: output || undefined,
 		statusMessage: isError ? "tool execution failed" : undefined,
+		usage: deps.standardUsageFromUsage(tool.usage),
+		usageDetails: deps.usageDetailsFromUsage(tool.usage),
+		costDetails: deps.costDetailsFromUsage(tool.usage),
 		metadata: {
 			tool: tool.toolName,
 			argsSummary: tool.argsSummary,
 			durationMs: Date.now() - tool.startedAt,
 		},
 	});
+
+	/** Count a tool's nested-model usage exactly once per toolCallId. */
+	const countToolUsage = (prompt: PromptState, tool: ToolState) => {
+		if (!tool.usage || tool.usageCounted) return;
+		tool.usageCounted = true;
+		addIndirectUsage(prompt, tool.usage);
+	};
 
 	const toolCall = async (event: ToolCallEvent, ctx: ExtensionContext) => {
 		const resolved = getSessionPrompt(ctx);
@@ -376,6 +407,8 @@ export function createToolLifecycleHandlers(
 			content: event.content,
 		});
 		tool.isError = event.isError;
+		tool.usage ??= event.usage;
+		countToolUsage(prompt, tool);
 		if (!tool.resultSeen) {
 			tool.resultSeen = true;
 			const imgCount = (event.content ?? []).filter(
@@ -421,6 +454,8 @@ export function createToolLifecycleHandlers(
 		if (tool.executionEndSeen) return;
 		tool.executionEndSeen = true;
 		tool.isError = event.isError;
+		tool.usage ??= usageFromToolResult(event.result);
+		countToolUsage(prompt, tool);
 		if (event.isError && !tool.errorCounted) {
 			tool.errorCounted = true;
 			prompt.toolErrors += 1;
@@ -467,6 +502,7 @@ export function createToolLifecycleHandlers(
 				tool.errorCounted = true;
 				prompt.toolErrors += 1;
 			}
+			countToolUsage(prompt, tool);
 			tool.completionSeen = true;
 			tool.finishPromise = finishTool(
 				state,
