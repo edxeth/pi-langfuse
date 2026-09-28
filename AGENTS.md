@@ -22,7 +22,7 @@ When modifying tracing logic, you MUST maintain the following hierarchy:
 
 - **Linting/Formatting**: We use **Biome**. `npm run check` and `npm run format` write changes; use `npx biome check .` for non-writing verification.
 - **Testing**: We use **Vitest**. Run `npm test`.
-- **E2E Integration**: Requires `RUN_LANGFUSE_E2E=1` and valid `LANGFUSE_*` credentials.
+- **E2E Integration**: Requires `RUN_LANGFUSE_E2E=1` and valid `LANGFUSE_*` credentials. Pushes to `main` trigger CI with E2E enabled; when GitHub Langfuse secrets are configured, obtain approval for synthetic trace writes to that project before pushing.
 - **Telemetry test isolation**: `resolveConfig({})` can load the user's persistent project. Before any runtime creation, pin an isolated config and verify the exact destination and synthetic credentials. Persistent-project writes and deletions each need explicit approval; after an accidental write, stop and report rather than automatically deleting it.
 - **Offline Pi tests**: Run `RUN_LANGFUSE_E2E=0 npm test`. The real-SDK fixtures in `test/pi-runtime/isolated-pi.ts` disable resource discovery and check owned discovery bait before prompting; reuse that boundary for new runtime scenarios.
 - **Releases**: Managed via `release-it`. Always use Conventional Commits (`feat:`, `fix:`, `chore:`, etc.) to ensure the automated changelog works correctly.

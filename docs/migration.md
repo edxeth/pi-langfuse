@@ -1,6 +1,6 @@
 # Migration to 2.0
 
-Version 2.0 requires Node.js 22 or newer. The package keeps `dist/index.js` as its Pi extension entrypoint.
+Version 2.x requires Node.js 22 or newer. Starting with version 2.1, Pi 0.87.1 or newer is required, and Pi loads `src/index.ts` for Git and registry installations. The npm API and export CLI still use the compiled `dist` files.
 
 ## Install and verify
 
