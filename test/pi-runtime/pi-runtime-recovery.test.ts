@@ -323,7 +323,7 @@ describe("pi runtime transport recovery", () => {
 			completeTrace(store, oversizedId);
 
 			// Trace B: usage/cost-bearing tool SPAN plus a generation. Delayed
-			// indexing: the recorder serves empty v2 pages for the first polls,
+			// indexing keeps v2 pages empty through the first drain round,
 			// so confirmation lags the accepted POST by one drain round.
 			const recoverableId = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 			recordTrace(store, {
@@ -353,22 +353,19 @@ describe("pi runtime transport recovery", () => {
 			});
 			completeTrace(store, recoverableId);
 
-			// Delayed indexing binds to B deterministically: the visibility
-			// window is shorter than the poll interval, so every completeness
-			// check performs exactly one poll. The first two polls (round 1's
-			// pre-send and post-accept checks) hit the lazy empty pages; the
-			// round 2 pre-check sees the indexed spans.
-			recorder.faults.lazyIndexPolls = 2;
-
 			const deps = drainDeps(recorder);
 			const options = {
 				requestTimeoutMs: 3_000,
 				visibilityTimeoutMs: 40,
-				pollIntervalMs: 1_000,
+				pollIntervalMs: 10,
 			};
 
 			const rounds = [];
 			for (let round = 0; round < 3; round += 1) {
+				// Hold visibility for the entire first drain, then expose the index.
+				// A timeout bounds elapsed time, not the number of HTTP polls.
+				recorder.faults.lazyIndexPolls =
+					round === 0 ? Number.POSITIVE_INFINITY : 0;
 				rounds.push(await drainCompletedRestFallback(store, deps, options));
 			}
 			const problems = rounds.flatMap((result) => result.problems);
