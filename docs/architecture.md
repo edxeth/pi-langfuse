@@ -35,7 +35,21 @@ Trace (name: "pi-agent")
     - `message_end` finalizes the generation with usage, cost, and provider metadata.
     - `turn_end` closes the turn span.
 4.  **Finalization**: `agent_settled` — Pi's final boundary after automatic retry, overflow compaction, and queued continuations — configuration refresh, session replacement, or `session_shutdown` closes unfinished child observations before the parent and updates trace health and aggregate metrics. `agent_end` only closes one low-level agent run: it records the run outcome (a healthy final run marks an earlier failure as recovered) and keeps the prompt open for continuation events that never re-emit `before_agent_start`. A prompt interrupted before settlement is finalized as abandoned by the interrupting boundary. A run that starts with no prompt at all — Pi defers `sendMessage(..., { triggerTurn: true })` issued during settlement and starts it without `before_agent_start` — gets its own trace with empty prompt input and `promptSource: "unannounced-agent-run"` metadata instead of being dropped.
-5.  **Flush and recovery**: A bounded OTel flush runs at prompt completion. The observations API confirms each recorded observation ID. The client prefers v2 (v4 write mode) and tries the legacy v1 read on a 404 for v3 deployments. It remembers a working API per client and renegotiates if an upgrade removes it; authentication and server errors do not trigger negotiation. Both pagination styles share a bounded deadline. Unconfirmed traces can replay through OTLP with their original IDs. Recovery retains bounded snapshots for up to three attempts and checks completeness after replay. Shutdown exhausts that bounded retry budget and reports permanent losses, even when other traces recover. Scores use the supported scores endpoint.
+5.  **Export and flush**: Ended spans use the Langfuse processor's public immediate mode and one OTLP exporter. Prompt completion and shutdown flush in-flight sends; they do not query observation read APIs. Scores use the supported scores endpoint.
+
+## Delivery contract
+
+Delivery means the OTLP endpoint accepted the export, not that each observation is already indexed or durably stored. The extension no longer maintains a second trace store, negotiates observation read APIs, or replays accepted exports. This removes indexing delays from the prompt lifecycle and makes normal tracing independent of server read mode.
+
+`otlp-export.ts` uses the existing OTLP serializer and Node.js fetch, with explicit endpoint and credentials. The SDK's default exporter treats partial rejection as success, so the extension supplies its own exporter through the public interface. No global diagnostic interception or private SDK members are used.
+
+- Transient network errors and HTTP 429/502/503/504 retry with backoff, at most four attempts within a two-second total export deadline. A Retry-After value beyond the remaining deadline ends the attempt with a diagnostic.
+- Partial rejection is reported and never retried, as required by OTLP. A zero-rejected warning is not a rejection. Malformed responses cannot establish acceptance.
+- Requests are bounded to 3.5 MB. Individually oversized spans are reported rather than poisoning sendable spans. Response reads and diagnostic summaries are bounded; server error bodies are not displayed.
+- Immediate mode emits one request per ended span. It avoids the SDK batch queue's silent overflow and ensures flush waits for active sends. This increases request count compared with batching, but does not wait for indexing or another prompt.
+- The deadline aborts active HTTP work. Exhausted exports are reported, not retained for a later prompt. There is no durable queue or crash-safe delivery guarantee. A timeout can mean an unconfirmed acceptance, not proven server-side loss.
+
+Telemetry diagnostics go through Pi notifications in interactive/RPC modes and stderr in headless mode. `/langfuse-status` keeps the last historical error; successful exports do not erase that history. Adjacent identical notifications are deduplicated for the active UI, and shutdown detaches its listener.
 
 ## State Management
 

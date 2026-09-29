@@ -38,6 +38,12 @@ Confirm `rawTraceEnabled` or `PI_LANGFUSE_RAW_TRACE=1`, then check `rawTraceDir`
 
 The extension closes unfinished prompt, turn, generation, and tool observations during agent finalization and session shutdown. A stalled exporter cannot block those boundaries indefinitely. Check `/langfuse-status` for the last runtime error, then inspect the raw trace for `session_end`.
 
+## Export accepted but not visible yet
+
+Langfuse may index accepted exports asynchronously. Normal tracing does not query observation APIs or warn about indexing delay. Check the Langfuse UI when inspecting completeness; a successful export response is not a completeness or durability guarantee.
+
+Export errors appear through Pi's notification UI rather than writing over the editor. Headless runs write diagnostics to stderr, leaving stdout unchanged. `/langfuse-status` shows the last historical error, not an active retry queue. Transient export errors retry within the current bounded send; they do not require another user message. Partial rejection and exhausted attempts are reported without keeping a recovery copy for later prompts.
+
 ## Package verification
 
 From a checkout of the repository, run:

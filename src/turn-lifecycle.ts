@@ -12,6 +12,7 @@ import {
 	type TurnState,
 } from "./lifecycle-types.js";
 import type { redactionMetadata } from "./redaction.js";
+import { recordRuntimeError } from "./runtime-diagnostics.js";
 import type { SessionContextLike, SessionState } from "./session-state.js";
 import type {
 	costDetailsFromUsage,
@@ -92,7 +93,7 @@ export function createTurnLifecycleHandlers(
 					},
 				});
 			} catch (e) {
-				console.warn("📊 Langfuse: Failed to create turn span", e);
+				recordRuntimeError("Failed to create turn span", e);
 			}
 		})();
 		await turnState.spanStartPromise;

@@ -12,6 +12,7 @@ import { context, trace as otelTrace } from "@opentelemetry/api";
 import { AsyncHooksContextManager } from "@opentelemetry/context-async-hooks";
 import { BasicTracerProvider } from "@opentelemetry/sdk-trace-base";
 import type { Config } from "./config.js";
+import { createOtlpExporter, OtlpExportError } from "./otlp-export.js";
 import {
 	type PayloadPolicyConfig,
 	shapeLangfuseObservationBody,
@@ -19,20 +20,15 @@ import {
 } from "./payload-policy.js";
 import { sanitizeForTelemetry } from "./redaction.js";
 import {
-	completeTrace,
-	createOtlpFallbackTransport,
-	createRestFallbackStore,
-	drainCompletedRestFallback,
-	endObservation,
-	type FallbackReplayTransport,
-	MAX_FALLBACK_ATTEMPTS,
-	type RestFallbackObservationBody,
-	type RestFallbackStore,
-	recordObservation,
-	recordTrace,
-	updateObservation,
-	updateTrace,
-} from "./rest-fallback.js";
+	getLastRuntimeError,
+	recordRuntimeError,
+} from "./runtime-diagnostics.js";
+
+export type { RuntimeError } from "./runtime-diagnostics.js";
+// Compatibility re-exports: the runtime error boundary lives in
+// runtime-diagnostics.ts and feeds the Pi UI subscription; existing callers
+// import it from here.
+export { getLastRuntimeError, recordRuntimeError };
 
 type LangfuseMetadata = Record<string, unknown>;
 
@@ -173,8 +169,6 @@ interface RuntimeState {
 	readonly scoreClient: LangfuseClient;
 	readonly observations: Map<string, VendorObservation>;
 	readonly traces: Map<string, RuntimeTrace>;
-	readonly fallbackStore: RestFallbackStore;
-	readonly fallbackTransport: FallbackReplayTransport;
 	/** In-flight direct score deliveries, awaited on flush and shutdown. */
 	readonly pendingScores: Set<Promise<void>>;
 }
@@ -203,52 +197,49 @@ let runtime: RuntimeState | null = null;
 let runtimeTransition: Promise<void> = Promise.resolve();
 let registeredContextManager: AsyncHooksContextManager | undefined;
 const DEFAULT_SHUTDOWN_STEP_TIMEOUT_MS = 2_000;
-const DEFAULT_TRACE_VISIBILITY_TIMEOUT_MS = 1_500;
-const TRACE_VISIBILITY_POLL_INTERVAL_MS = 200;
 let shutdownStepTimeoutMs = DEFAULT_SHUTDOWN_STEP_TIMEOUT_MS;
-let traceVisibilityTimeoutMs = DEFAULT_TRACE_VISIBILITY_TIMEOUT_MS;
-let traceVisibilityPollIntervalMs = TRACE_VISIBILITY_POLL_INTERVAL_MS;
 
-export interface RuntimeError {
-	message: string;
-	timestamp: string;
+/**
+ * Bounds every shutdown and flush step, including the OTLP exporter's send
+ * timeout, so reconfiguration or disposal cannot leave sends running past
+ * the teardown window.
+ */
+export function setRuntimeTimeoutsForTest(timeouts: {
+	shutdownStepMs: number;
+}) {
+	const previous = shutdownStepTimeoutMs;
+	shutdownStepTimeoutMs = timeouts.shutdownStepMs;
+	return () => {
+		shutdownStepTimeoutMs = previous;
+	};
 }
-
-let lastRuntimeError: RuntimeError | undefined;
 
 function runtimeErrorMessage(error: unknown) {
 	return error instanceof Error ? error.message : String(error);
 }
 
-export function recordRuntimeError(error: unknown) {
-	lastRuntimeError = {
-		message: runtimeErrorMessage(error),
-		timestamp: new Date().toISOString(),
-	};
+/** Records one contextual runtime diagnostic; the runtime never writes to console. */
+function recordRuntimeFailure(label: string, error: unknown) {
+	// The provider aggregates processor failures; the exporter has already
+	// reported its own errors, including failures from background batches.
+	if (error instanceof OtlpExportError) return;
+	if (Array.isArray(error)) {
+		for (const cause of error) recordRuntimeFailure(label, cause);
+		return;
+	}
+	recordRuntimeError(`Langfuse: ${label}: ${runtimeErrorMessage(error)}`);
 }
 
-export function getLastRuntimeError() {
-	return lastRuntimeError;
-}
-
-export function setRuntimeTimeoutsForTest(timeouts: {
-	shutdownStepMs: number;
-	traceVisibilityMs: number;
-	pollIntervalMs: number;
-}) {
-	const previous = {
-		shutdownStepMs: shutdownStepTimeoutMs,
-		traceVisibilityMs: traceVisibilityTimeoutMs,
-		pollIntervalMs: traceVisibilityPollIntervalMs,
-	};
-	shutdownStepTimeoutMs = timeouts.shutdownStepMs;
-	traceVisibilityTimeoutMs = timeouts.traceVisibilityMs;
-	traceVisibilityPollIntervalMs = timeouts.pollIntervalMs;
-	return () => {
-		shutdownStepTimeoutMs = previous.shutdownStepMs;
-		traceVisibilityTimeoutMs = previous.traceVisibilityMs;
-		traceVisibilityPollIntervalMs = previous.pollIntervalMs;
-	};
+function recordScoreFailure(error: unknown) {
+	// Langfuse API exception messages embed response bodies, which may echo
+	// private score content. Report only the HTTP status, never that message.
+	const status =
+		error && typeof error === "object" && "statusCode" in error
+			? error.statusCode
+			: undefined;
+	recordRuntimeError(
+		`Failed to send Langfuse score${typeof status === "number" ? ` (HTTP ${status})` : ": request failed"}`,
+	);
 }
 
 function neutralizeLangfuseMediaPrefix<T>(
@@ -464,19 +455,6 @@ function createTrace(
 	);
 	const vendorRoot = root as unknown as VendorObservation;
 	applyPublicTraceFlag(vendorRoot, shaped);
-	const fallback = recordTrace(rt.fallbackStore, {
-		id: vendorRoot.traceId,
-		timestamp: new Date().toISOString(),
-		body: shaped,
-	});
-	recordObservation(rt.fallbackStore, {
-		id: vendorRoot.id,
-		traceId: vendorRoot.traceId,
-		name: "agent.prompt",
-		type: "SPAN",
-		startTime: fallback.timestamp,
-		body: shaped,
-	});
 	const initialTraceIO = traceIOAttributes(shaped);
 	if (
 		initialTraceIO.input !== undefined ||
@@ -505,8 +483,6 @@ function createTrace(
 					shapedUpdate,
 				);
 				applyPublicTraceFlag(vendorRoot, shapedUpdate);
-				updateTrace(rt.fallbackStore, vendorRoot.traceId, shapedUpdate);
-				updateObservation(rt.fallbackStore, vendorRoot.id, shapedUpdate);
 				runWithVendorContext(vendorRoot, () => {
 					propagateAttributes(
 						propagationAttributes(runtimeTrace.lastUpdate),
@@ -532,8 +508,6 @@ function createTrace(
 					runtimeTrace.lastUpdate,
 					shapedIO,
 				);
-				updateTrace(rt.fallbackStore, vendorRoot.traceId, shapedIO);
-				updateObservation(rt.fallbackStore, vendorRoot.id, shapedIO);
 				runWithVendorContext(vendorRoot, () => {
 					vendorRoot.setTraceIO(shapedIO);
 				});
@@ -546,17 +520,9 @@ function createTrace(
 						) as ObservationBody)
 					: undefined;
 				if (shapedEnd) {
-					updateTrace(rt.fallbackStore, vendorRoot.traceId, shapedEnd);
-					updateObservation(rt.fallbackStore, vendorRoot.id, shapedEnd);
 					vendorRoot.update(observationAttributes(shapedEnd));
 				}
 				runtimeTrace.ended = true;
-				endObservation(
-					rt.fallbackStore,
-					vendorRoot.id,
-					new Date().toISOString(),
-				);
-				completeTrace(rt.fallbackStore, vendorRoot.traceId);
 				vendorRoot.end();
 				removeObservation(rt, vendorRoot);
 			},
@@ -575,22 +541,15 @@ function removeObservation(rt: RuntimeState, observation: VendorObservation) {
 }
 
 function finalizeOpenTraces(rt: RuntimeState) {
-	for (const [traceId, runtimeTrace] of rt.traces) {
+	for (const runtimeTrace of rt.traces.values()) {
 		if (runtimeTrace.ended) continue;
 		runtimeTrace.ended = true;
 		const root = runtimeTrace.root;
 		try {
-			endObservation(rt.fallbackStore, root.id, new Date().toISOString());
-			completeTrace(rt.fallbackStore, traceId);
-		} catch (error) {
-			recordRuntimeError(error);
-		}
-		try {
 			root.end();
 		} catch (error) {
-			recordRuntimeError(error);
-			console.warn(
-				"📊 Langfuse: Failed to end open prompt root during shutdown",
+			recordRuntimeFailure(
+				"Failed to end open prompt root during shutdown",
 				error,
 			);
 		}
@@ -607,7 +566,6 @@ function wrapObservation<T extends LangfuseSpan | LangfuseGeneration>(
 	const rootTrace = Array.from(rt.traces.values()).find(
 		(trace) => trace.root.id === observation.id,
 	);
-	const fallback = rt.fallbackStore.traces.get(observation.traceId);
 	const update = (body?: ObservationBody) => {
 		if (!body || ended) return;
 		const shaped = shapeBody(config, body, (policyConfig, value) =>
@@ -628,7 +586,6 @@ function wrapObservation<T extends LangfuseSpan | LangfuseGeneration>(
 			rootTrace.lastUpdate = effective as TraceUpdateBody;
 			applyPublicTraceFlag(rootTrace.root, effective as TraceUpdateBody);
 		}
-		updateObservation(rt.fallbackStore, observation.id, shaped);
 		observation.update(observationAttributes(effective));
 	};
 	const wrapped = {
@@ -639,14 +596,8 @@ function wrapObservation<T extends LangfuseSpan | LangfuseGeneration>(
 			if (ended) return;
 			update(body);
 			ended = true;
-			endObservation(
-				rt.fallbackStore,
-				observation.id,
-				new Date().toISOString(),
-			);
-			if (rootTrace && fallback) {
+			if (rootTrace) {
 				rootTrace.ended = true;
-				completeTrace(rt.fallbackStore, observation.traceId);
 			}
 			observation.end();
 			removeObservation(rt, observation);
@@ -696,17 +647,6 @@ function createObservation(
 			)
 		: startChild();
 	rt.observations.set(observation.id, observation);
-	if (rt.fallbackStore.traces.has(shaped.traceId)) {
-		recordObservation(rt.fallbackStore, {
-			id: observation.id,
-			traceId: observation.traceId,
-			name: shaped.name,
-			type: asType === "generation" ? "GENERATION" : "SPAN",
-			startTime: new Date().toISOString(),
-			parentObservationId: parent.id,
-			body: shaped as RestFallbackObservationBody,
-		});
-	}
 	return observation;
 }
 
@@ -787,8 +727,7 @@ function wrapRuntime(rt: RuntimeState, config: Config): LangfuseRuntime {
 					.then(
 						() => undefined,
 						(error) => {
-							recordRuntimeError(error);
-							console.warn("📊 Langfuse: Failed to send score", error);
+							recordScoreFailure(error);
 						},
 					);
 				rt.pendingScores.add(delivery);
@@ -796,8 +735,7 @@ function wrapRuntime(rt: RuntimeState, config: Config): LangfuseRuntime {
 					rt.pendingScores.delete(delivery);
 				});
 			} catch (error) {
-				recordRuntimeError(error);
-				console.warn("📊 Langfuse: Failed to send score", error);
+				recordScoreFailure(error);
 			}
 		},
 		withContext(observation, fn) {
@@ -810,12 +748,28 @@ function wrapRuntime(rt: RuntimeState, config: Config): LangfuseRuntime {
 function createRuntime(config: Config): RuntimeState {
 	ensureOtelContextManager();
 	const idGenerator = new RuntimeIdGenerator();
+	// The injected exporter owns one-way delivery: bounded native-fetch retry
+	// and partial-rejection reporting through onError. There is no read-back,
+	// no retained replay, and the send bound matches flush/shutdown so no
+	// send outlives a disposed or reconfigured runtime.
+	const exporter = createOtlpExporter({
+		host: config.host,
+		publicKey: config.publicKey,
+		secretKey: config.secretKey,
+		timeoutMs: shutdownStepTimeoutMs,
+		onError: (message) => recordRuntimeError(message),
+	});
 	const processor = new LangfuseSpanProcessor({
+		// Immediate mode exposes every ended span to our bounded exporter and
+		// awaits active sends on flush. The SDK batch mode silently drops a full
+		// queue and its forceFlush does not await already-started batches.
+		exportMode: "immediate",
 		publicKey: config.publicKey,
 		secretKey: config.secretKey,
 		baseUrl: config.host,
 		release: config.release || undefined,
 		environment: config.environment || undefined,
+		exporter,
 	});
 	const tracerProvider = new BasicTracerProvider({
 		spanProcessors: [processor],
@@ -833,12 +787,6 @@ function createRuntime(config: Config): RuntimeState {
 		}),
 		observations: new Map(),
 		traces: new Map(),
-		fallbackStore: createRestFallbackStore(),
-		fallbackTransport: createOtlpFallbackTransport({
-			host: config.host,
-			publicKey: config.publicKey,
-			secretKey: config.secretKey,
-		}),
 		pendingScores: new Set(),
 	};
 }
@@ -847,7 +795,6 @@ async function withTimeout<T>(
 	label: string,
 	operation: Promise<T> | undefined,
 	timeoutMs = shutdownStepTimeoutMs,
-	onTimeout?: () => void,
 ): Promise<T | undefined> {
 	if (!operation) return undefined;
 	let timer: NodeJS.Timeout | undefined;
@@ -856,9 +803,9 @@ async function withTimeout<T>(
 			Promise.resolve(operation),
 			new Promise<undefined>((resolve) => {
 				timer = setTimeout(() => {
-					recordRuntimeError(`${label} timed out after ${timeoutMs}ms`);
-					onTimeout?.();
-					console.warn(`📊 Langfuse: ${label} timed out after ${timeoutMs}ms`);
+					recordRuntimeError(
+						`Langfuse: ${label} timed out after ${timeoutMs}ms`,
+					);
 					resolve(undefined);
 				}, timeoutMs);
 			}),
@@ -869,92 +816,32 @@ async function withTimeout<T>(
 }
 
 /**
- * Drains completed fallback traces with bounded retries so a shutdown or
- * configuration replacement cannot discard copies it still claims to retain.
- * Each round lets the drain's own attempt accounting discard exhausted
- * traces. Permanent losses (exhausted discards, retention evictions, traces
- * retired with undeliverable spans) are tracked separately from transient
- * round errors and reported once at the end, so a later round that recovers
- * other traces cannot erase them, while a teardown that ends fully
- * delivered stays silent.
+ * Teardown order: end abandoned prompt roots so their spans become exportable,
+ * then bound each dependency independently. Export failures were already
+ * reported by the exporter's onError, so no delivery diagnostics are
+ * duplicated here.
  */
-async function drainUntilSettled(rt: RuntimeState) {
-	const terminalLosses: string[] = [];
-	let lastRoundProblems: string[] | undefined;
-	for (let round = 0; round < MAX_FALLBACK_ATTEMPTS; round += 1) {
-		const hasCandidates = Array.from(rt.fallbackStore.traces.values()).some(
-			(trace) => trace.completed,
-		);
-		if (!hasCandidates) break;
-		const result = await drainCompletedRestFallback(
-			rt.fallbackStore,
-			{ client: rt.scoreClient, transport: rt.fallbackTransport },
-			{
-				requestTimeoutMs: shutdownStepTimeoutMs,
-				visibilityTimeoutMs: traceVisibilityTimeoutMs,
-				pollIntervalMs: traceVisibilityPollIntervalMs,
-			},
-		);
-		terminalLosses.push(...result.terminalLosses);
-		// A round that ends clean makes any earlier round's transient failure
-		// stale; only the final round's problems remain candidates for
-		// reporting, and never as loss claims.
-		lastRoundProblems =
-			result.problems.length > 0 ? result.problems : undefined;
-	}
-	const remaining = Array.from(rt.fallbackStore.traces.values()).filter(
-		(trace) => trace.completed,
-	);
-	const finalMessages = [...terminalLosses];
-	if (remaining.length > 0) {
-		// The attempt budget should have discarded everything by now; report
-		// any survivor as an explicit loss instead of dropping it silently.
-		finalMessages.push(
-			`Langfuse: ${remaining.length} completed trace(s) could not be confirmed or delivered before shutdown and were discarded: ${remaining.map((trace) => trace.id).join(", ")}`,
-		);
-	}
-	if (finalMessages.length > 0) {
-		const error = new Error(finalMessages.join("; "));
-		recordRuntimeError(error);
-		console.warn(`📊 Langfuse: ${runtimeErrorMessage(error)}`);
-		return;
-	}
-	if (lastRoundProblems !== undefined) {
-		// The store is empty, so these are round diagnostics whose traces all
-		// settled (for example a final round's failed sends elsewhere); report
-		// them without loss claims.
-		const error = new Error(lastRoundProblems.join("; "));
-		recordRuntimeError(error);
-		console.warn(`📊 Langfuse: ${runtimeErrorMessage(error)}`);
-	}
-}
-
 async function shutdownRuntime(rt: RuntimeState) {
 	finalizeOpenTraces(rt);
 	try {
 		await withTimeout("OTel force flush", rt.tracerProvider.forceFlush());
 	} catch (error) {
-		recordRuntimeError(error);
-		console.warn("📊 Langfuse: Failed to flush OpenTelemetry spans", error);
+		recordRuntimeFailure("Failed to flush OpenTelemetry spans", error);
 	}
-	await drainUntilSettled(rt);
 	try {
 		await withTimeout("Langfuse score flush", Promise.all(rt.pendingScores));
 	} catch (error) {
-		recordRuntimeError(error);
-		console.warn("📊 Langfuse: Failed to flush Langfuse scores", error);
+		recordRuntimeFailure("Failed to flush Langfuse scores", error);
 	}
 	try {
 		await withTimeout("Langfuse client shutdown", rt.scoreClient.shutdown());
 	} catch (error) {
-		recordRuntimeError(error);
-		console.warn("📊 Langfuse: Failed to shut down Langfuse client", error);
+		recordRuntimeFailure("Failed to shut down Langfuse client", error);
 	}
 	try {
 		await withTimeout("OTel tracer shutdown", rt.tracerProvider.shutdown());
 	} catch (error) {
-		recordRuntimeError(error);
-		console.warn("📊 Langfuse: Failed to shut down OpenTelemetry", error);
+		recordRuntimeFailure("Failed to shut down OpenTelemetry", error);
 	}
 	setLangfuseTracerProvider(null);
 }
@@ -985,29 +872,7 @@ export function flushClient() {
 				runtime.tracerProvider.forceFlush(),
 			);
 		} catch (error) {
-			recordRuntimeError(error);
-			console.warn("📊 Langfuse: Failed to flush OpenTelemetry spans", error);
-		}
-		try {
-			const result = await drainCompletedRestFallback(
-				runtime.fallbackStore,
-				{ client: runtime.scoreClient, transport: runtime.fallbackTransport },
-				{
-					requestTimeoutMs: shutdownStepTimeoutMs,
-					visibilityTimeoutMs: traceVisibilityTimeoutMs,
-					pollIntervalMs: traceVisibilityPollIntervalMs,
-				},
-			);
-			if (result.problems.length > 0) {
-				const error = new Error(result.problems.join("; "));
-				recordRuntimeError(error);
-				console.warn(`📊 Langfuse: ${runtimeErrorMessage(error)}`);
-			}
-		} catch (error) {
-			// The drain only throws on internal defects; round diagnostics are
-			// carried by the typed result.
-			recordRuntimeError(error);
-			console.warn(`📊 Langfuse: ${runtimeErrorMessage(error)}`);
+			recordRuntimeFailure("Failed to flush OpenTelemetry spans", error);
 		}
 		try {
 			await withTimeout(
@@ -1015,8 +880,7 @@ export function flushClient() {
 				Promise.all(runtime.pendingScores),
 			);
 		} catch (error) {
-			recordRuntimeError(error);
-			console.warn("📊 Langfuse: Failed to flush Langfuse scores", error);
+			recordRuntimeFailure("Failed to flush Langfuse scores", error);
 		}
 	});
 }

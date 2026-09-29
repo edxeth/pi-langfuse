@@ -171,14 +171,6 @@ const telemetry = vi.hoisted(() => {
 
 	const client = {
 		api: {
-			observations: {
-				getMany: vi.fn(async (request: { traceId: string }) => ({
-					data: state.received
-						.filter((span) => span.traceId === request.traceId)
-						.map((span) => ({ id: span.spanId })),
-					meta: {},
-				})),
-			},
 			scores: {
 				create: vi.fn(async (body: Record<string, unknown>) => {
 					state.scores.push(body);
@@ -324,40 +316,12 @@ vi.mock("@langfuse/tracing", () => telemetry.tracing);
 vi.mock("@opentelemetry/api", () => ({
 	context: telemetry.context,
 	trace: telemetry.trace,
-	// OTel enum constants used by the fallback replay span builder.
-	SpanKind: { INTERNAL: 0 },
-	SpanStatusCode: { UNSET: 0, ERROR: 2 },
-	TraceFlags: { SAMPLED: 1, NONE: 0 },
 }));
 vi.mock("@opentelemetry/context-async-hooks", () => ({
 	AsyncHooksContextManager: telemetry.AsyncHooksContextManager,
 }));
 vi.mock("@opentelemetry/sdk-trace-base", () => ({
 	BasicTracerProvider: telemetry.BasicTracerProvider,
-}));
-// The fallback replay exporter must stay inert in this fake-SDK environment
-// instead of dialing the scenarios' unresolvable fake hosts.
-vi.mock("@opentelemetry/exporter-trace-otlp-http", () => ({
-	OTLPTraceExporter: vi.fn(() => ({
-		export: vi.fn(
-			(
-				spans: Array<{
-					spanContext(): { traceId: string; spanId: string };
-				}>,
-				callback: (result: { code: number }) => void,
-			) => {
-				// Replayed spans index like any accepted delivery.
-				for (const span of spans) {
-					const ctx = span.spanContext();
-					telemetry.state.received.push({
-						traceId: ctx.traceId,
-						spanId: ctx.spanId,
-					});
-				}
-				callback({ code: 0 });
-			},
-		),
-	})),
 }));
 
 type EventHandler = (event?: unknown, ctx?: unknown) => Promise<void> | void;
@@ -480,21 +444,17 @@ function tempRoot(prefix: string) {
 	return root;
 }
 
-// The fake telemetry client exposes no REST API, so every completed trace
-// waits out the real 1500 ms visibility-poll deadline before the fallback
-// gives up. The production path stays live; only the irrelevant wall-clock
-// wait shrinks. Without this, tests finishing three prompts (e.g. the
-// duplicate-lifecycle test) run near the 5 s vitest timeout and fail
-// intermittently under load.
-let restoreFallbackTimeouts: (() => void) | undefined;
+// The fake telemetry stack never delivers anywhere real; shrinking the
+// bounded shutdown and flush steps keeps multi-prompt scenarios well inside
+// the vitest timeout without changing the production lifecycle. (The old
+// visibility-poll windows are gone: the runtime no longer polls a read API.)
+let restoreRuntimeTimeouts: (() => void) | undefined;
 
 beforeEach(() => {
 	drainRawTraceQueue();
 	telemetry.reset();
-	restoreFallbackTimeouts = setRuntimeTimeoutsForTest({
+	restoreRuntimeTimeouts = setRuntimeTimeoutsForTest({
 		shutdownStepMs: 100,
-		traceVisibilityMs: 30,
-		pollIntervalMs: 5,
 	});
 	delete process.env.LANGFUSE_PUBLIC_KEY;
 	delete process.env.LANGFUSE_SECRET_KEY;
@@ -514,8 +474,8 @@ beforeEach(() => {
 afterEach(async () => {
 	drainRawTraceQueue();
 	await shutdownClient();
-	restoreFallbackTimeouts?.();
-	restoreFallbackTimeouts = undefined;
+	restoreRuntimeTimeouts?.();
+	restoreRuntimeTimeouts = undefined;
 	for (const root of createdRoots.splice(0)) {
 		rmSync(root, { recursive: true, force: true });
 	}

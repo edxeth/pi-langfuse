@@ -12,6 +12,7 @@ import {
 	type PromptState,
 	type ToolState,
 } from "./lifecycle-types.js";
+import { recordRuntimeError } from "./runtime-diagnostics.js";
 import type { SessionContextLike, SessionState } from "./session-state.js";
 import type {
 	costDetailsFromUsage,
@@ -203,7 +204,7 @@ export function createToolLifecycleHandlers(
 						},
 					});
 				} catch (error) {
-					console.warn("📊 Langfuse: Failed to create tool span", error);
+					recordRuntimeError("Failed to create tool span", error);
 				}
 			})();
 		}
@@ -225,7 +226,7 @@ export function createToolLifecycleHandlers(
 		try {
 			tool.span?.end(body);
 		} catch (error) {
-			console.warn("📊 Langfuse: Failed to end tool span", error);
+			recordRuntimeError("Failed to end tool span", error);
 		}
 		if (body?.isError && tool.span && prompt.trace?.id) {
 			try {
@@ -238,7 +239,7 @@ export function createToolLifecycleHandlers(
 					observationId: tool.span.id,
 				});
 			} catch (error) {
-				console.warn("📊 Langfuse: Failed to send tool error score", error);
+				recordRuntimeError("Failed to send tool error score", error);
 			}
 		}
 	};

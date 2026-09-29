@@ -1,6 +1,6 @@
 # Privacy and capture
 
-pi-langfuse sanitizes values before Langfuse observations, OTLP recovery payloads, raw-trace writes, and operator test traces. Pi's own session files remain unchanged.
+pi-langfuse sanitizes values before Langfuse observations, OTLP exports, raw-trace writes, and operator test traces. Pi's own session files remain unchanged.
 
 ## Capture policies
 

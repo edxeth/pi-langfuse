@@ -6,6 +6,7 @@ import {
 	normalizeCapturePolicy,
 } from "./payload-policy.js";
 import { defaultRawTraceDir } from "./raw-trace.js";
+import { recordRuntimeError } from "./runtime-diagnostics.js";
 import { DEFAULT_SETTINGS, type SettingsValues } from "./settings.js";
 
 export type RawTraceProviderRequestMode = "summary" | "full" | "off";
@@ -65,7 +66,7 @@ function readConfigJson(path: string): Partial<Config> {
 		const content = readFileSync(path, "utf-8");
 		return JSON.parse(content) as Partial<Config>;
 	} catch (e) {
-		console.warn(`📊 Langfuse: Failed to load ${path}`, e);
+		recordRuntimeError(`Failed to load ${path}`, e);
 		return {};
 	}
 }

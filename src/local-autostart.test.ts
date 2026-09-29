@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "./config.js";
 import { ensureLocalLangfuseStarted } from "./local-autostart.js";
+import { getLastRuntimeError } from "./runtime-diagnostics.js";
 
 describe("ensureLocalLangfuseStarted", () => {
 	let stackDir: string;
@@ -55,11 +56,11 @@ describe("ensureLocalLangfuseStarted", () => {
 
 		expect(spawnImpl).toHaveBeenCalledOnce();
 		expect(unref).toHaveBeenCalledOnce();
-		expect(warn).toHaveBeenCalledOnce();
-		expect(String(warn.mock.calls[0])).toContain(
+		expect(warn).not.toHaveBeenCalled();
+		expect(getLastRuntimeError()?.message).toContain(
 			"failed to autostart local Langfuse",
 		);
-		expect(String(warn.mock.calls[0])).toContain("ENOENT");
+		expect(getLastRuntimeError()?.message).toContain("ENOENT");
 		warn.mockRestore();
 	});
 });

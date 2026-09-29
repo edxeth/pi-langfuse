@@ -15,6 +15,7 @@ import {
 } from "./lifecycle-types.js";
 import type { ensureLocalLangfuseStarted } from "./local-autostart.js";
 import type { redactionMetadata } from "./redaction.js";
+import { recordRuntimeError } from "./runtime-diagnostics.js";
 import type { SessionContextLike, SessionState } from "./session-state.js";
 import type { collectSourceMetadata } from "./source-metadata.js";
 import type {
@@ -118,7 +119,7 @@ export function createAgentLifecycleHandlers(
 				});
 			}
 		} catch (error) {
-			console.warn("📊 Langfuse: Failed to send prompt health scores", error);
+			recordRuntimeError("Failed to send prompt health scores", error);
 		}
 	};
 
@@ -413,7 +414,7 @@ export function createAgentLifecycleHandlers(
 					});
 				}
 			} catch (e) {
-				console.warn("📊 Langfuse: Failed to create trace", e);
+				recordRuntimeError("Failed to create trace", e);
 			}
 		})();
 		state.promptStartPromise = promptStart;
@@ -537,7 +538,7 @@ export function createAgentLifecycleHandlers(
 					});
 				}
 			} catch (e) {
-				console.warn("📊 Langfuse: Failed to create trace", e);
+				recordRuntimeError("Failed to create trace", e);
 			}
 		})();
 		state.promptStartPromise = promptStart;
@@ -599,7 +600,7 @@ export function createAgentLifecycleHandlers(
 						},
 					});
 				} catch (e) {
-					console.warn("📊 Langfuse: Failed to create prompt span", e);
+					recordRuntimeError("Failed to create prompt span", e);
 				}
 			})();
 		}

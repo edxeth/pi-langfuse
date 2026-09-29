@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "./config.js";
 import {
 	flushClient,
+	getLastRuntimeError,
 	getRuntime,
 	setRuntimeTimeoutsForTest,
 	shutdownClient,
@@ -74,9 +75,8 @@ function exportedSpans(bodies: string[]): ExportedOtlpSpan[] {
 
 /**
  * Local fake of the supported server surface: OTLP ingestion plus the v2
- * observations query the fallback uses for completeness. Spans posted to the
- * OTLP route become queryable, so a healthy export satisfies the fallback
- * check the way a real server would.
+ * observations query. Spans posted to the OTLP route become queryable, so a
+ * healthy export satisfies the read the way a real server would.
  */
 function createCollectingTraceServer() {
 	const requests: Array<{ url: string; body: string }> = [];
@@ -112,8 +112,250 @@ function createCollectingTraceServer() {
 }
 
 describe("langfuse v5 local runtime", () => {
+	it.each([512, 3000])(
+		"awaits exports already started before forceFlush and delivers all %i ended spans",
+		async (spanCount) => {
+			const restore = setRuntimeTimeoutsForTest({ shutdownStepMs: 10_000 });
+			const waiting: Array<() => void> = [];
+			let started: (() => void) | undefined;
+			const firstRequest = new Promise<void>((resolve) => {
+				started = resolve;
+			});
+			let hold = true;
+			let received = 0;
+			const server = createServer((request, response) => {
+				const chunks: Buffer[] = [];
+				request.on("data", (chunk: Buffer) => chunks.push(chunk));
+				request.on("end", () => {
+					received += exportedSpans([Buffer.concat(chunks).toString()]).length;
+					const accept = () => {
+						response.setHeader("content-type", "application/json");
+						response.end("{}");
+					};
+					if (hold) waiting.push(accept);
+					else accept();
+					started?.();
+				});
+			});
+			await new Promise<void>((resolve) =>
+				server.listen(0, "127.0.0.1", resolve),
+			);
+			try {
+				const runtime = await getRuntime({
+					...baseConfig,
+					host: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+				});
+				const trace = runtime.trace({ name: "flush-in-flight" });
+				for (let n = 0; n < spanCount; n++)
+					runtime.span({ name: "tool:burst", traceId: trace.id }).end();
+				await firstRequest;
+				let finished = false;
+				const flush = flushClient().then(() => {
+					finished = true;
+				});
+				await new Promise((resolve) => setTimeout(resolve, 40));
+				const finishedBeforeAcceptance = finished;
+				hold = false;
+				for (const accept of waiting.splice(0)) accept();
+				await flush;
+				expect(finishedBeforeAcceptance).toBe(false);
+				expect(received).toBe(spanCount);
+			} finally {
+				hold = false;
+				for (const accept of waiting.splice(0)) accept();
+				await shutdownClient();
+				restore();
+				server.closeAllConnections();
+				await new Promise<void>((resolve) => server.close(() => resolve()));
+			}
+		},
+		30_000,
+	);
+
+	it("does not expose response bodies from rejected score writes", async () => {
+		const server = createServer((request, response) => {
+			request.resume();
+			request.on("end", () => {
+				response.writeHead(400, { "content-type": "application/json" });
+				response.end(
+					JSON.stringify({ message: "private-score-payload-marker" }),
+				);
+			});
+		});
+		await new Promise<void>((resolve) =>
+			server.listen(0, "127.0.0.1", resolve),
+		);
+		try {
+			const runtime = await getRuntime({
+				...baseConfig,
+				host: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+			});
+			runtime.score({ name: "synthetic", value: 1, traceId: "a".repeat(32) });
+			await flushClient();
+			expect(getLastRuntimeError()?.message).toContain("400");
+			expect(getLastRuntimeError()?.message).not.toContain(
+				"private-score-payload-marker",
+			);
+		} finally {
+			await shutdownClient();
+			server.closeAllConnections();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		}
+	});
 	afterEach(async () => {
 		await shutdownClient();
+	});
+
+	/**
+	 * Server that accepts the OTLP export route and rejects every other
+	 * request, like a server whose read APIs are unavailable. Records every
+	 * request so tests can assert that delivery is one-way.
+	 */
+	function createAcceptOnlyOtelServer() {
+		const requests: Array<{ method: string; url: string }> = [];
+		const receivedSpans: ExportedOtlpSpan[] = [];
+		const server = createServer((request, response) => {
+			requests.push({ method: request.method || "", url: request.url || "" });
+			const chunks: Buffer[] = [];
+			request.on("data", (chunk: Buffer) => chunks.push(chunk));
+			request.on("end", () => {
+				if (
+					request.method === "POST" &&
+					request.url?.includes("/api/public/otel/v1/traces")
+				) {
+					receivedSpans.push(
+						...exportedSpans([Buffer.concat(chunks).toString("utf8")]),
+					);
+					response.statusCode = 200;
+					response.setHeader("content-type", "application/json");
+					response.end("{}");
+					return;
+				}
+				response.statusCode = 404;
+				response.setHeader("content-type", "application/json");
+				response.end(JSON.stringify({ message: "not found" }));
+			});
+		});
+		return { server, requests, receivedSpans };
+	}
+
+	it("delivers an accepted prompt with one-way export and no diagnostics", async () => {
+		const previousError = getLastRuntimeError();
+		const restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 500 });
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		const { server, requests, receivedSpans } = createAcceptOnlyOtelServer();
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", () => resolve());
+		});
+
+		try {
+			const address = server.address() as AddressInfo;
+			const runtime = await getRuntime({
+				...baseConfig,
+				host: `http://127.0.0.1:${address.port}`,
+			});
+			const trace = runtime.trace({
+				name: "pi-agent",
+				id: "a".repeat(32),
+				input: "one-way prompt",
+				sessionId: "one-way-session",
+			});
+			const prompt = runtime.span({ name: "agent.prompt", traceId: trace.id });
+			const turn = runtime.span({
+				name: "agent.turn",
+				traceId: trace.id,
+				parentObservationId: prompt.id,
+			});
+			const generation = runtime.generation({
+				name: "llm-response",
+				traceId: trace.id,
+				parentObservationId: turn.id,
+				model: "one-way-model",
+			});
+			generation.end({ output: "one-way answer" });
+			turn.end({ output: "one-way answer" });
+			prompt.end({ output: "one-way answer" });
+			await flushClient();
+			await shutdownClient();
+
+			// The accepted POST carried the full hierarchy with original ids.
+			expect(receivedSpans.length).toBeGreaterThan(0);
+			for (const span of receivedSpans) {
+				expect(span.traceId).toBe(trace.id);
+			}
+			const byName = new Map(receivedSpans.map((span) => [span.name, span]));
+			expect(byName.get("agent.turn")?.parentSpanId).toBe(
+				byName.get("agent.prompt")?.spanId,
+			);
+			expect(byName.get("llm-response")?.parentSpanId).toBe(
+				byName.get("agent.turn")?.spanId,
+			);
+			expect(byName.get("agent.prompt")?.parentSpanId).toBeUndefined();
+
+			// Delivery is one-way: only accepted OTLP POSTs, no reads, no
+			// replay re-POST of an already delivered span.
+			expect(requests.length).toBeGreaterThan(0);
+			for (const request of requests) {
+				expect(request.method).toBe("POST");
+				expect(request.url).toContain("/api/public/otel/v1/traces");
+			}
+			const postedSpanIds = receivedSpans.map((span) => span.spanId);
+			expect(new Set(postedSpanIds).size).toBe(postedSpanIds.length);
+
+			// A successful prompt must stay silent.
+			expect(warn.mock.calls).toEqual([]);
+			expect(getLastRuntimeError()).toBe(previousError);
+		} finally {
+			warn.mockRestore();
+			restoreTimeouts();
+			await new Promise<void>((resolve, reject) => {
+				server.closeAllConnections();
+				server.close((error) => (error ? reject(error) : resolve()));
+			});
+		}
+	});
+
+	it("surfaces export failure through the runtime error boundary without raw console output", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 500 });
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		const server = createServer((request, response) => {
+			request.resume();
+			request.on("end", () => {
+				response.statusCode = 500;
+				response.setHeader("content-type", "application/json");
+				response.end(JSON.stringify({ message: "export rejected" }));
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", () => resolve());
+		});
+
+		try {
+			const address = server.address() as AddressInfo;
+			const runtime = await getRuntime({
+				...baseConfig,
+				host: `http://127.0.0.1:${address.port}`,
+			});
+			const trace = runtime.trace({ name: "pi-agent" });
+			const prompt = runtime.span({ name: "agent.prompt", traceId: trace.id });
+			prompt.end({ output: "done" });
+			await flushClient();
+
+			// The exporter reports through onError, which lands in the runtime
+			// error boundary; the runtime itself adds no duplicate report and
+			// never writes to the console.
+			expect(getLastRuntimeError()).toBeDefined();
+			expect(warn.mock.calls).toEqual([]);
+		} finally {
+			warn.mockRestore();
+			restoreTimeouts();
+			await new Promise<void>((resolve, reject) => {
+				server.closeAllConnections();
+				server.close((error) => (error ? reject(error) : resolve()));
+			});
+		}
 	});
 
 	it("propagates real OTel context and exports to an ephemeral local endpoint", async () => {
@@ -183,11 +425,7 @@ describe("langfuse v5 local runtime", () => {
 	});
 
 	it("prevents non-media data prefixes from corrupting later media", async () => {
-		const restoreTimeouts = setRuntimeTimeoutsForTest({
-			shutdownStepMs: 200,
-			traceVisibilityMs: 25,
-			pollIntervalMs: 1,
-		});
+		const restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 200 });
 		const requests: string[] = [];
 		const consoleError = vi
 			.spyOn(console, "error")
@@ -240,8 +478,6 @@ describe("langfuse v5 local runtime", () => {
 				),
 			).toBe(false);
 		} finally {
-			// Settle within the shortened windows; the echo server never
-			// reports observations, so retained traces discard explicitly.
 			await shutdownClient();
 			consoleError.mockRestore();
 			restoreTimeouts();
@@ -251,7 +487,7 @@ describe("langfuse v5 local runtime", () => {
 		}
 	});
 
-	it("replays an unconfirmed trace over the OTLP ingestion endpoint", async () => {
+	it("exports the full hierarchy with observation facts over the OTLP ingestion endpoint", async () => {
 		const requests: Array<{ url: string; body: string }> = [];
 		const server = createServer((request, response) => {
 			const chunks: Buffer[] = [];
@@ -261,8 +497,6 @@ describe("langfuse v5 local runtime", () => {
 					url: request.url || "",
 					body: Buffer.concat(chunks).toString("utf8"),
 				});
-				// The server never reports observations, so the fallback cannot
-				// confirm delivery and must replay over OTLP.
 				response.statusCode = 200;
 				response.setHeader("content-type", "application/json");
 				response.end("{}");
@@ -272,11 +506,7 @@ describe("langfuse v5 local runtime", () => {
 			server.once("error", reject);
 			server.listen(0, "127.0.0.1", () => resolve());
 		});
-		const restoreTimeouts = setRuntimeTimeoutsForTest({
-			shutdownStepMs: 500,
-			traceVisibilityMs: 25,
-			pollIntervalMs: 1,
-		});
+		const restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 500 });
 
 		type ReplayAttribute = {
 			key: string;
@@ -356,16 +586,25 @@ describe("langfuse v5 local runtime", () => {
 			});
 			turn.end({ output: "final answer" });
 			prompt.end({ output: "final answer" });
-
+			await flushClient();
 			await shutdownClient();
 
-			const replayBodies = requests
-				.filter(({ url }) => url.includes("/api/public/otel/v1/traces"))
-				.map(({ body }) => body);
-			if (replayBodies.length === 0) {
-				throw new Error("OTLP fallback replay was not received");
+			// Delivery is one-way over the OTLP ingestion endpoint: no
+			// observation reads, no replay posts.
+			const otelRequests = requests.filter(({ url }) =>
+				url.includes("/api/public/otel/v1/traces"),
+			);
+			if (otelRequests.length === 0) {
+				throw new Error("OTLP export was not received");
 			}
-			const spans = parseReplaySpans(replayBodies);
+			expect(
+				requests.filter(({ url }) => url.includes("observations")),
+			).toEqual([]);
+			const postedSpanIds = parseReplaySpans(
+				otelRequests.map(({ body }) => body),
+			).map((span) => span.spanId);
+			expect(new Set(postedSpanIds).size).toBe(postedSpanIds.length);
+			const spans = parseReplaySpans(otelRequests.map(({ body }) => body));
 			expect(spans.map((span) => span.name)).toEqual(
 				expect.arrayContaining([
 					"agent.prompt",
@@ -401,34 +640,26 @@ describe("langfuse v5 local runtime", () => {
 			expect(attributeOf(toolSpan, "langfuse.observation.status_message")).toBe(
 				"tool failed",
 			);
-			// SPAN-type observations keep usage and cost through the replay.
+			// SPAN-type observations keep usage and cost on the export.
 			expect(attributeOf(toolSpan, "langfuse.observation.usage_details")).toBe(
 				JSON.stringify({ input: 2, output: 1, total: 3 }),
 			);
 			expect(attributeOf(toolSpan, "langfuse.observation.cost_details")).toBe(
 				JSON.stringify({ total: 0.02 }),
 			);
-			// The replay must be visible to the same v2 observations endpoint the
-			// fallback checks for completeness.
-			expect(
-				requests.some(({ url }) => url.includes("/api/public/v2/observations")),
-			).toBe(true);
 			expect(JSON.stringify(spans)).not.toContain("sk-local-test");
 		} finally {
 			restoreTimeouts();
 			await shutdownClient();
 			await new Promise<void>((resolve, reject) => {
+				server.closeAllConnections();
 				server.close((error) => (error ? reject(error) : resolve()));
 			});
 		}
 	});
 
 	it("stamps trace identity on child spans before the prompt root exports", async () => {
-		const restoreTimeouts = setRuntimeTimeoutsForTest({
-			shutdownStepMs: 200,
-			traceVisibilityMs: 25,
-			pollIntervalMs: 1,
-		});
+		const restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 200 });
 		const requests: Array<{ url: string; body: string }> = [];
 		const server = createServer((request, response) => {
 			const chunks: Buffer[] = [];
@@ -499,11 +730,7 @@ describe("langfuse v5 local runtime", () => {
 			server.once("error", reject);
 			server.listen(0, "127.0.0.1", () => resolve());
 		});
-		const restoreTimeouts = setRuntimeTimeoutsForTest({
-			shutdownStepMs: 500,
-			traceVisibilityMs: 25,
-			pollIntervalMs: 1,
-		});
+		const restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 500 });
 
 		try {
 			const address = server.address() as AddressInfo;

@@ -32,9 +32,11 @@ import { sendIsolatedTestTrace } from "./operator-telemetry.js";
 import { CAPTURE_POLICIES, type CapturePolicy } from "./payload-policy.js";
 import { appendRawTrace, drainRawTraceQueue } from "./raw-trace.js";
 import { redactionMetadata, redactString } from "./redaction.js";
+import { subscribeRuntimeErrors } from "./runtime-diagnostics.js";
 import {
 	hasActiveSessionLeases,
 	type SessionContextLike,
+	type SessionState,
 	SessionStateOwner,
 } from "./session-state.js";
 import {
@@ -73,8 +75,10 @@ const LANGFUSE_STATUS_KEY = "pi-langfuse:status";
 const LANGFUSE_TEST_TIMEOUT_MS = 3_000;
 
 interface LangfuseUiContext {
+	hasUI?: boolean;
 	ui?: {
 		setStatus?: (key: string, text: string | undefined) => void;
+		notify?: (message: string, type?: "info" | "warning" | "error") => void;
 	};
 	sessionManager?: { getSessionFile?: () => string | undefined };
 }
@@ -196,12 +200,12 @@ function announceConfigState(settings: Partial<SettingsValues>) {
 	const config = resolveConfig(settings);
 	if (!config.enabled) return;
 	if (!config.publicKey || !config.secretKey) {
-		console.log(
-			"📊 Langfuse: Configure public/secret key in settings, pi-langfuse.json, or LANGFUSE_* env vars to enable",
+		recordRuntimeError(
+			"Configure Langfuse public/secret key in settings, pi-langfuse.json, or LANGFUSE_* env vars to enable tracing",
 		);
 	}
 	for (const warning of getConfigWarnings(config)) {
-		console.warn(`📊 Langfuse: ${warning}`);
+		recordRuntimeError(warning);
 	}
 }
 
@@ -273,6 +277,37 @@ export default async function (pi: ExtensionAPI) {
 	let lastUiContext: LangfuseUiContext | undefined;
 	let commandSettingsOverrides: Partial<SettingsValues> = {};
 	const sessionOwner = new SessionStateOwner<PromptState>();
+	const diagnosticContexts = new Map<
+		SessionState<PromptState>,
+		{
+			ctx: LangfuseUiContext;
+			config: Config;
+		}
+	>();
+	let detachDiagnostics: (() => void) | undefined;
+	const bindDiagnostics = (ctx: LangfuseUiContext, config: Config) => {
+		const state = sessionOwner.get(ctx);
+		if (state) diagnosticContexts.set(state, { ctx, config });
+		detachDiagnostics?.();
+		let lastMessage: string | undefined;
+		detachDiagnostics = subscribeRuntimeErrors((error) => {
+			// Capture configuration here: resolving it inside the callback could
+			// recurse if reading that configuration itself produces a diagnostic.
+			const safe = operatorSafeText(config, error.message).replace(
+				/\p{Cc}/gu,
+				" ",
+			);
+			if (safe === lastMessage) return;
+			lastMessage = safe;
+			const message = safe.startsWith("Langfuse") ? safe : `Langfuse: ${safe}`;
+			if (ctx.hasUI) {
+				ctx.ui?.notify?.(message, "warning");
+			} else if (ctx.hasUI === false) {
+				// Print/JSON mode has no terminal renderer; keep diagnostics off stdout.
+				process.stderr.write(`${message}\n`);
+			}
+		});
+	};
 
 	const refreshConfig = async (clearCommandOverrides = false) => {
 		if (clearCommandOverrides) commandSettingsOverrides = {};
@@ -282,6 +317,7 @@ export default async function (pi: ExtensionAPI) {
 		};
 		registerSettings(pi, getLiveSettingsView(settings));
 		const config = resolveConfig(settings);
+		if (lastUiContext) bindDiagnostics(lastUiContext, config);
 		for (const state of sessionOwner.values()) {
 			await agentLifecycle.finalizePrompt(
 				state,
@@ -342,6 +378,7 @@ export default async function (pi: ExtensionAPI) {
 		getConfig: () => resolveConfig(settings),
 		updateStatus: (ctx, config) => {
 			lastUiContext = ctx;
+			bindDiagnostics(ctx, config);
 			updateLangfuseStatusLine(ctx, config);
 		},
 		getSessionState,
@@ -526,14 +563,14 @@ export default async function (pi: ExtensionAPI) {
 		},
 	});
 
-	announceConfigState(settings);
-
 	pi.on("session_start", async (event, ctx) => {
 		const state = getSessionState(ctx, true);
 		if (!state) return;
 		lastUiContext = ctx;
 		updateLangfuseStatusLine(ctx, resolveConfig(settings));
 		const config = resolveConfig(settings);
+		bindDiagnostics(ctx, config);
+		announceConfigState(settings);
 		await agentLifecycle.finalizePrompt(
 			state,
 			config,
@@ -644,6 +681,10 @@ export default async function (pi: ExtensionAPI) {
 				drainRawTraceQueue();
 				await shutdownClient();
 			}
+			if (diagnosticContexts.size === 0) {
+				detachDiagnostics?.();
+				detachDiagnostics = undefined;
+			}
 			return;
 		}
 		if (!state.shutdownPromise) {
@@ -666,5 +707,14 @@ export default async function (pi: ExtensionAPI) {
 			})();
 		}
 		await state.shutdownPromise;
+		diagnosticContexts.delete(state);
+		const surviving = [...diagnosticContexts.values()].at(-1);
+		lastUiContext = surviving?.ctx;
+		if (surviving) {
+			bindDiagnostics(surviving.ctx, surviving.config);
+		} else {
+			detachDiagnostics?.();
+			detachDiagnostics = undefined;
+		}
 	});
 }

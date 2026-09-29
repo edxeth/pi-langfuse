@@ -14,6 +14,7 @@ import {
 } from "./lifecycle-types.js";
 import type { redactionMetadata } from "./redaction.js";
 import { isSensitiveKey } from "./redaction.js";
+import { recordRuntimeError } from "./runtime-diagnostics.js";
 import type { SessionContextLike, SessionState } from "./session-state.js";
 import type {
 	costDetailsFromUsage,
@@ -459,7 +460,7 @@ export function createGenerationLifecycleHandlers(
 						},
 					});
 				} catch (error) {
-					console.warn("📊 Langfuse: Failed to start generation", error);
+					recordRuntimeError("Failed to start generation", error);
 				}
 			})();
 		}
@@ -559,7 +560,7 @@ export function createGenerationLifecycleHandlers(
 					}
 				}
 			} catch (error) {
-				console.warn("📊 Langfuse: Failed to end generation", error);
+				recordRuntimeError("Failed to end generation", error);
 			}
 		})();
 		return generationState.finishPromise;
@@ -992,7 +993,7 @@ export function createGenerationLifecycleHandlers(
 						},
 					});
 				} catch (error) {
-					console.warn("📊 Langfuse: Failed to abandon generation", error);
+					recordRuntimeError("Failed to abandon generation", error);
 				}
 			})();
 			await generationState.finishPromise;

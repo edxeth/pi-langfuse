@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import registerExtension from "./index.js";
+import { recordRuntimeError } from "./runtime-diagnostics.js";
 
 type ExtensionArg = Parameters<typeof registerExtension>[0];
 type EventHandler = (event: unknown, ctx?: unknown) => Promise<void> | void;
@@ -112,6 +113,114 @@ describe("index (extension entry)", () => {
 			.split("\n")
 			.map((line) => JSON.parse(line) as Record<string, unknown>);
 	}
+
+	it("routes safe runtime failures through Pi notifications and detaches on shutdown", async () => {
+		mockPi.events.emit.mockImplementation((event, probe) => {
+			if (event === "extension:settings:get") {
+				probe.values = { enabled: false, "secret-key": "sk-ui-private" };
+			}
+		});
+		await registerExtension(mockPi as unknown as ExtensionArg);
+		const start = mockPi.on.mock.calls.find(
+			(call) => call[0] === "session_start",
+		);
+		const stop = mockPi.on.mock.calls.find(
+			(call) => call[0] === "session_shutdown",
+		);
+		if (!start || !stop) throw new Error("session lifecycle not registered");
+		const messages: string[] = [];
+		const ctx = {
+			hasUI: true,
+			ui: { notify: (message: string) => messages.push(message) },
+			sessionManager: {
+				getSessionFile: () => "/tmp/ui-diagnostic/session.jsonl",
+			},
+		};
+		await (start[1] as EventHandler)({}, ctx);
+		recordRuntimeError("export failed for sk-ui-private");
+		expect(messages).toHaveLength(1);
+		expect(messages[0]).toContain("export failed");
+		expect(messages[0]).not.toContain("sk-ui-private");
+		recordRuntimeError("export failed for sk-ui-private");
+		expect(messages).toHaveLength(1);
+		await (stop[1] as EventHandler)({}, ctx);
+		recordRuntimeError("failure after this UI closed");
+		expect(messages).toHaveLength(1);
+	});
+
+	it("rebinds diagnostics to a surviving session and ignores unknown shutdowns", async () => {
+		mockPi.events.emit.mockImplementation((event, probe) => {
+			if (event === "extension:settings:get") probe.values = { enabled: false };
+		});
+		await registerExtension(mockPi as unknown as ExtensionArg);
+		const start = mockPi.on.mock.calls.find(
+			(call) => call[0] === "session_start",
+		);
+		const stop = mockPi.on.mock.calls.find(
+			(call) => call[0] === "session_shutdown",
+		);
+		if (!start || !stop) throw new Error("session lifecycle not registered");
+		const messagesA: string[] = [];
+		const messagesB: string[] = [];
+		const context = (id: string, messages: string[]) => ({
+			hasUI: true,
+			ui: { notify: (message: string) => messages.push(message) },
+			sessionManager: {
+				getSessionFile: () => `/tmp/ui-diagnostic/${id}.jsonl`,
+			},
+		});
+		const a = context("a", messagesA);
+		const b = context("b", messagesB);
+		await (start[1] as EventHandler)({}, a);
+		await (start[1] as EventHandler)({}, b);
+		try {
+			await (stop[1] as EventHandler)({}, b);
+			recordRuntimeError("failure for surviving A");
+			expect(messagesA).toHaveLength(1);
+			expect(messagesB).toEqual([]);
+			await (stop[1] as EventHandler)({}, context("unknown", []));
+			recordRuntimeError("failure after unknown shutdown");
+			expect(messagesA).toHaveLength(2);
+		} finally {
+			await (stop[1] as EventHandler)({}, a);
+		}
+	});
+
+	it("keeps headless diagnostics on stderr and leaves stdout untouched", async () => {
+		mockPi.events.emit.mockImplementation((event, probe) => {
+			if (event === "extension:settings:get") probe.values = { enabled: false };
+		});
+		await registerExtension(mockPi as unknown as ExtensionArg);
+		const start = mockPi.on.mock.calls.find(
+			(call) => call[0] === "session_start",
+		);
+		if (!start) throw new Error("session lifecycle not registered");
+		await (start[1] as EventHandler)(
+			{},
+			{
+				hasUI: false,
+				sessionManager: {
+					getSessionFile: () => "/tmp/headless-diagnostic/session.jsonl",
+				},
+			},
+		);
+		const stdout = vi
+			.spyOn(process.stdout, "write")
+			.mockImplementation(() => true);
+		const stderr = vi
+			.spyOn(process.stderr, "write")
+			.mockImplementation(() => true);
+		try {
+			recordRuntimeError("export failed\u001b[31m");
+			expect(stdout).not.toHaveBeenCalled();
+			expect(stderr).toHaveBeenCalledOnce();
+			expect(String(stderr.mock.calls[0][0])).toContain("export failed");
+			expect(String(stderr.mock.calls[0][0])).not.toContain("\u001b");
+		} finally {
+			stdout.mockRestore();
+			stderr.mockRestore();
+		}
+	});
 
 	it("should update state on session_start", async () => {
 		await registerExtension(mockPi as unknown as ExtensionArg);

@@ -3,14 +3,17 @@ import type { AddressInfo } from "node:net";
 
 /**
  * Local stand-in for the supported Langfuse server surface, used by the real
- * Pi runtime regression tests. Mirrors the v3/v4 contract the extension
- * targets:
+ * Pi runtime regression tests. Mirrors the single-export-pipeline contract:
  *
  * - POST /api/public/otel/v1/traces: OTLP JSON ingestion. Accepted spans are
  *   indexed per trace, which is what a real server's observation index does.
- * - GET  /api/public/v2/observations?traceId=...: serves the accepted index.
- *   This is the authoritative completeness surface; a 200 with an empty page
- *   means "not indexed yet", not "lost".
+ *   Acceptance is decided by the transport response alone: a 200 without a
+ *   rejecting partialSuccess is final, and a partialSuccess with rejected
+ *   spans is a loss the server reports in-band (nothing is indexed).
+ * - GET  /api/public/v2/observations and GET /api/public/observations: the
+ *   read APIs exist here only as server-mode modeling. The extension must
+ *   never call them under the single-export pipeline; their hit counters
+ *   (pollCounts, v1Hits) turn any read attempt into a visible defect.
  * - POST /api/public/scores: accepted and recorded.
  * - Legacy routes (/api/public/ingestion, GET /api/public/traces/<id>) answer
  *   404 so any legacy traffic becomes a visible defect.
@@ -38,18 +41,16 @@ export type RecorderFaults = {
 	gateAtMatchedCount: number;
 	/** Answer matching OTLP posts with 200 + partialSuccess and index nothing. */
 	partialRejectBodiesContaining: string[];
-	/** Serve empty v2 observation pages for the first N polls per trace id. */
-	lazyIndexPolls: number;
 	/**
 	 * Status code for GET /api/public/v2/observations (default 200). Servers
-	 * outside v4 write mode answer 404 while the indexed data itself is
-	 * still there; set 404 here to model them.
+	 * outside v4 write mode answer 404; the extension must never ask either
+	 * way, so the hit counter stays the real assertion.
 	 */
 	v2Status: number;
 	/**
-	 * Status code for GET /api/public/observations (the legacy v1 read the
-	 * fallback can negotiate to). Default 404 keeps legacy discipline; set
-	 * 200 to model a server where the v1 read works.
+	 * Status code for GET /api/public/observations (the legacy v1 read).
+	 * Default 404 keeps legacy discipline; set 200 to prove the extension
+	 * ignores an available legacy read surface too.
 	 */
 	v1Status: number;
 };
@@ -89,8 +90,9 @@ export class LangfuseRecorder {
 	readonly legacyHits: string[] = [];
 	/** traceId -> indexed spanId -> span name (only accepted OTLP posts). */
 	readonly index = new Map<string, Map<string, string>>();
+	/** GET /api/public/v2/observations requests per trace id; any hit is a defect. */
 	readonly pollCounts = new Map<string, number>();
-	/** GET /api/public/observations requests (the negotiated legacy v1 read). */
+	/** GET /api/public/observations requests; any hit is a defect. */
 	v1Hits = 0;
 	readonly faults: RecorderFaults;
 	postsTotal = 0;
@@ -107,7 +109,6 @@ export class LangfuseRecorder {
 			rejectStatus: 503,
 			gateAtMatchedCount: Number.POSITIVE_INFINITY,
 			partialRejectBodiesContaining: [],
-			lazyIndexPolls: 0,
 			v2Status: 200,
 			v1Status: 404,
 		};
@@ -199,7 +200,7 @@ export class LangfuseRecorder {
 				return;
 			}
 
-			// Authoritative completeness query.
+			// Read APIs: modeled for server-mode tests; any hit is a defect.
 			if (
 				request.method === "GET" &&
 				path.includes("/api/public/v2/observations")
@@ -217,18 +218,16 @@ export class LangfuseRecorder {
 					new URL(path, "http://127.0.0.1").searchParams.get("traceId") ?? "";
 				const polls = (this.pollCounts.get(traceId) ?? 0) + 1;
 				this.pollCounts.set(traceId, polls);
-				const held = polls <= this.faults.lazyIndexPolls;
-				const spans = held
-					? []
-					: [...(this.index.get(traceId)?.entries() ?? [])].map(
-							([id, name]) => ({ id, name, type: "SPAN" }),
-						);
-				record.outcome = held ? "v2-empty-page" : `v2-${spans.length}`;
+				const spans = [...(this.index.get(traceId)?.entries() ?? [])].map(
+					([id, name]) => ({ id, name, type: "SPAN" }),
+				);
+				record.outcome = `v2-${spans.length}`;
 				finish(200, JSON.stringify({ data: spans, meta: {} }));
 				return;
 			}
 
-			// Legacy v1 observations read (negotiated when v2 is unsupported).
+			// Legacy v1 observations read (the extension must never negotiate
+			// or read it; v1Hits exists to prove that).
 			if (
 				request.method === "GET" &&
 				path.startsWith("/api/public/observations")

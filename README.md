@@ -24,7 +24,7 @@ See [Migration to 2.0](./docs/migration.md) before upgrading.
 - **Local-First Setup**: Local mode creates a self-hosted localhost Langfuse stack with generated secrets.
 - **Autostart**: Once local init is complete, the extension starts Docker Compose on demand when tracing begins.
 - **Raw Traces**: Optional redacted JSONL companion stream for training, distillation, and audit workflows.
-- **Langfuse v5 and OpenTelemetry**: Uses a typed runtime facade with bounded flush and OTLP replay when recorded observations remain unconfirmed.
+- **Langfuse v5 and OpenTelemetry**: Uses one OTLP export path with bounded transport retries and flush. Normal tracing never waits for Langfuse's observation index.
 - **Operator Commands**: Inspect status, test connectivity with an isolated trace, and change capture policy without interrupting an active run.
 
 ## Quick Start

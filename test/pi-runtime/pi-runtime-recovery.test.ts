@@ -1,20 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+	getLastRuntimeError,
 	getRuntimeRegistrySizeForTest,
 	setRuntimeTimeoutsForTest,
 	shutdownClient,
 } from "../../src/langfuse-client.js";
 import { drainRawTraceQueue } from "../../src/raw-trace.js";
-import {
-	completeTrace,
-	createOtlpFallbackTransport,
-	createRestFallbackStore,
-	drainCompletedRestFallback,
-	MAX_FALLBACK_ATTEMPTS,
-	type RestFallbackDeps,
-	recordObservation,
-	recordTrace,
-} from "../../src/rest-fallback.js";
+import { subscribeRuntimeErrors } from "../../src/runtime-diagnostics.js";
 import {
 	createRuntimeCase,
 	type PiAiModule,
@@ -27,20 +19,26 @@ import {
 	latestSpanPerId,
 	spansByName,
 } from "./otlp.js";
-import { startLangfuseRecorder } from "./recorder.js";
+import type { RecorderRecord } from "./recorder.js";
 
 /**
- * Transport-fault regressions at the real seams:
+ * Transport-fault regressions at the real Pi seam under the single-export
+ * pipeline:
  *
- * - The first test drives a genuine Pi SDK session whose recorder deliberately
- *   rejects the first OTLP posts, so recovery happens through the extension's
- *   production shutdown path: rejection, bounded replay, and confirmation on
- *   the supported v2 observations surface.
- * - The remaining tests drive the rest-fallback drain module directly (the
- *   seam the validator used, because oversized and partialSuccess faults
- *   cannot be injected at the session level) with the real OTLP replay
- *   exporter and a fault-injecting recorder.
+ * - The extension's only delivery path is the OTLP transport (POST
+ *   /api/public/otel/v1/traces). Acceptance is the transport response; there
+ *   is no read-back confirmation and no retained replay.
+ * - A transient rejection recovers inside the same export through the
+ *   exporter's bounded native-fetch retry: no second prompt, no replay
+ *   pipeline, no diagnostic.
+ * - A permanent HTTP failure is reported exactly once through the
+ *   runtime-diagnostics subscription (never the console) while the prompt
+ *   and the bounded shutdown still complete.
+ * - A 200 response that rejects spans via partialSuccess is never retried
+ *   (the server persisted the accepted spans) and is reported as a loss.
  *
+ * The privacy, hierarchy, usage/cost, score-environment, and credential
+ * contracts from the previous replay pipeline carry over unchanged.
  * Everything stays on 127.0.0.1 with synthetic credentials; no Docker, no
  * persistent Langfuse, no paid models.
  */
@@ -71,159 +69,163 @@ function spansFromAccepted(recorder: RuntimeCase["recorder"]): DecodedSpan[] {
 		.flatMap((record) => decodeOtlpPayload(record.body));
 }
 
-/**
- * Drain dependencies against the recorder: the completeness check queries the
- * recorder's supported v2 observations surface, and replays go through the
- * real OTLP fallback transport.
- */
-function drainDeps(recorder: RuntimeCase["recorder"]): RestFallbackDeps {
-	const getMany = async (query: { traceId: string }) => {
-		const response = await fetch(
-			`${recorder.url}/api/public/v2/observations?traceId=${encodeURIComponent(query.traceId)}`,
-			{
-				headers: { authorization: "Basic dDp0" },
-				signal: AbortSignal.timeout(3_000),
-			},
-		);
-		const page = (await response.json()) as { data?: unknown[] };
-		return { data: page.data ?? [], meta: {} };
-	};
-	// SAFETY: the drain reads only client.api.observations.getMany; the
-	// minimal query shape mirrors how the production score client is called.
-	return {
-		client: {
-			api: { observations: { getMany } },
-		} as unknown as RestFallbackDeps["client"],
-		transport: createOtlpFallbackTransport({
-			host: recorder.url,
-			publicKey: "pk-drain-test",
-			secretKey: "sk-drain-test",
+function spanIdsOf(record: RecorderRecord): Set<string> {
+	return new Set(decodeOtlpPayload(record.body).map((span) => span.spanId));
+}
+
+function otlpPosts(recorder: RuntimeCase["recorder"]): RecorderRecord[] {
+	return recorder.records.filter((record) =>
+		record.path.includes("/otel/v1/traces"),
+	);
+}
+
+function getReadRequests(recorder: RuntimeCase["recorder"]): RecorderRecord[] {
+	return recorder.records.filter((record) => record.method === "GET");
+}
+
+/** Collect runtime diagnostics for a test window; the runtime never logs. */
+function captureRuntimeDiagnostics() {
+	const messages: string[] = [];
+	const stop = subscribeRuntimeErrors((error) => {
+		messages.push(error.message);
+	});
+	return { messages, stop };
+}
+
+/** Capture every console channel so runtime console output becomes visible. */
+function captureConsole() {
+	const output: string[] = [];
+	const spies = (["warn", "error", "log"] as const).map((method) =>
+		vi.spyOn(console, method).mockImplementation((...parts: unknown[]) => {
+			output.push(`${method}: ${parts.map((part) => String(part)).join(" ")}`);
 		}),
+	);
+	return {
+		output,
+		stop: () => {
+			for (const spy of spies) spy.mockRestore();
+		},
 	};
 }
 
-describe("pi runtime transport recovery", () => {
-	it("recovers a transport-rejected export through the supported OTLP/v2 surface at the Pi session boundary", async () => {
-		// Production drain behavior under fault: rounds are bounded, so shrink
-		// the wall-clock windows without touching the recovery contract.
-		restoreTimeouts = setRuntimeTimeoutsForTest({
-			shutdownStepMs: 1_500,
-			traceVisibilityMs: 100,
-			pollIntervalMs: 10,
-		});
-		const marker = "PR-RECOVERY-canary";
-		const secret = "SUP3R-PR-SECRET";
-		// Quoted key with a newline separator: the shape the redaction model
-		// handles in-place while keeping the surrounding marker text.
-		const secretPattern = `{"api_password"\n : "${secret}"`;
-		const userPrompt = `${marker}: setup ${secretPattern}"`;
-		const finalText = "PR-RECOVERY final answer";
-		const toolUsage = {
-			input: 700,
-			output: 70,
+function langfuseConsoleOutput(output: string[]): string[] {
+	return output.filter((line) => /langfuse/i.test(line));
+}
+
+type RecoveryFixture = {
+	runtimeCase: RuntimeCase;
+	userPrompt: string;
+	secret: string;
+	marker: string;
+};
+
+/**
+ * A real Pi session with a usage-bearing tool and a redaction-targeted
+ * secret, so every test exercises the same wire content contracts.
+ */
+async function createRecoveryCase(name: string): Promise<RecoveryFixture> {
+	const marker = `PR-${name}-canary`;
+	const secret = `SUP3R-${name}-SECRET`;
+	// Quoted key with a newline separator: the shape the redaction model
+	// handles in-place while keeping the surrounding marker text.
+	const userPrompt = `${marker}: setup {"api_password"\n : "${secret}"`;
+	const toolUsage = {
+		input: 700,
+		output: 70,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 770,
+		cost: {
+			input: 0.7,
+			output: 0.07,
 			cacheRead: 0,
 			cacheWrite: 0,
-			totalTokens: 770,
-			cost: {
-				input: 0.7,
-				output: 0.07,
-				cacheRead: 0,
-				cacheWrite: 0,
-				total: 0.77,
+			total: 0.77,
+		},
+	};
+	const runtimeCase = await createRuntimeCase({
+		name,
+		provider: { kind: "faux" },
+		settings: { environment: `${name}-ENV` },
+		customToolsFactory: (piAiModule: PiAiModule) => [
+			{
+				name: "probe_echo",
+				label: "Probe Echo",
+				description: "returns fixed text and reports usage",
+				parameters: piAiModule.Type.Object({ q: piAiModule.Type.String() }),
+				execute: async () => ({
+					content: [{ type: "text", text: "probe ok" }],
+					details: { name: "probe_echo" },
+					usage: toolUsage,
+				}),
 			},
-		};
+		],
+	});
+	const piAi = runtimeCase.piAi;
+	runtimeCase.faux?.setResponses([
+		piAi.fauxAssistantMessage([
+			piAi.fauxToolCall("probe_echo", { q: "probe" }, { id: `call-${name}-1` }),
+		]),
+		piAi.fauxAssistantMessage([piAi.fauxText("PR-RECOVERY final answer")]),
+	]);
+	return { runtimeCase, userPrompt, secret, marker };
+}
 
-		const runtimeCase = await createRuntimeCase({
-			name: "otlp-recovery",
-			provider: { kind: "faux" },
-			settings: { environment: "PR-RECOVERY-ENV" },
-			customToolsFactory: (piAiModule: PiAiModule) => [
-				{
-					name: "probe_echo",
-					label: "Probe Echo",
-					description: "returns fixed text and reports usage",
-					parameters: piAiModule.Type.Object({ q: piAiModule.Type.String() }),
-					execute: async () => ({
-						content: [{ type: "text", text: "probe ok" }],
-						details: { name: "probe_echo" },
-						usage: toolUsage,
-					}),
-				},
-			],
-		});
+describe("pi runtime transport recovery (single OTLP export pipeline)", () => {
+	it("recovers a transiently rejected export inside one prompt via the exporter's bounded retry, with no replay and no read-back", async () => {
+		// The retry budget runs inside one export; the step bound must cover
+		// the backoff chain without touching the recovery contract.
+		restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 4_000 });
+		const { runtimeCase, userPrompt, secret, marker } =
+			await createRecoveryCase("PR-RECOVERY");
 		activeCase = runtimeCase;
-		const piAi = runtimeCase.piAi;
-		const faux = runtimeCase.faux;
-		if (!faux) throw new Error("faux provider was not registered");
-		faux.setResponses([
-			piAi.fauxAssistantMessage([
-				piAi.fauxToolCall(
-					"probe_echo",
-					{ q: "probe" },
-					{ id: "call-pr-rec-1" },
-				),
-			]),
-			piAi.fauxAssistantMessage([piAi.fauxText(finalText)]),
-		]);
 
-		// Deliberate fault, separate from the healthy default: reject the first
-		// two OTLP posts carrying the marker (the normal export and the first
-		// replay round), then accept. 400 is nonretryable for the OTel
-		// exporter, so the normal transport cannot recover on its own and the
-		// accepted delivery below can only be the fallback replay.
+		// Deliberate fault: reject the first OTLP post carrying the marker
+		// with a transient 503, then accept. The exporter's bounded retry must
+		// deliver the same batch; nothing else may appear on the wire.
 		runtimeCase.recorder.faults.rejectBodiesContaining = [marker];
-		runtimeCase.recorder.faults.gateAtMatchedCount = 2;
-		runtimeCase.recorder.faults.rejectStatus = 400;
+		runtimeCase.recorder.faults.gateAtMatchedCount = 1;
+		runtimeCase.recorder.faults.rejectStatus = 503;
 
-		const warns: string[] = [];
-		const warnSpy = vi
-			.spyOn(console, "warn")
-			.mockImplementation((...parts: unknown[]) => {
-				warns.push(parts.map((part) => String(part)).join(" "));
-			});
-
+		const diagnostics = captureRuntimeDiagnostics();
+		const consoleCapture = captureConsole();
 		try {
 			await runtimeCase.session.prompt(userPrompt);
 			await runtimeCase.session.waitForIdle();
 			runtimeCase.session.dispose();
-			// Shutdown drain: replay rounds with production-shaped, bounded windows.
 			await shutdownClient();
 			drainRawTraceQueue();
 		} finally {
-			warnSpy.mockRestore();
+			consoleCapture.stop();
+			diagnostics.stop();
 		}
 
 		const recorder = runtimeCase.recorder;
-		const accepted = spansFromAccepted(recorder);
 
-		// --- endpoint discipline: OTLP + v2 only, no legacy routes ---
+		// --- endpoint discipline: OTLP POST only, no reads, no legacy routes ---
 		expect(recorder.legacyHits).toEqual([]);
-		expect(recorder.pollCounts.size).toBe(1);
+		expect(getReadRequests(recorder)).toEqual([]);
 
-		// --- the accepted delivery is the fallback replay, provably ---
-		// 400 is nonretryable, so the exporter cannot recover by itself: the
-		// normal export and the first replay round are both rejected, and the
-		// single accepted post can only be the fallback replay. Its spans ride
-		// the fallback's instrumentation scope, not the normal exporter's.
-		expect(recorder.postsRejected).toBe(2);
-		expect(recorder.postsAccepted).toBe(1);
-		expect(recorder.postsTotal).toBe(3);
-		for (const span of accepted) {
-			expect(span.scopeName).toBe("pi-langfuse-rest-fallback");
-		}
-
-		// --- stable identities: the replay carries the original ids ---
-		const otlpPosts = recorder.records.filter((record) =>
-			record.path.includes("/otel/v1/traces"),
+		// --- recovery without another prompt: one rejected attempt, one accepted retry ---
+		expect(recorder.postsRejected).toBe(1);
+		expect(recorder.postsAccepted).toBe(6);
+		expect(recorder.postsTotal).toBe(7);
+		const rejectedPost = otlpPosts(recorder).find((post) =>
+			post.outcome.startsWith("rejected-"),
 		);
-		const firstPostIds = new Set(
-			decodeOtlpPayload(otlpPosts[0]?.body).map((span) => span.spanId),
-		);
-		const replayedIds = new Set(accepted.map((span) => span.spanId));
-		expect(firstPostIds.size).toBeGreaterThan(0);
-		expect(replayedIds).toEqual(firstPostIds);
+		if (!rejectedPost) throw new Error("expected the rejected attempt");
+		const rejectedIds = spanIdsOf(rejectedPost);
+		const acceptedPost = recorder
+			.acceptedPosts()
+			.find((post) => [...spanIdsOf(post)].some((id) => rejectedIds.has(id)));
+		if (!acceptedPost) throw new Error("expected a retry of the same span");
+		const acceptedIds = spanIdsOf(acceptedPost);
+		expect(rejectedIds.size).toBeGreaterThan(0);
+		// The retry carries the original identities, not a rebuilt copy.
+		expect([...acceptedIds].sort()).toEqual([...rejectedIds].sort());
 
 		// --- delivery: the server-visible index holds every expected span ---
+		const accepted = spansFromAccepted(recorder);
 		const byName = spansByName(latestSpanPerId(accepted));
 		for (const name of [
 			"agent.prompt",
@@ -235,16 +237,15 @@ describe("pi runtime transport recovery", () => {
 		}
 		const traceIds = new Set(accepted.map((span) => span.traceId));
 		expect(traceIds.size).toBe(1);
-		const traceId = [...traceIds][0];
-		const indexed = recorder.index.get(traceId ?? "");
+		const traceId = [...traceIds][0] ?? "";
 		const uniqueDeliveredSpanIds = new Set(accepted.map((span) => span.spanId));
-		expect(indexed?.size).toBe(uniqueDeliveredSpanIds.size);
+		expect(recorder.index.get(traceId)?.size).toBe(uniqueDeliveredSpanIds.size);
 		expect(recorder.index.size).toBe(1);
-		// The fallback confirmed the replay through the supported surface and
-		// retired the trace: the completeness check ran for it.
-		expect(recorder.pollCounts.get(traceId ?? "") ?? 0).toBeGreaterThan(0);
+		// Acceptance is final on the transport response: the completeness
+		// surface is never queried.
+		expect(recorder.pollCounts.size).toBe(0);
 
-		// --- tool SPAN usage/cost fidelity in the replay-delivered payload ---
+		// --- tool SPAN usage/cost fidelity on the delivered payload ---
 		const acceptedToolPost = recorder
 			.acceptedPosts()
 			.find((record) =>
@@ -269,7 +270,7 @@ describe("pi runtime transport recovery", () => {
 			expect(String(score.auth)).toContain("Basic ");
 		}
 
-		// --- privacy through normal export, replay, and raw records ---
+		// --- privacy through normal export and raw records ---
 		const sinkText = JSON.stringify(recorder.records);
 		expect(sinkText).not.toContain(secret);
 		expect(sinkText).toContain("[REDACTED:");
@@ -280,240 +281,134 @@ describe("pi runtime transport recovery", () => {
 		expect(rawText).toContain("[REDACTED:");
 		expect(rawText).toContain(marker);
 
-		// --- the fallback retired everything during the shutdown drain ---
+		// --- the single pipeline retired everything during shutdown ---
 		expect(getRuntimeRegistrySizeForTest()).toEqual({
 			traces: 0,
 			observations: 0,
 		});
 
-		// --- honest diagnostics: recovery succeeded, nothing reported lost ---
-		const lossWarnings = warns.filter(
-			(warning) =>
-				warning.includes("discarded") ||
-				warning.includes("could not be delivered"),
-		);
-		expect(lossWarnings).toEqual([]);
+		// --- honest diagnostics: transient recovery is silent and console-free ---
+		expect(diagnostics.messages).toEqual([]);
+		expect(langfuseConsoleOutput(consoleCapture.output)).toEqual([]);
 		expect(JSON.stringify(recorder.records)).not.toContain(
 			"sk-local-runtime-test-secret",
 		);
-	});
+	}, 30_000);
 
-	it("discards an oversized trace terminally while a delayed-index trace recovers exactly once", async () => {
-		const recorder = await startLangfuseRecorder("drain-mixed");
+	it("reports a permanent HTTP failure through the diagnostics subscription while prompt and bounded shutdown complete console-silently", async () => {
+		// The full bounded retry chain (initial + 3 retries with backoff) must
+		// fit the export deadline so the failure is "all attempts rejected",
+		// not a deadline cut.
+		restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 5_000 });
+		const { runtimeCase, userPrompt, secret, marker } =
+			await createRecoveryCase("PR-DEAD");
+		activeCase = runtimeCase;
+
+		// Every post is rejected: the loss is permanent and must be reported,
+		// not retried forever and not hidden.
+		runtimeCase.recorder.faults.rejectBodiesContaining = ['"traceId"'];
+		runtimeCase.recorder.faults.rejectStatus = 503;
+
+		const startedAt = Date.now();
+		const diagnostics = captureRuntimeDiagnostics();
+		const consoleCapture = captureConsole();
 		try {
-			const store = createRestFallbackStore();
-			const now = () => new Date().toISOString();
-
-			// Trace A: one span whose serialized body exceeds the 3.5 MB wire
-			// batch limit; every replay drops it before sending.
-			const oversizedId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-			recordTrace(store, {
-				id: oversizedId,
-				timestamp: now(),
-				body: { name: "pi-agent" },
-			});
-			recordObservation(store, {
-				id: "aaaa-span-root",
-				traceId: oversizedId,
-				name: "agent.prompt",
-				type: "SPAN",
-				startTime: now(),
-				body: { input: "A".repeat(3_550_000) },
-			});
-			completeTrace(store, oversizedId);
-
-			// Trace B: usage/cost-bearing tool SPAN plus a generation. Delayed
-			// indexing keeps v2 pages empty through the first drain round,
-			// so confirmation lags the accepted POST by one drain round.
-			const recoverableId = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-			recordTrace(store, {
-				id: recoverableId,
-				timestamp: now(),
-				body: { name: "pi-agent" },
-			});
-			recordObservation(store, {
-				id: "bbbb-span-tool",
-				traceId: recoverableId,
-				name: "tool:probe_echo",
-				type: "SPAN",
-				startTime: now(),
-				body: {
-					usageDetails: { input: 700, output: 70, total: 770 },
-					costDetails: { total: 0.77 },
-					output: "probe ok",
-				},
-			});
-			recordObservation(store, {
-				id: "bbbb-span-gen",
-				traceId: recoverableId,
-				name: "llm-response",
-				type: "GENERATION",
-				startTime: now(),
-				body: { model: "faux-model", usageDetails: { input: 42, output: 7 } },
-			});
-			completeTrace(store, recoverableId);
-
-			const deps = drainDeps(recorder);
-			const options = {
-				requestTimeoutMs: 3_000,
-				visibilityTimeoutMs: 40,
-				pollIntervalMs: 10,
-			};
-
-			const rounds = [];
-			for (let round = 0; round < 3; round += 1) {
-				// Hold visibility for the entire first drain, then expose the index.
-				// A timeout bounds elapsed time, not the number of HTTP polls.
-				recorder.faults.lazyIndexPolls =
-					round === 0 ? Number.POSITIVE_INFINITY : 0;
-				rounds.push(await drainCompletedRestFallback(store, deps, options));
-			}
-			const problems = rounds.flatMap((result) => result.problems);
-			const terminalText = rounds
-				.flatMap((result) => result.terminalLosses)
-				.join(" | ");
-
-			// --- oversized trace A: named truthfully, never transmitted, terminally discarded ---
-			expect(
-				rounds[0]?.problems.some(
-					(problem) =>
-						problem.includes("no sendable span remained") &&
-						problem.includes(oversizedId),
-				),
-			).toBe(true);
-			const oversizedLine = rounds[0]?.problems.find((problem) =>
-				problem.includes("oversized"),
-			);
-			const reportedSize = Number(oversizedLine?.match(/\((\d+) bytes\)/)?.[1]);
-			expect(reportedSize).toBeGreaterThan(3_550_000);
-			expect(reportedSize).toBeLessThan(3_560_000);
-			expect(oversizedLine).toContain("3500000");
-			expect(terminalText).toContain(oversizedId);
-			expect(terminalText).toContain(
-				`${MAX_FALLBACK_ATTEMPTS} failed attempts`,
-			);
-			for (const record of recorder.records) {
-				expect(JSON.stringify(record.body ?? {})).not.toContain(
-					"A".repeat(1000),
-				);
-			}
-
-			// --- delayed-index trace B: sent once, confirmed late, never misreported ---
-			const recoverablePosts = recorder.records.filter(
-				(record) =>
-					record.path.includes("/otel/v1/traces") &&
-					JSON.stringify(record.body ?? {}).includes(recoverableId),
-			);
-			expect(recoverablePosts).toHaveLength(1);
-			expect(recoverablePosts[0]?.outcome).toBe("accepted");
-			const replayBody = JSON.stringify(recoverablePosts[0]?.body ?? {});
-			expect(replayBody).toContain("usage_details");
-			expect(replayBody).toContain("700");
-			expect(replayBody).toContain("cost_details");
-			expect(replayBody).toContain("0.77");
-			expect(recorder.index.get(recoverableId)?.has("bbbb-span-tool")).toBe(
-				true,
-			);
-			expect(
-				recorder.pollCounts.get(recoverableId) ?? 0,
-			).toBeGreaterThanOrEqual(3);
-			// Round 1 could not confirm (lazy empty pages) and said so honestly.
-			expect(
-				rounds[0]?.problems.some(
-					(problem) =>
-						problem.includes(recoverableId) &&
-						problem.includes("sent but not confirmed"),
-				),
-			).toBe(true);
-			// Round 2 confirmed through the v2 surface and retired B without
-			// another send; B never appears in any terminal loss.
-			expect(
-				rounds[1]?.problems.some((problem) => problem.includes(recoverableId)),
-			).toBe(false);
-			expect(terminalText).not.toContain(recoverableId);
-
-			// Round diagnostics: unconfirmed traces are explicitly retained for a
-			// later drain instead of being silently dropped.
-			expect(problems.some((problem) => problem.includes("retaining"))).toBe(
-				true,
-			);
+			await runtimeCase.session.prompt(userPrompt);
+			await runtimeCase.session.waitForIdle();
+			runtimeCase.session.dispose();
+			await shutdownClient();
+			drainRawTraceQueue();
 		} finally {
-			await recorder.close();
+			consoleCapture.stop();
+			diagnostics.stop();
 		}
-	});
+		const elapsedMs = Date.now() - startedAt;
 
-	it("never misreports a partial-acceptance response as delivered and discards after bounded replays", async () => {
-		const recorder = await startLangfuseRecorder("drain-partial");
+		const recorder = runtimeCase.recorder;
+
+		// --- bounded transport behavior: initial attempt plus three retries ---
+		expect(recorder.postsTotal).toBe(24);
+		expect(recorder.postsAccepted).toBe(0);
+		expect(recorder.index.size).toBe(0);
+		expect(getReadRequests(recorder)).toEqual([]);
+		expect(recorder.legacyHits).toEqual([]);
+
+		// --- the failure surfaces deterministically through the subscription ---
+		// Six ended observations each report one failed export, not an
+		// additional wrapper warning from forceFlush.
+		expect(diagnostics.messages).toHaveLength(6);
+		const message = diagnostics.messages[0] ?? "";
+		expect(message).toContain("Langfuse OTLP export failed");
+		expect(message).toContain("HTTP 503");
+		expect(message).toContain("4 attempts");
+		// Sanitized: no credentials, endpoints, or user content ride the summary.
+		for (const forbidden of [
+			secret,
+			marker,
+			"sk-local-runtime-test-secret",
+			"127.0.0.1",
+		]) {
+			for (const diagnostic of diagnostics.messages) {
+				expect(diagnostic).not.toContain(forbidden);
+			}
+		}
+		expect(getLastRuntimeError()?.message).toBe(diagnostics.messages.at(-1));
+
+		// --- console silence: diagnostics never ride console.warn ---
+		expect(langfuseConsoleOutput(consoleCapture.output)).toEqual([]);
+
+		// --- the prompt and the bounded shutdown completed without hanging ---
+		expect(elapsedMs).toBeLessThan(20_000);
+		expect(getRuntimeRegistrySizeForTest()).toEqual({
+			traces: 0,
+			observations: 0,
+		});
+	}, 30_000);
+
+	it("never retries a 200 partial rejection, indexes nothing, and reports the loss through diagnostics", async () => {
+		restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 4_000 });
+		const { runtimeCase, userPrompt } = await createRecoveryCase("PR-PARTIAL");
+		activeCase = runtimeCase;
+
+		// Deliberate fault: every post answers 200 + partialSuccess and the
+		// recorder indexes nothing. The server persisted the accepted spans,
+		// so resending would duplicate them: exactly one attempt is allowed.
+		runtimeCase.recorder.faults.partialRejectBodiesContaining = ['"traceId"'];
+
+		const diagnostics = captureRuntimeDiagnostics();
+		const consoleCapture = captureConsole();
 		try {
-			const store = createRestFallbackStore();
-			const now = () => new Date().toISOString();
-			const traceId = "cccccccccccccccccccccccccccccccc";
-			recordTrace(store, {
-				id: traceId,
-				timestamp: now(),
-				body: { name: "pi-agent" },
-			});
-			recordObservation(store, {
-				id: "cccc-span-root",
-				traceId,
-				name: "agent.prompt",
-				type: "SPAN",
-				startTime: now(),
-				body: { output: "c" },
-			});
-			completeTrace(store, traceId);
-
-			// Deliberate fault: every post answers 200 + partialSuccess and the
-			// recorder indexes nothing, so the v2 check stays unsatisfied.
-			recorder.faults.partialRejectBodiesContaining = [traceId];
-
-			const deps = drainDeps(recorder);
-			const options = {
-				requestTimeoutMs: 3_000,
-				visibilityTimeoutMs: 100,
-				pollIntervalMs: 20,
-			};
-
-			const rounds = [];
-			for (let round = 0; round < 3; round += 1) {
-				rounds.push(await drainCompletedRestFallback(store, deps, options));
-			}
-
-			// Every round reports the trace as sent-but-not-confirmed, never
-			// delivered; the replay count stays inside the retry budget; the
-			// budget exhaustion produces the explicit discard.
-			for (const result of rounds) {
-				const relevant = result.problems.filter((problem) =>
-					problem.includes(traceId),
-				);
-				for (const problem of relevant) {
-					if (problem.includes("replay")) {
-						expect(problem).toContain("sent but not confirmed");
-					}
-				}
-			}
-			expect(
-				rounds
-					.flatMap((result) => result.problems)
-					.some((problem) => problem.includes("sent but not confirmed")),
-			).toBe(true);
-			const terminalText = rounds
-				.flatMap((result) => result.terminalLosses)
-				.join(" | ");
-			expect(terminalText).toContain(traceId);
-			expect(terminalText).toContain(
-				`${MAX_FALLBACK_ATTEMPTS} failed attempts`,
-			);
-			const posts = recorder.records.filter((record) =>
-				record.path.includes("/otel/v1/traces"),
-			);
-			expect(posts.length).toBeLessThanOrEqual(MAX_FALLBACK_ATTEMPTS);
-			for (const post of posts) {
-				expect(post.outcome).toBe("partial-reject");
-			}
-			expect(recorder.index.size).toBe(0);
+			await runtimeCase.session.prompt(userPrompt);
+			await runtimeCase.session.waitForIdle();
+			runtimeCase.session.dispose();
+			await shutdownClient();
+			drainRawTraceQueue();
 		} finally {
-			await recorder.close();
+			consoleCapture.stop();
+			diagnostics.stop();
 		}
-	});
+
+		const recorder = runtimeCase.recorder;
+
+		expect(recorder.postsTotal).toBe(6);
+		expect(
+			new Set(otlpPosts(recorder).flatMap((post) => [...spanIdsOf(post)])).size,
+		).toBe(6);
+		expect(recorder.postsAccepted).toBe(0);
+		expect(recorder.index.size).toBe(0);
+		// A partial rejection is reported in-band; no read API is consulted.
+		expect(getReadRequests(recorder)).toEqual([]);
+
+		// Each ended observation reports its rejection exactly once.
+		expect(diagnostics.messages).toHaveLength(6);
+		const message = diagnostics.messages[0] ?? "";
+		expect(message).toContain("rejected 1 span(s)");
+		expect(message).toContain("not retried (OTLP partial success)");
+		expect(langfuseConsoleOutput(consoleCapture.output)).toEqual([]);
+		expect(getLastRuntimeError()?.message).toBe(diagnostics.messages.at(-1));
+		expect(getRuntimeRegistrySizeForTest()).toEqual({
+			traces: 0,
+			observations: 0,
+		});
+	}, 30_000);
 });

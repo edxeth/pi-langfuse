@@ -67,13 +67,9 @@ afterEach(async () => {
 	}
 });
 
-/** Common fault-free runtime tuning: bounded drains, fast polls. */
+/** Common fault-free runtime tuning: bounded shutdown and flush steps. */
 function useBoundedTimeouts() {
-	restoreTimeouts = setRuntimeTimeoutsForTest({
-		shutdownStepMs: 1_000,
-		traceVisibilityMs: 100,
-		pollIntervalMs: 10,
-	});
+	restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 1_000 });
 }
 
 function decodedAcceptedSpans(

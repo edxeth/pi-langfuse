@@ -14,6 +14,7 @@ import {
 	type PayloadPolicyConfig,
 	shapeRawTraceRecord,
 } from "./payload-policy.js";
+import { recordRuntimeError } from "./runtime-diagnostics.js";
 
 // Raw traces hold private prompt/tool data, so new files are owner-only and
 // new directories are private regardless of the process umask.
@@ -75,7 +76,7 @@ function flushQueue() {
 				`${JSON.stringify(sanitizedRecord, jsonReplacer)}\n`,
 			);
 		} catch (error) {
-			console.warn("📊 Langfuse: Failed to write raw trace", error);
+			recordRuntimeError("Failed to write raw trace", error);
 		}
 	}
 }
@@ -218,7 +219,7 @@ export function appendRawTrace(
 		// Unsafe path components and preparation failures both skip the
 		// record; a write is never enqueued for a directory that could not be
 		// prepared safely.
-		console.warn("📊 Langfuse: Failed to prepare raw trace directory", error);
+		recordRuntimeError("Failed to prepare raw trace directory", error);
 		return;
 	}
 	writeQueue.push({ path, config, record });
