@@ -87,7 +87,7 @@ async function createFauxCase(name: string): Promise<RuntimeCase> {
 
 describe("pi runtime delivery across server read-surface modes", () => {
 	it("delivers both prompts with zero observation reads on a server where v2 and the legacy v1 read are both 404", async () => {
-		restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 1_500 });
+		restoreTimeouts = setRuntimeTimeoutsForTest({ exportMs: 1_500 });
 		const runtimeCase = await createFauxCase("server-mode-no-reads");
 		activeCase = runtimeCase;
 		// Neither read API exists (servers outside v4 write mode). Delivery
@@ -143,7 +143,7 @@ describe("pi runtime delivery across server read-surface modes", () => {
 	}, 30_000);
 
 	it("never queries a legacy v1 read even when the server offers it", async () => {
-		restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 1_500 });
+		restoreTimeouts = setRuntimeTimeoutsForTest({ exportMs: 1_500 });
 		const runtimeCase = await createFauxCase("server-mode-v1-available");
 		activeCase = runtimeCase;
 		// v2 is unsupported (404 outside v4 write mode) but the legacy v1 read
@@ -189,7 +189,7 @@ describe("pi runtime delivery across server read-surface modes", () => {
 	}, 30_000);
 
 	it("flushes each prompt's export before shutdown and drains cleanly on a healthy server", async () => {
-		restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 1_500 });
+		restoreTimeouts = setRuntimeTimeoutsForTest({ exportMs: 1_500 });
 		const runtimeCase = await createFauxCase("server-mode-healthy");
 		activeCase = runtimeCase;
 

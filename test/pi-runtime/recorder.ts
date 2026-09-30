@@ -19,8 +19,9 @@ import type { AddressInfo } from "node:net";
  *   404 so any legacy traffic becomes a visible defect.
  *
  * Faults are explicit and opt-in per test; the default behavior is a healthy
- * server. All traffic stays on 127.0.0.1 and every request is recorded in
- * memory for assertions.
+ * server. Faults include an acceptance delay that holds a 200 back, modeling
+ * a healthy server that is slow to accept. All traffic stays on 127.0.0.1 and
+ * every request is recorded in memory for assertions.
  */
 
 export type RecorderRecord = {
@@ -53,6 +54,12 @@ export type RecorderFaults = {
 	 * ignores an available legacy read surface too.
 	 */
 	v1Status: number;
+	/**
+	 * Hold every accepted OTLP post this many ms before answering 200
+	 * (0 = answer immediately). Models a healthy server whose acceptance
+	 * takes longer than a short step budget.
+	 */
+	acceptanceDelayMs: number;
 };
 
 export type RecordedSpan = {
@@ -95,6 +102,8 @@ export class LangfuseRecorder {
 	/** GET /api/public/observations requests; any hit is a defect. */
 	v1Hits = 0;
 	readonly faults: RecorderFaults;
+	/** Acceptances still held by the delay fault; each settle runs exactly once. */
+	private readonly pendingAcceptances = new Set<() => void>();
 	postsTotal = 0;
 	postsAccepted = 0;
 	postsRejected = 0;
@@ -111,6 +120,7 @@ export class LangfuseRecorder {
 			partialRejectBodiesContaining: [],
 			v2Status: 200,
 			v1Status: 404,
+			acceptanceDelayMs: 0,
 		};
 	}
 
@@ -186,17 +196,30 @@ export class LangfuseRecorder {
 					);
 					return;
 				}
-				this.postsAccepted += 1;
-				record.outcome = "accepted";
-				for (const span of spansFromBody(body)) {
-					let spans = this.index.get(span.traceId);
-					if (!spans) {
-						spans = new Map();
-						this.index.set(span.traceId, spans);
+				const accept = () => {
+					this.postsAccepted += 1;
+					record.outcome = "accepted";
+					for (const span of spansFromBody(body)) {
+						let spans = this.index.get(span.traceId);
+						if (!spans) {
+							spans = new Map();
+							this.index.set(span.traceId, spans);
+						}
+						spans.set(span.spanId, span.name);
 					}
-					spans.set(span.spanId, span.name);
+					finish(200, "{}");
+				};
+				if (this.faults.acceptanceDelayMs > 0) {
+					const settle = () => {
+						clearTimeout(timer);
+						this.pendingAcceptances.delete(settle);
+						accept();
+					};
+					const timer = setTimeout(settle, this.faults.acceptanceDelayMs);
+					this.pendingAcceptances.add(settle);
+					return;
 				}
-				finish(200, "{}");
+				accept();
 				return;
 			}
 
@@ -292,6 +315,12 @@ export class LangfuseRecorder {
 
 	/** Stop accepting traffic and wait until the socket is fully released. */
 	close(): Promise<void> {
+		// Deliver acceptances still held by the delay fault so no response is
+		// left hanging on an open socket while the server shuts down. Each
+		// settle clears its own timer and removes itself first, so a timer
+		// that already fired can never run its acceptance twice.
+		for (const settle of [...this.pendingAcceptances]) settle();
+		this.pendingAcceptances.clear();
 		return new Promise((resolve, reject) => {
 			this.server.close((error) => (error ? reject(error) : resolve()));
 		});

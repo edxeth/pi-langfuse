@@ -454,7 +454,7 @@ beforeEach(() => {
 	drainRawTraceQueue();
 	telemetry.reset();
 	restoreRuntimeTimeouts = setRuntimeTimeoutsForTest({
-		shutdownStepMs: 100,
+		exportMs: 100,
 	});
 	delete process.env.LANGFUSE_PUBLIC_KEY;
 	delete process.env.LANGFUSE_SECRET_KEY;

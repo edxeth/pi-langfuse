@@ -44,6 +44,18 @@ Langfuse may index accepted exports asynchronously. Normal tracing does not quer
 
 Export errors appear through Pi's notification UI rather than writing over the editor. Headless runs write diagnostics to stderr, leaving stdout unchanged. `/langfuse-status` shows the last historical error, not an active retry queue. Transient export errors retry within the current bounded send; they do not require another user message. Partial rejection and exhausted attempts are reported without keeping a recovery copy for later prompts.
 
+## Export deadline warnings
+
+An OTLP deadline warning means the endpoint did not confirm acceptance within the ten-second total budget, including retries and response reads. It does not prove that the server lost the span. The extension aborts the request and does not retain a replay copy.
+
+Older versions used the two-second shutdown-step budget for HTTP exports as well. A successful response taking slightly over two seconds could therefore trigger both an export warning and an OTel flush warning. Export now owns a ten-second request deadline. Flush and shutdown await actual completion or cancellation instead of racing a second lifecycle timer.
+
+If warnings continue, check endpoint latency, server load, and connectivity. A successful health request confirms reachability but does not measure OTLP ingestion latency. The session JSONL and raw trace do not contain these UI warnings or HTTP timing details, so retain the warning and its time when investigating server logs.
+
+## Media attachments
+
+The extension disables automatic SDK uploads of embedded image/audio data. The installed SDK cannot cancel those uploads, which could leave shutdown waiting indefinitely. Normal text, tool, usage, and trace hierarchy capture remains available. Media values follow the existing capture, redaction, and payload limits, without separate media attachments. Setting `LANGFUSE_MEDIA_UPLOAD_ENABLED` does not override this safety boundary.
+
 ## Package verification
 
 From a checkout of the repository, run:

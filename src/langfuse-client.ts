@@ -166,6 +166,7 @@ interface RuntimeState {
 	readonly configKey: string;
 	readonly idGenerator: RuntimeIdGenerator;
 	readonly tracerProvider: BasicTracerProvider;
+	readonly processor: LangfuseSpanProcessor;
 	readonly scoreClient: LangfuseClient;
 	readonly observations: Map<string, VendorObservation>;
 	readonly traces: Map<string, RuntimeTrace>;
@@ -196,21 +197,23 @@ class RuntimeIdGenerator {
 let runtime: RuntimeState | null = null;
 let runtimeTransition: Promise<void> = Promise.resolve();
 let registeredContextManager: AsyncHooksContextManager | undefined;
-const DEFAULT_SHUTDOWN_STEP_TIMEOUT_MS = 2_000;
-let shutdownStepTimeoutMs = DEFAULT_SHUTDOWN_STEP_TIMEOUT_MS;
+// Deadlines belong to HTTP requests, not the operations awaiting them.
+const DEFAULT_EXPORT_TIMEOUT_MS = 10_000;
+const DEFAULT_SCORE_REQUEST_TIMEOUT_MS = 2_000;
+let exportTimeoutMs = DEFAULT_EXPORT_TIMEOUT_MS;
+let scoreRequestTimeoutMs = DEFAULT_SCORE_REQUEST_TIMEOUT_MS;
 
-/**
- * Bounds every shutdown and flush step, including the OTLP exporter's send
- * timeout, so reconfiguration or disposal cannot leave sends running past
- * the teardown window.
- */
+/** Override HTTP request deadlines in isolated tests; return their restoration. */
 export function setRuntimeTimeoutsForTest(timeouts: {
-	shutdownStepMs: number;
+	exportMs: number;
+	scoreMs?: number;
 }) {
-	const previous = shutdownStepTimeoutMs;
-	shutdownStepTimeoutMs = timeouts.shutdownStepMs;
+	const previous = { exportTimeoutMs, scoreRequestTimeoutMs };
+	exportTimeoutMs = timeouts.exportMs;
+	scoreRequestTimeoutMs = timeouts.scoreMs ?? timeouts.exportMs;
 	return () => {
-		shutdownStepTimeoutMs = previous;
+		exportTimeoutMs = previous.exportTimeoutMs;
+		scoreRequestTimeoutMs = previous.scoreRequestTimeoutMs;
 	};
 }
 
@@ -242,30 +245,27 @@ function recordScoreFailure(error: unknown) {
 	);
 }
 
-function neutralizeLangfuseMediaPrefix<T>(
-	value: T,
-	seen = new WeakSet<object>(),
-): T {
-	if (typeof value === "string") {
-		return value.replace(
-			/data:(?![^,;]+(?:;[^,;]+)*;base64,[A-Za-z0-9+/=_-]+)/g,
-			"data\\:",
-		) as T;
+async function sendScore(
+	scoresApi: LangfuseClient["api"]["scores"],
+	body: Parameters<LangfuseClient["api"]["scores"]["create"]>[0],
+): Promise<void> {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), scoreRequestTimeoutMs);
+	try {
+		await scoresApi.create(body, {
+			// SDK 5.11.1 clears its own timer at response headers. The caller
+			// signal stays active through the body read. Keep the SDK header
+			// budget equal: it cannot be disabled via public options and its
+			// timer can survive a rejected fetch until the deadline expires.
+			timeoutInSeconds: Math.max(scoreRequestTimeoutMs / 1000, 0.001),
+			maxRetries: 0,
+			abortSignal: controller.signal,
+		});
+	} catch (error) {
+		recordScoreFailure(error);
+	} finally {
+		clearTimeout(timer);
 	}
-	if (!value || typeof value !== "object") return value;
-	if (value instanceof Date) return value;
-	if (seen.has(value)) return "[Circular]" as T;
-	seen.add(value);
-
-	if (Array.isArray(value)) {
-		return value.map((item) => neutralizeLangfuseMediaPrefix(item, seen)) as T;
-	}
-
-	const output: Record<string, unknown> = {};
-	for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-		output[key] = neutralizeLangfuseMediaPrefix(item, seen);
-	}
-	return output as T;
 }
 
 function shapeBody<T>(
@@ -277,9 +277,7 @@ function shapeBody<T>(
 	) => Record<string, unknown>,
 ): T {
 	if (!body || typeof body !== "object") return body;
-	return neutralizeLangfuseMediaPrefix(
-		shape(config, body as Record<string, unknown>),
-	) as T;
+	return shape(config, body as Record<string, unknown>) as T;
 }
 
 function stringPropagationMetadata(
@@ -719,17 +717,7 @@ function wrapRuntime(rt: RuntimeState, config: Config): LangfuseRuntime {
 						undefined,
 					...body,
 				}) as Parameters<typeof scoresApi.create>[0];
-				const delivery = scoresApi
-					.create(shaped, {
-						timeoutInSeconds: Math.max(shutdownStepTimeoutMs / 1000, 0.001),
-						maxRetries: 0,
-					})
-					.then(
-						() => undefined,
-						(error) => {
-							recordScoreFailure(error);
-						},
-					);
+				const delivery = sendScore(scoresApi, shaped);
 				rt.pendingScores.add(delivery);
 				void delivery.finally(() => {
 					rt.pendingScores.delete(delivery);
@@ -750,13 +738,13 @@ function createRuntime(config: Config): RuntimeState {
 	const idGenerator = new RuntimeIdGenerator();
 	// The injected exporter owns one-way delivery: bounded native-fetch retry
 	// and partial-rejection reporting through onError. There is no read-back,
-	// no retained replay, and the send bound matches flush/shutdown so no
-	// send outlives a disposed or reconfigured runtime.
+	// no retained replay. Each send aborts at its own deadline; lifecycle
+	// operations await actual completion instead of racing another timer.
 	const exporter = createOtlpExporter({
 		host: config.host,
 		publicKey: config.publicKey,
 		secretKey: config.secretKey,
-		timeoutMs: shutdownStepTimeoutMs,
+		timeoutMs: exportTimeoutMs,
 		onError: (message) => recordRuntimeError(message),
 	});
 	const processor = new LangfuseSpanProcessor({
@@ -764,6 +752,9 @@ function createRuntime(config: Config): RuntimeState {
 		// awaits active sends on flush. The SDK batch mode silently drops a full
 		// queue and its forceFlush does not await already-started batches.
 		exportMode: "immediate",
+		// SDK 5.11.1 media PUTs have no cancellation API. Keep telemetry in
+		// the bounded OTLP path; revisit only when uploads are cancellable.
+		mediaUploadEnabled: false,
 		publicKey: config.publicKey,
 		secretKey: config.secretKey,
 		baseUrl: config.host,
@@ -780,6 +771,7 @@ function createRuntime(config: Config): RuntimeState {
 		configKey: runtimeKey(config),
 		idGenerator,
 		tracerProvider,
+		processor,
 		scoreClient: new LangfuseClient({
 			publicKey: config.publicKey,
 			secretKey: config.secretKey,
@@ -791,55 +783,30 @@ function createRuntime(config: Config): RuntimeState {
 	};
 }
 
-async function withTimeout<T>(
-	label: string,
-	operation: Promise<T> | undefined,
-	timeoutMs = shutdownStepTimeoutMs,
-): Promise<T | undefined> {
-	if (!operation) return undefined;
-	let timer: NodeJS.Timeout | undefined;
+/** Drain the owned processor directly, without the provider's generic timer. */
+async function flushRuntime(rt: RuntimeState) {
 	try {
-		return await Promise.race([
-			Promise.resolve(operation),
-			new Promise<undefined>((resolve) => {
-				timer = setTimeout(() => {
-					recordRuntimeError(
-						`Langfuse: ${label} timed out after ${timeoutMs}ms`,
-					);
-					resolve(undefined);
-				}, timeoutMs);
-			}),
-		]);
-	} finally {
-		if (timer) clearTimeout(timer);
-	}
-}
-
-/**
- * Teardown order: end abandoned prompt roots so their spans become exportable,
- * then bound each dependency independently. Export failures were already
- * reported by the exporter's onError, so no delivery diagnostics are
- * duplicated here.
- */
-async function shutdownRuntime(rt: RuntimeState) {
-	finalizeOpenTraces(rt);
-	try {
-		await withTimeout("OTel force flush", rt.tracerProvider.forceFlush());
+		// No media uploads, async masks, or async resource attributes are
+		// configured. The remaining I/O is owned by the bounded exporter.
+		await rt.processor.forceFlush();
 	} catch (error) {
 		recordRuntimeFailure("Failed to flush OpenTelemetry spans", error);
 	}
+	await Promise.all(rt.pendingScores);
+}
+
+/** End open roots, await request completion, then dispose the SDK resources. */
+async function shutdownRuntime(rt: RuntimeState) {
+	finalizeOpenTraces(rt);
+	await flushRuntime(rt);
 	try {
-		await withTimeout("Langfuse score flush", Promise.all(rt.pendingScores));
-	} catch (error) {
-		recordRuntimeFailure("Failed to flush Langfuse scores", error);
-	}
-	try {
-		await withTimeout("Langfuse client shutdown", rt.scoreClient.shutdown());
+		// We send scores through api.scores, so the SDK queue is empty.
+		await rt.scoreClient.shutdown();
 	} catch (error) {
 		recordRuntimeFailure("Failed to shut down Langfuse client", error);
 	}
 	try {
-		await withTimeout("OTel tracer shutdown", rt.tracerProvider.shutdown());
+		await rt.tracerProvider.shutdown();
 	} catch (error) {
 		recordRuntimeFailure("Failed to shut down OpenTelemetry", error);
 	}
@@ -865,23 +832,7 @@ async function withRuntimeTransition<T>(
 
 export function flushClient() {
 	return withRuntimeTransition(async () => {
-		if (!runtime) return;
-		try {
-			await withTimeout(
-				"OTel force flush",
-				runtime.tracerProvider.forceFlush(),
-			);
-		} catch (error) {
-			recordRuntimeFailure("Failed to flush OpenTelemetry spans", error);
-		}
-		try {
-			await withTimeout(
-				"Langfuse score flush",
-				Promise.all(runtime.pendingScores),
-			);
-		} catch (error) {
-			recordRuntimeFailure("Failed to flush Langfuse scores", error);
-		}
+		if (runtime) await flushRuntime(runtime);
 	});
 }
 

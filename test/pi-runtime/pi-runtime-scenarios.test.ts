@@ -69,7 +69,7 @@ afterEach(async () => {
 
 /** Common fault-free runtime tuning: bounded shutdown and flush steps. */
 function useBoundedTimeouts() {
-	restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 1_000 });
+	restoreTimeouts = setRuntimeTimeoutsForTest({ exportMs: 1_000 });
 }
 
 function decodedAcceptedSpans(

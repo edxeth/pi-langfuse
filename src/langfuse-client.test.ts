@@ -5,7 +5,6 @@ import {
 	getLastRuntimeError,
 	getRuntime,
 	getRuntimeRegistrySizeForTest,
-	setRuntimeTimeoutsForTest,
 	shutdownClient,
 } from "./langfuse-client.js";
 
@@ -274,12 +273,10 @@ describe("langfuse v5 runtime facade", () => {
 				(record.end as Record<string, unknown> | undefined)?.output,
 			);
 			if (!output || output === "undefined") continue;
-			expect(output).not.toMatch(/^data:/);
-			expect(output).toContain('data\\: 0:"Hello! How can I help you today?"');
-			expect(output).toContain('data\\: d:{"credits_used":0.0046');
+			expect(output).toBe(mediaOutput);
 		}
-		expect(serialized).toContain("data\\\\: 0:");
-		expect(serialized).toContain("data\\\\: d:");
+		expect(serialized).toContain("data: 0:");
+		expect(serialized).toContain("data: d:");
 		expect(serialized).toContain("credits_used");
 		const actualMediaRecord = mocks.records.find(
 			(item) => item.name === "tool:actual-media",
@@ -299,7 +296,7 @@ describe("langfuse v5 runtime facade", () => {
 		expect(
 			(repeatedPrefixesRecord?.end as Record<string, unknown> | undefined)
 				?.output,
-		).toBe("data\\: first, then data\\: second");
+		).toBe("data: first, then data: second");
 		expect(serialized).toContain("[REDACTED:langfuse-secret-key:");
 		expect(serialized).toContain("[REDACTED:github-token:");
 		expect(serialized).toContain("[REDACTED:bearer-token:");
@@ -474,75 +471,37 @@ describe("langfuse v5 runtime facade", () => {
 		expect(mocks.context.with).toHaveBeenCalled();
 	});
 
-	it("bounds prompt flush without shutting down the shared runtime", async () => {
-		const restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 20 });
-		let provider: (typeof mocks.tracerProviders)[number] | undefined;
-		try {
-			await getRuntime(config);
-			provider = mocks.tracerProviders[mocks.tracerProviders.length - 1];
-			if (!provider) throw new Error("tracer provider was not created");
-			provider.forceFlush.mockImplementation(
-				() => new Promise<never>(() => {}),
-			);
-			const startedAt = Date.now();
-			await flushClient();
-			expect(Date.now() - startedAt).toBeLessThan(80);
-			expect(mocks.client.shutdown).not.toHaveBeenCalled();
-			expect(provider.shutdown).not.toHaveBeenCalled();
-		} finally {
-			provider?.forceFlush.mockResolvedValue(undefined);
-			restoreTimeouts();
-		}
+	it("reports processor flush failures without disposing the shared runtime", async () => {
+		await getRuntime(config);
+		const processor = mocks.LangfuseSpanProcessor.mock.results.at(-1)?.value;
+		const provider = mocks.tracerProviders.at(-1);
+		if (!processor || !provider) throw new Error("runtime was not created");
+		processor.forceFlush.mockRejectedValueOnce(new Error("processor failed"));
+		await flushClient();
+		expect(getLastRuntimeError()?.message).toBe(
+			"Langfuse: Failed to flush OpenTelemetry spans: processor failed",
+		);
+		expect(mocks.client.shutdown).not.toHaveBeenCalled();
+		expect(provider.shutdown).not.toHaveBeenCalled();
 	});
 
-	it("bounds every shutdown dependency independently", async () => {
-		const restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 20 });
-		try {
-			for (const dependency of [
-				"otel flush",
-				"score flush",
-				"client shutdown",
-				"tracer shutdown",
-			]) {
-				mocks.client.shutdown.mockReset().mockResolvedValue(undefined);
-				mocks.scoresCreate.mockReset().mockResolvedValue({ id: "score" });
-				const lf = await getRuntime(config);
-				const trace = lf.trace({ name: "pi-agent" });
-				const prompt = lf.span({ name: "agent.prompt", traceId: trace.id });
-				prompt.end({ output: "done" });
-				if (dependency === "score flush") {
-					// Hang the delivery before issuing so the in-flight promise is
-					// genuinely pending when the bounded step awaits it.
-					mocks.scoresCreate.mockImplementation(
-						() => new Promise<never>(() => {}),
-					);
-					lf.score({ name: "hanging_score", value: 1, traceId: trace.id });
-				}
-				const provider =
-					mocks.tracerProviders[mocks.tracerProviders.length - 1];
-				if (!provider) throw new Error("tracer provider was not created");
-				if (dependency === "otel flush") {
-					provider.forceFlush.mockImplementation(
-						() => new Promise<never>(() => {}),
-					);
-				} else if (dependency === "client shutdown") {
-					mocks.client.shutdown.mockImplementation(
-						() => new Promise<never>(() => {}),
-					);
-				} else if (dependency === "tracer shutdown") {
-					provider.shutdown.mockImplementation(
-						() => new Promise<never>(() => {}),
-					);
-				}
-				const startedAt = Date.now();
-				await shutdownClient();
-				expect(Date.now() - startedAt).toBeLessThan(180);
-				expect(mocks.client.shutdown).toHaveBeenCalledTimes(1);
-				expect(provider.forceFlush).toHaveBeenCalledTimes(1);
-				expect(provider.shutdown).toHaveBeenCalledTimes(1);
-			}
-		} finally {
-			restoreTimeouts();
-		}
+	it("continues SDK disposal after a failed flush or client shutdown", async () => {
+		await getRuntime(config);
+		const processor = mocks.LangfuseSpanProcessor.mock.results.at(-1)?.value;
+		const provider = mocks.tracerProviders.at(-1);
+		if (!processor || !provider) throw new Error("runtime was not created");
+		processor.forceFlush.mockRejectedValueOnce(new Error("processor failed"));
+		mocks.client.shutdown.mockRejectedValueOnce(new Error("client failed"));
+		provider.shutdown.mockRejectedValueOnce(new Error("provider failed"));
+		await shutdownClient();
+		expect(mocks.client.shutdown).toHaveBeenCalledTimes(1);
+		expect(provider.shutdown).toHaveBeenCalledTimes(1);
+		expect(getLastRuntimeError()?.message).toBe(
+			"Langfuse: Failed to shut down OpenTelemetry: provider failed",
+		);
+		expect(getRuntimeRegistrySizeForTest()).toEqual({
+			traces: 0,
+			observations: 0,
+		});
 	});
 });

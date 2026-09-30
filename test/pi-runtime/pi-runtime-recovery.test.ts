@@ -175,7 +175,7 @@ describe("pi runtime transport recovery (single OTLP export pipeline)", () => {
 	it("recovers a transiently rejected export inside one prompt via the exporter's bounded retry, with no replay and no read-back", async () => {
 		// The retry budget runs inside one export; the step bound must cover
 		// the backoff chain without touching the recovery contract.
-		restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 4_000 });
+		restoreTimeouts = setRuntimeTimeoutsForTest({ exportMs: 4_000 });
 		const { runtimeCase, userPrompt, secret, marker } =
 			await createRecoveryCase("PR-RECOVERY");
 		activeCase = runtimeCase;
@@ -299,7 +299,7 @@ describe("pi runtime transport recovery (single OTLP export pipeline)", () => {
 		// The full bounded retry chain (initial + 3 retries with backoff) must
 		// fit the export deadline so the failure is "all attempts rejected",
 		// not a deadline cut.
-		restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 5_000 });
+		restoreTimeouts = setRuntimeTimeoutsForTest({ exportMs: 5_000 });
 		const { runtimeCase, userPrompt, secret, marker } =
 			await createRecoveryCase("PR-DEAD");
 		activeCase = runtimeCase;
@@ -366,7 +366,7 @@ describe("pi runtime transport recovery (single OTLP export pipeline)", () => {
 	}, 30_000);
 
 	it("never retries a 200 partial rejection, indexes nothing, and reports the loss through diagnostics", async () => {
-		restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 4_000 });
+		restoreTimeouts = setRuntimeTimeoutsForTest({ exportMs: 4_000 });
 		const { runtimeCase, userPrompt } = await createRecoveryCase("PR-PARTIAL");
 		activeCase = runtimeCase;
 

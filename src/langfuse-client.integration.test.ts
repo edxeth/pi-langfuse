@@ -11,9 +11,11 @@ import {
 	flushClient,
 	getLastRuntimeError,
 	getRuntime,
+	reconfigureRuntime,
 	setRuntimeTimeoutsForTest,
 	shutdownClient,
 } from "./langfuse-client.js";
+import { subscribeRuntimeErrors } from "./runtime-diagnostics.js";
 
 const baseConfig: Omit<Config, "host"> = {
 	enabled: true,
@@ -112,10 +114,272 @@ function createCollectingTraceServer() {
 }
 
 describe("langfuse v5 local runtime", () => {
+	it("keeps flush pending until the exporter actually completes", async () => {
+		const restore = setRuntimeTimeoutsForTest({
+			exportMs: 60_000,
+			scoreMs: 20,
+		});
+		const errors: string[] = [];
+		const unsubscribe = subscribeRuntimeErrors(({ message }) =>
+			errors.push(message),
+		);
+		let accept: (() => void) | undefined;
+		let markStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const server = createServer((request, response) => {
+			request.resume();
+			request.on("end", () => {
+				accept = () => response.end("{}");
+				markStarted?.();
+			});
+		});
+		await new Promise<void>((resolve) =>
+			server.listen(0, "127.0.0.1", resolve),
+		);
+		let flush: Promise<void> | undefined;
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string")
+				throw new Error("Missing local server port");
+			const runtime = await getRuntime({
+				...baseConfig,
+				host: `http://127.0.0.1:${address.port}`,
+			});
+			const trace = runtime.trace({ name: "held-export" });
+			runtime.span({ name: "agent.prompt", traceId: trace.id }).end();
+			await started;
+			// The request owns a real 60s deadline. Advance only the lifecycle
+			// clock past the provider's generic 30s watchdog, without slowing CI.
+			vi.useFakeTimers();
+			let finished = false;
+			flush = flushClient().then(() => {
+				finished = true;
+			});
+			await vi.advanceTimersByTimeAsync(31_000);
+			expect(finished).toBe(false);
+			expect(errors).toEqual([]);
+			vi.useRealTimers();
+			accept?.();
+			await flush;
+			expect(finished).toBe(true);
+			expect(errors).toEqual([]);
+		} finally {
+			vi.useRealTimers();
+			accept?.();
+			await flush;
+			await shutdownClient();
+			unsubscribe();
+			restore();
+			server.closeAllConnections();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		}
+	});
+	it.each([
+		["flush", "headers"],
+		["flush", "body"],
+		["shutdown", "body"],
+		["reconfigure", "body"],
+	])(
+		"cancels stalled score %s/%s before the lifecycle operation completes",
+		async (boundary, phase) => {
+			const restore = setRuntimeTimeoutsForTest({ exportMs: 100 });
+			const errors: string[] = [];
+			const unsubscribe = subscribeRuntimeErrors(({ message }) =>
+				errors.push(message),
+			);
+			let responseClosed = false;
+			let releaseBody: (() => void) | undefined;
+			let markStarted: (() => void) | undefined;
+			const started = new Promise<void>((resolve) => {
+				markStarted = resolve;
+			});
+			const server = createServer((request, response) => {
+				request.resume();
+				request.on("end", () => {
+					response.on("close", () => {
+						responseClosed = true;
+					});
+					if (phase === "body") {
+						response.writeHead(200, { "content-type": "application/json" });
+						response.write('{"id":');
+					}
+					releaseBody = () =>
+						response.end(
+							phase === "body" ? '"test-score"}' : '{"id":"test-score"}',
+						);
+					markStarted?.();
+				});
+			});
+			await new Promise<void>((resolve) =>
+				server.listen(0, "127.0.0.1", resolve),
+			);
+			try {
+				const address = server.address();
+				if (!address || typeof address === "string")
+					throw new Error("Missing local server port");
+				const runtime = await getRuntime({
+					...baseConfig,
+					host: `http://127.0.0.1:${address.port}`,
+				});
+				runtime.score({
+					name: "stalled-score",
+					value: 1,
+					traceId: "a".repeat(32),
+				});
+				await started;
+				if (boundary === "flush") await flushClient();
+				else if (boundary === "shutdown") await shutdownClient();
+				else await reconfigureRuntime();
+				// Permit the peer to observe the aborted socket after fetch has settled.
+				await new Promise((resolve) => setTimeout(resolve, 20));
+				expect(responseClosed).toBe(true);
+				expect(errors).toEqual([
+					"Failed to send Langfuse score: request failed",
+				]);
+			} finally {
+				releaseBody?.();
+				await shutdownClient();
+				unsubscribe();
+				restore();
+				server.closeAllConnections();
+				await new Promise<void>((resolve) => server.close(() => resolve()));
+			}
+		},
+	);
+	it.each(["flush", "shutdown", "reconfigure"])(
+		"aborts a stalled export once during %s and delivers the next prompt",
+		async (boundary) => {
+			const restore = setRuntimeTimeoutsForTest({
+				exportMs: 100,
+			});
+			const errors: string[] = [];
+			const unsubscribe = subscribeRuntimeErrors(({ message }) =>
+				errors.push(message),
+			);
+			let accept = false;
+			let accepted = 0;
+			let markClosed: (() => void) | undefined;
+			const closed = new Promise<void>((resolve) => {
+				markClosed = resolve;
+			});
+			const server = createServer((request, response) => {
+				request.resume();
+				request.on("end", () => {
+					if (!accept) {
+						response.on("close", () => markClosed?.());
+						return;
+					}
+					accepted += 1;
+					response.end("{}");
+				});
+			});
+			await new Promise<void>((resolve) =>
+				server.listen(0, "127.0.0.1", resolve),
+			);
+			try {
+				const address = server.address();
+				if (!address || typeof address === "string")
+					throw new Error("Missing local server port");
+				const config = {
+					...baseConfig,
+					host: `http://127.0.0.1:${address.port}`,
+				};
+				const runtime = await getRuntime(config);
+				const trace = runtime.trace({ name: "stalled-export" });
+				runtime.span({ name: "agent.prompt", traceId: trace.id }).end();
+				const started = Date.now();
+				if (boundary === "flush") await flushClient();
+				else if (boundary === "shutdown") await shutdownClient();
+				else await reconfigureRuntime();
+				await closed;
+				expect(Date.now() - started).toBeLessThan(500);
+				expect(errors).toEqual([
+					"Langfuse OTLP export failed: timed out after 100ms total export deadline",
+				]);
+				accept = true;
+				const nextRuntime = await getRuntime(config);
+				const next = nextRuntime.trace({ name: "healthy-next-prompt" });
+				nextRuntime.span({ name: "agent.prompt", traceId: next.id }).end();
+				await flushClient();
+				expect(accepted).toBe(1);
+				await shutdownClient();
+				expect(errors).toHaveLength(1);
+			} finally {
+				await shutdownClient();
+				restore();
+				unsubscribe();
+				server.closeAllConnections();
+				await new Promise<void>((resolve) => server.close(() => resolve()));
+			}
+		},
+	);
+	it.each(["flush", "shutdown", "reconfigure"])(
+		"accepts a healthy export taking more than two seconds during %s",
+		async (boundary) => {
+			const errors: string[] = [];
+			const unsubscribe = subscribeRuntimeErrors(({ message }) =>
+				errors.push(message),
+			);
+			const received: ExportedOtlpSpan[] = [];
+			let accepted = 0;
+			const timers = new Set<ReturnType<typeof setTimeout>>();
+			const server = createServer((request, response) => {
+				const chunks: Buffer[] = [];
+				request.on("data", (chunk: Buffer) => chunks.push(chunk));
+				request.on("end", () => {
+					received.push(...exportedSpans([Buffer.concat(chunks).toString()]));
+					const timer = setTimeout(() => {
+						timers.delete(timer);
+						accepted += 1;
+						response.setHeader("content-type", "application/json");
+						response.end("{}");
+					}, 2_500);
+					timers.add(timer);
+				});
+			});
+			await new Promise<void>((resolve) =>
+				server.listen(0, "127.0.0.1", resolve),
+			);
+			try {
+				const address = server.address();
+				if (!address || typeof address === "string")
+					throw new Error("Missing local server port");
+				const runtime = await getRuntime({
+					...baseConfig,
+					host: `http://127.0.0.1:${address.port}`,
+				});
+				const trace = runtime.trace({ name: "slow-acceptance" });
+				const prompt = runtime.span({
+					name: "agent.prompt",
+					traceId: trace.id,
+				});
+				// Shutdown must also give freshly finalized open roots time to export.
+				if (boundary !== "shutdown") {
+					prompt.end({ output: "done" });
+					if (boundary === "flush") await flushClient();
+					else await reconfigureRuntime();
+				} else {
+					await shutdownClient();
+				}
+				expect(errors).toEqual([]);
+				expect(accepted).toBe(1);
+				expect(received.map(({ spanId }) => spanId)).toEqual([prompt.id]);
+			} finally {
+				await shutdownClient();
+				unsubscribe();
+				for (const timer of timers) clearTimeout(timer);
+				server.closeAllConnections();
+				await new Promise<void>((resolve) => server.close(() => resolve()));
+			}
+		},
+		15_000,
+	);
 	it.each([512, 3000])(
 		"awaits exports already started before forceFlush and delivers all %i ended spans",
 		async (spanCount) => {
-			const restore = setRuntimeTimeoutsForTest({ shutdownStepMs: 10_000 });
+			const restore = setRuntimeTimeoutsForTest({ exportMs: 10_000 });
 			const waiting: Array<() => void> = [];
 			let started: (() => void) | undefined;
 			const firstRequest = new Promise<void>((resolve) => {
@@ -241,7 +505,7 @@ describe("langfuse v5 local runtime", () => {
 
 	it("delivers an accepted prompt with one-way export and no diagnostics", async () => {
 		const previousError = getLastRuntimeError();
-		const restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 500 });
+		const restoreTimeouts = setRuntimeTimeoutsForTest({ exportMs: 500 });
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 		const { server, requests, receivedSpans } = createAcceptOnlyOtelServer();
 		await new Promise<void>((resolve, reject) => {
@@ -317,7 +581,7 @@ describe("langfuse v5 local runtime", () => {
 	});
 
 	it("surfaces export failure through the runtime error boundary without raw console output", async () => {
-		const restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 500 });
+		const restoreTimeouts = setRuntimeTimeoutsForTest({ exportMs: 500 });
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 		const server = createServer((request, response) => {
 			request.resume();
@@ -424,16 +688,21 @@ describe("langfuse v5 local runtime", () => {
 		}
 	});
 
-	it("prevents non-media data prefixes from corrupting later media", async () => {
-		const restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 200 });
+	it("exports data prefixes unchanged without automatic media uploads", async () => {
+		const restoreTimeouts = setRuntimeTimeoutsForTest({ exportMs: 200 });
+		const previousMediaEnv = process.env.LANGFUSE_MEDIA_UPLOAD_ENABLED;
+		process.env.LANGFUSE_MEDIA_UPLOAD_ENABLED = "true";
 		const requests: string[] = [];
+		const payloads: string[] = [];
 		const consoleError = vi
 			.spyOn(console, "error")
 			.mockImplementation(() => undefined);
 		const server = createServer((request, response) => {
 			requests.push(request.url || "");
-			request.resume();
+			const chunks: Buffer[] = [];
+			request.on("data", (chunk: Buffer) => chunks.push(chunk));
 			request.on("end", () => {
+				payloads.push(Buffer.concat(chunks).toString());
 				response.statusCode = 200;
 				response.setHeader("content-type", "application/json");
 				response.end("{}");
@@ -467,8 +736,11 @@ describe("langfuse v5 local runtime", () => {
 			});
 			await flushClient();
 
+			expect(payloads.join("\n")).toContain("SSE example: data:");
+			expect(payloads.join("\n")).toContain("Terminator example: data: [DONE]");
+			expect(payloads.join("\n")).toContain("data:image/png;base64,AAAA");
 			expect(requests.some((url) => url.includes("/api/public/media"))).toBe(
-				true,
+				false,
 			);
 			expect(
 				consoleError.mock.calls.some((call) =>
@@ -480,6 +752,9 @@ describe("langfuse v5 local runtime", () => {
 		} finally {
 			await shutdownClient();
 			consoleError.mockRestore();
+			if (previousMediaEnv === undefined)
+				delete process.env.LANGFUSE_MEDIA_UPLOAD_ENABLED;
+			else process.env.LANGFUSE_MEDIA_UPLOAD_ENABLED = previousMediaEnv;
 			restoreTimeouts();
 			await new Promise<void>((resolve, reject) => {
 				server.close((error) => (error ? reject(error) : resolve()));
@@ -506,7 +781,7 @@ describe("langfuse v5 local runtime", () => {
 			server.once("error", reject);
 			server.listen(0, "127.0.0.1", () => resolve());
 		});
-		const restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 500 });
+		const restoreTimeouts = setRuntimeTimeoutsForTest({ exportMs: 500 });
 
 		type ReplayAttribute = {
 			key: string;
@@ -659,7 +934,7 @@ describe("langfuse v5 local runtime", () => {
 	});
 
 	it("stamps trace identity on child spans before the prompt root exports", async () => {
-		const restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 200 });
+		const restoreTimeouts = setRuntimeTimeoutsForTest({ exportMs: 200 });
 		const requests: Array<{ url: string; body: string }> = [];
 		const server = createServer((request, response) => {
 			const chunks: Buffer[] = [];
@@ -730,7 +1005,7 @@ describe("langfuse v5 local runtime", () => {
 			server.once("error", reject);
 			server.listen(0, "127.0.0.1", () => resolve());
 		});
-		const restoreTimeouts = setRuntimeTimeoutsForTest({ shutdownStepMs: 500 });
+		const restoreTimeouts = setRuntimeTimeoutsForTest({ exportMs: 500 });
 
 		try {
 			const address = server.address() as AddressInfo;
