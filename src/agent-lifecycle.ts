@@ -289,6 +289,12 @@ export function createAgentLifecycleHandlers(
 		if (!state) return;
 		const config = deps.getConfig();
 		deps.updateStatus(ctx, config);
+		// Since Pi 1.2.0 this event also announces runs started by
+		// pi.sendMessage(..., { triggerTurn: true }) (messageType "custom"), which
+		// carry a custom message and no prompt. A custom message is not a user
+		// prompt, so agent_start traces the run as unannounced. The prompt check
+		// stands in for messageType until the pinned Pi types declare it.
+		if (typeof event.prompt !== "string") return;
 		const sessionFile = ctx.sessionManager.getSessionFile();
 		if (config.skipUnpersistedSessions && !sessionFile) return;
 		if (!deps.canTrace(config) && !config.rawTraceEnabled) return;
@@ -435,7 +441,8 @@ export function createAgentLifecycleHandlers(
 		ctx: ExtensionContext,
 	) => {
 		// Pi starts deferred runs (e.g. sendMessage(..., { triggerTurn: true })
-		// during agent_settled) without before_agent_start, so no event ever
+		// during agent_settled) without before_agent_start, and beforeAgentStart
+		// ignores the custom-message runs that Pi 1.2.0 announces, so no event
 		// announces a user prompt. Own the run anyway: the previous prompt is
 		// already settled, and the run gets a trace whose metadata marks that no
 		// user prompt was captured. Concurrent agent_start deliveries await the

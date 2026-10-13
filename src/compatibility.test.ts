@@ -20,6 +20,7 @@ import {
 	shutdownClient,
 } from "./langfuse-client.js";
 import { drainRawTraceQueue } from "./raw-trace.js";
+import { getLastRuntimeError } from "./runtime-diagnostics.js";
 
 interface FakeRecord {
 	kind: "trace" | "observation";
@@ -4505,6 +4506,124 @@ describe("executable compatibility contract", () => {
 			prompt: "",
 			promptSource: "unannounced-agent-run",
 		});
+		await handler("session_shutdown")({ reason: "quit" }, context);
+	});
+
+	it("traces a custom-message run announced by a before_agent_start without prompt", async () => {
+		const agentDir = tempRoot("pi-langfuse-custom-start-agent-");
+		const rawTraceDir = join(agentDir, "raw-traces");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const pi = createTestPi({
+			enabled: true,
+			"public-key": "custom-start-public",
+			"secret-key": "custom-start-secret",
+			"base-url": "http://custom-start-host",
+			"raw-trace-enabled": true,
+			"raw-trace-dir": rawTraceDir,
+		});
+		await registerExtension(pi as unknown as ExtensionAPI);
+		const handler = (name: string) => eventHandler(pi, name);
+		const context = {
+			model: { id: "custom-start-model", provider: "custom-start-provider" },
+			sessionManager: {
+				getSessionFile: () =>
+					"/tmp/pi-agent/sessions/--custom-start--/custom-start-session.jsonl",
+				getSessionId: () => "custom-start-session",
+			},
+		};
+		const runtimeErrorBefore = getLastRuntimeError();
+		await handler("session_start")({ reason: "startup" }, context);
+
+		// Since Pi 1.2.0, pi.sendMessage(..., { triggerTurn: true }) while idle
+		// fires before_agent_start with messageType "custom", the starting
+		// message, and no prompt.
+		await handler("before_agent_start")(
+			{
+				messageType: "custom",
+				message: {
+					role: "custom",
+					customType: "reminder",
+					content: "custom message body",
+					display: true,
+					timestamp: 1,
+				},
+				systemPrompt: "custom system",
+				systemPromptOptions: { cwd: "/tmp/custom-start" },
+			},
+			context,
+		);
+		await handler("agent_start")({}, context);
+		await handler("turn_start")({ turnIndex: 0 }, context);
+		await handler("message_end")(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "custom-run answer" }],
+					usage: { input: 2, output: 3, totalTokens: 5 },
+				},
+			},
+			context,
+		);
+		await handler("turn_end")(
+			{
+				turnIndex: 0,
+				message: { role: "assistant", content: [] },
+				toolResults: [],
+			},
+			context,
+		);
+		await handler("agent_end")(
+			{
+				messages: [
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "custom-run answer" }],
+					},
+				],
+			},
+			context,
+		);
+		await handler("agent_settled")({}, context);
+
+		expect(getLastRuntimeError()).toBe(runtimeErrorBefore);
+		expect(telemetry.state.traces).toHaveLength(1);
+		const trace = telemetry.state.traces[0];
+		if (!trace) throw new Error("expected a trace for the custom-message run");
+		// A custom message is not a user prompt, so the run is traced like any
+		// other run that no user prompt announced.
+		expect(trace.input).toBeUndefined();
+		expect(trace.metadata).toMatchObject({
+			completed: true,
+			promptSource: "unannounced-agent-run",
+		});
+		const observations = telemetry.state.observations.filter(
+			(record) => record.traceId === trace.id,
+		);
+		expect(observations.map((record) => record.name)).toEqual([
+			"agent.prompt",
+			"agent.turn",
+			"llm-response",
+		]);
+		expect(latestRecord(observations, "llm-response").end).toMatchObject({
+			output: "custom-run answer",
+			usage: { input: 2, output: 3, total: 5 },
+		});
+
+		drainRawTraceQueue();
+		const starts = readFileSync(
+			join(rawTraceDir, "--custom-start--", "custom-start-session.jsonl"),
+			"utf-8",
+		)
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>)
+			.filter((record) => record.type === "agent_prompt_start");
+		expect(starts).toEqual([
+			expect.objectContaining({
+				prompt: "",
+				promptSource: "unannounced-agent-run",
+			}),
+		]);
 		await handler("session_shutdown")({ reason: "quit" }, context);
 	});
 
