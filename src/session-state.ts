@@ -7,6 +7,40 @@ export interface SessionContextLike {
 	sessionManager?: SessionManagerIdentity;
 }
 
+/**
+ * The Langfuse project a trace was written to. Host and public key identify
+ * the project; a secret-key rotation within one project keeps the identity.
+ */
+export interface TraceDestination {
+	readonly host: string;
+	readonly publicKey: string;
+}
+
+/** Identify the Langfuse project a config writes to; the host ignores trailing slashes. */
+export function traceDestination(config: {
+	host: string;
+	publicKey: string;
+}): TraceDestination {
+	return {
+		host: config.host.replace(/\/+$/, ""),
+		publicKey: config.publicKey,
+	};
+}
+
+/** Whether two destinations name the same Langfuse project. */
+export function sameTraceDestination(
+	a: TraceDestination,
+	b: TraceDestination,
+): boolean {
+	return a.host === b.host && a.publicKey === b.publicKey;
+}
+
+/** The last trace a session finalized, with the destination that received it. */
+export interface FinalizedTraceTarget {
+	readonly traceId: string;
+	readonly destination: TraceDestination;
+}
+
 export interface SessionState<PromptState> {
 	sessionId: string;
 	sessionFile: string;
@@ -15,6 +49,12 @@ export interface SessionState<PromptState> {
 	model: string;
 	provider: string;
 	promptState: PromptState | null;
+	/**
+	 * Target for explicit feedback: the last trace this session finalized.
+	 * It survives the next prompt's start so feedback never lands on an active
+	 * prompt, and it is never shared across sessions.
+	 */
+	lastFinalizedTrace?: FinalizedTraceTarget;
 	compactCount: number;
 	lease: symbol;
 	shutdownPromise?: Promise<void>;

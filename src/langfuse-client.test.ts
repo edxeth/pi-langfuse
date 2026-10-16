@@ -7,6 +7,7 @@ import {
 	getRuntimeRegistrySizeForTest,
 	shutdownClient,
 } from "./langfuse-client.js";
+import { recordRuntimeError } from "./runtime-diagnostics.js";
 
 const mocks = vi.hoisted(() => {
 	const records: Array<Record<string, unknown>> = [];
@@ -503,5 +504,190 @@ describe("langfuse v5 runtime facade", () => {
 			traces: 0,
 			observations: 0,
 		});
+	});
+
+	it("reports a rejected score without its response body, with or without an HTTP status", async () => {
+		const lf = await getRuntime(config);
+
+		mocks.scoresCreate.mockRejectedValueOnce(
+			Object.assign(new Error("body echoes sk-private-value"), {
+				statusCode: 503,
+			}),
+		);
+		await expect(lf.score({ name: "s", value: 1, traceId: "t" })).resolves.toBe(
+			false,
+		);
+		expect(getLastRuntimeError()?.message).toBe(
+			"Failed to send Langfuse score (HTTP 503)",
+		);
+
+		mocks.scoresCreate.mockRejectedValueOnce(new Error("socket hang up"));
+		await expect(lf.score({ name: "s", value: 1, traceId: "t" })).resolves.toBe(
+			false,
+		);
+		expect(getLastRuntimeError()?.message).toBe(
+			"Failed to send Langfuse score: request failed",
+		);
+
+		for (const rejection of ["not an object", null, undefined, 503]) {
+			recordRuntimeError("before rejection");
+			mocks.scoresCreate.mockRejectedValueOnce(rejection);
+			await expect(
+				lf.score({ name: "s", value: 1, traceId: "t" }),
+			).resolves.toBe(false);
+			expect(getLastRuntimeError()?.message).toBe(
+				"Failed to send Langfuse score: request failed",
+			);
+		}
+		await expect(lf.score({ name: "s", value: 1, traceId: "t" })).resolves.toBe(
+			true,
+		);
+	});
+
+	it("fails a score without throwing when the scores API is missing", async () => {
+		const original = mocks.client.api.scores;
+		Object.assign(mocks.client.api, { scores: undefined });
+		try {
+			const lf = await getRuntime(config);
+
+			await expect(
+				lf.score({ name: "s", value: 1, traceId: "t" }),
+			).resolves.toBe(false);
+			expect(getLastRuntimeError()?.message).toBe(
+				"Failed to send Langfuse score: request failed",
+			);
+		} finally {
+			Object.assign(mocks.client.api, { scores: original });
+		}
+	});
+
+	it("ignores a trace update without a body and ends a prompt trace once", async () => {
+		const lf = await getRuntime(config);
+		const trace = lf.trace({ name: "pi-agent" });
+		const root = () =>
+			mocks.records.find((record) => record.name === "agent.prompt");
+
+		const updatesBefore = (root()?.updateCalls as unknown[] | undefined)
+			?.length;
+		trace.update(undefined);
+		expect((root()?.updateCalls as unknown[] | undefined)?.length).toBe(
+			updatesBefore,
+		);
+		expect(getRuntimeRegistrySizeForTest().traces).toBe(1);
+
+		trace.end?.({ output: "final answer" });
+		trace.end?.({ output: "ignored second end" });
+
+		expect(root()?.end).toMatchObject({ output: "final answer" });
+		expect(getRuntimeRegistrySizeForTest()).toEqual({
+			traces: 0,
+			observations: 0,
+		});
+	});
+
+	it("ends a prompt trace that has no end body", async () => {
+		const lf = await getRuntime(config);
+		const trace = lf.trace({ name: "pi-agent" });
+
+		trace.end?.();
+
+		expect(getRuntimeRegistrySizeForTest().traces).toBe(0);
+	});
+
+	it("sets trace input and output after creation", async () => {
+		const lf = await getRuntime(config);
+		const trace = lf.trace({ name: "pi-agent" });
+
+		trace.setTraceIO?.({ input: "question", output: "answer" });
+		trace.update({ input: "question 2", output: "answer 2" });
+		trace.update({ metadata: { only: "metadata" } });
+
+		const root = mocks.records.find((record) => record.name === "agent.prompt");
+		expect(root?.lastUpdate).toMatchObject({
+			input: "question 2",
+			output: "answer 2",
+			metadata: { only: "metadata" },
+		});
+	});
+
+	it("reports an open prompt root that fails to end during shutdown, and skips an ended one", async () => {
+		const lf = await getRuntime(config);
+		mocks.tracing.startObservation.mockImplementationOnce(() => ({
+			id: "failing-root",
+			traceId: "failing-trace",
+			otelSpan: { id: "failing-root", traceId: "failing-trace" },
+			update: vi.fn(),
+			end: vi.fn(() => {
+				throw new Error("root end failed");
+			}),
+			setTraceIO: vi.fn(),
+			setTraceAsPublic: vi.fn(),
+			startObservation: vi.fn(),
+		}));
+		lf.trace({ name: "pi-agent" });
+		const wrapped = lf.trace({ name: "pi-agent" });
+		wrapped.end?.();
+
+		await shutdownClient();
+
+		expect(getLastRuntimeError()?.message).toContain(
+			"Failed to end open prompt root during shutdown",
+		);
+		expect(getLastRuntimeError()?.message).toContain("root end failed");
+	});
+
+	it("keeps a runtime when another OpenTelemetry context manager is already registered", async () => {
+		vi.resetModules();
+		mocks.context.setGlobalContextManager.mockReturnValueOnce(false);
+		const fresh = await import("./langfuse-client.js");
+
+		const lf = await fresh.getRuntime(config);
+		const manager = mocks.AsyncHooksContextManager.mock.results.at(-1)?.value;
+
+		expect(lf).toBeDefined();
+		expect(manager?.disable).toHaveBeenCalledTimes(1);
+		await fresh.shutdownClient();
+	});
+
+	it("carries the trace version and ends an observation once", async () => {
+		const lf = await getRuntime(config);
+		const trace = lf.trace({ name: "pi-agent", version: "v7" });
+		const span = lf.span({ name: "tool:bash", traceId: trace.id });
+
+		span.end({ output: "first" });
+		span.end({ output: "second" });
+
+		expect(mocks.tracing.propagateAttributes).toHaveBeenCalledWith(
+			expect.objectContaining({ version: "v7" }),
+			expect.any(Function),
+		);
+		const spanRecord = mocks.records.find(
+			(record) => record.name === "tool:bash",
+		);
+		expect(spanRecord?.updateCalls).toHaveLength(1);
+		expect(getRuntimeRegistrySizeForTest().observations).toBe(1);
+	});
+
+	it("leaves a prompt root whose end failed out of shutdown's second attempt", async () => {
+		const lf = await getRuntime(config);
+		mocks.tracing.startObservation.mockImplementationOnce(() => ({
+			id: "stuck-root",
+			traceId: "stuck-trace",
+			otelSpan: { id: "stuck-root", traceId: "stuck-trace" },
+			update: vi.fn(),
+			end: vi.fn(() => {
+				throw new Error("end refused");
+			}),
+			setTraceIO: vi.fn(),
+			setTraceAsPublic: vi.fn(),
+			startObservation: vi.fn(),
+		}));
+		const trace = lf.trace({ name: "pi-agent" });
+		expect(() => trace.end?.()).toThrow("end refused");
+		recordRuntimeError("before shutdown");
+
+		await shutdownClient();
+
+		expect(getLastRuntimeError()?.message).toBe("before shutdown");
 	});
 });

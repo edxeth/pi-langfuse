@@ -34,10 +34,13 @@ import { appendRawTrace, drainRawTraceQueue } from "./raw-trace.js";
 import { redactionMetadata, redactString } from "./redaction.js";
 import { subscribeRuntimeErrors } from "./runtime-diagnostics.js";
 import {
+	type FinalizedTraceTarget,
 	hasActiveSessionLeases,
 	type SessionContextLike,
 	type SessionState,
 	SessionStateOwner,
+	sameTraceDestination,
+	traceDestination,
 } from "./session-state.js";
 import {
 	EXTENSION_ID,
@@ -60,7 +63,7 @@ import {
 	standardUsageFromUsage,
 	summarizeMessages,
 	summarizeProviderPayload,
-	summarizeProviderRequestMessages,
+	summarizeRawProviderRequestContents,
 	summarizeToolArgs,
 	summarizeToolResult,
 	telemetryText,
@@ -73,6 +76,16 @@ import { createTurnLifecycleHandlers } from "./turn-lifecycle.js";
 
 const LANGFUSE_STATUS_KEY = "pi-langfuse:status";
 const LANGFUSE_TEST_TIMEOUT_MS = 3_000;
+const FEEDBACK_SCORE_NAME = "user_feedback";
+const FEEDBACK_USAGE = "Usage: /langfuse-score <good|bad> [comment]";
+/** Stored comment length; Langfuse score comments are short free text. */
+const FEEDBACK_COMMENT_MAX_CHARS = 500;
+/**
+ * Longest raw comment accepted. Longer input is rejected, never sliced:
+ * redaction needs the whole original text, and a cut could separate a secret
+ * from the rest of its literal.
+ */
+const FEEDBACK_COMMENT_INPUT_MAX_CHARS = 4_000;
 
 interface LangfuseUiContext {
 	hasUI?: boolean;
@@ -128,8 +141,130 @@ function operatorSafeText(config: Config, value: string) {
 	);
 }
 
+/**
+ * Validate `<good|bad> [comment]`; undefined when the verdict is malformed.
+ * The comment keeps its original whitespace, because redaction must see the
+ * text exactly as typed.
+ */
+function parseFeedbackArgs(args: string) {
+	const match = /^\s*(\S+)(?:\s+([\s\S]*))?$/.exec(args);
+	const verdict = match?.[1]?.toLowerCase();
+	if (verdict !== "good" && verdict !== "bad") return undefined;
+	return { verdict, comment: match?.[2] ?? "" };
+}
+
+/**
+ * Prepare an accepted feedback comment for the score. Redaction is forced on
+ * and runs first, on the original text with the full configuration, so exact
+ * secrets that contain whitespace or span lines still match. Flattening and
+ * the length bound follow, so a cut never leaves a secret fragment.
+ */
+function feedbackComment(config: Config, raw: string) {
+	const redacted = redactString({ ...config, redactionEnabled: true }, raw);
+	const text = redacted
+		.replace(/\p{Cc}/gu, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+	return text ? truncate(text, FEEDBACK_COMMENT_MAX_CHARS) : undefined;
+}
+
 function errorMessage(error: unknown) {
 	return error instanceof Error ? error.message : String(error);
+}
+
+interface FeedbackNotice {
+	message: string;
+	level: "info" | "warning" | "error";
+}
+
+type FeedbackRequest = {
+	config: Config;
+	feedback: NonNullable<ReturnType<typeof parseFeedbackArgs>>;
+	target: FinalizedTraceTarget;
+};
+
+function refusal(message: string, level: FeedbackNotice["level"]) {
+	return { notice: { message, level } };
+}
+
+/**
+ * Decide whether `/langfuse-score` may send a score, in the order the
+ * checks must run: syntax, input size, tracing configuration, target trace,
+ * then destination. A refusal carries the operator notice; nothing is sent.
+ */
+function planFeedback(
+	args: string,
+	settings: Partial<SettingsValues>,
+	findTarget: () => { lastFinalizedTrace?: FinalizedTraceTarget } | undefined,
+): FeedbackRequest | { notice: FeedbackNotice } {
+	const feedback = parseFeedbackArgs(args);
+	if (!feedback) return refusal(FEEDBACK_USAGE, "warning");
+	// Report only the length: echoing the comment could repeat a secret.
+	if (feedback.comment.length > FEEDBACK_COMMENT_INPUT_MAX_CHARS) {
+		return refusal(
+			`Feedback not saved: the comment has ${feedback.comment.length} characters, over the ${FEEDBACK_COMMENT_INPUT_MAX_CHARS} limit. Shorten it or omit it.`,
+			"warning",
+		);
+	}
+	const config = resolveConfig(settings);
+	if (!canTrace(config)) {
+		recordRuntimeError("Langfuse credentials are not configured");
+		return refusal(
+			"Feedback not saved: Langfuse tracing is disabled or not configured",
+			"error",
+		);
+	}
+	// Only this session's last finalized trace is a valid target. A prompt
+	// still running in the session is never scored.
+	const target = findTarget()?.lastFinalizedTrace;
+	if (!target) {
+		return refusal(
+			"Feedback not saved: this session has no finalized trace to rate",
+			"warning",
+		);
+	}
+	if (!sameTraceDestination(target.destination, traceDestination(config))) {
+		return refusal(
+			"Feedback not saved: the last trace was written to a different Langfuse destination than the current configuration",
+			"error",
+		);
+	}
+	return { config, feedback, target };
+}
+
+async function sendFeedback({
+	config,
+	feedback,
+	target,
+}: FeedbackRequest): Promise<FeedbackNotice> {
+	try {
+		const lf = await getRuntime(config);
+		// The score resolves only after the scores endpoint answered, so
+		// success is reported for delivery, not for enqueueing.
+		const delivered = await lf.score({
+			name: FEEDBACK_SCORE_NAME,
+			value: feedback.verdict === "good" ? 1 : 0,
+			dataType: "BOOLEAN",
+			traceId: target.traceId,
+			comment: feedbackComment(config, feedback.comment),
+		});
+		if (!delivered) {
+			return {
+				message: "Feedback not saved: Langfuse did not accept the score",
+				level: "error",
+			};
+		}
+		return {
+			message: `Feedback saved: ${feedback.verdict} for trace ${target.traceId}`,
+			level: "info",
+		};
+	} catch (error) {
+		recordRuntimeError(error);
+		return {
+			message: `Feedback not saved: ${operatorSafeText(config, errorMessage(error))}`,
+			level: "error",
+		};
+	}
 }
 
 function safeHost(config: Config) {
@@ -143,9 +278,19 @@ function safeHost(config: Config) {
 	}
 }
 
+function identityReport(config: Config) {
+	if (config.identityError) {
+		return `Identity: blocked, telemetry and raw traces are off (${operatorSafeText(config, config.identityError)})`;
+	}
+	return config.identityMode === "pseudonymous"
+		? `Identity: pseudonymous (repository identity ${config.identityKeepRepo ? "kept" : "hashed"}); reduces direct identifiers, not anonymization`
+		: "Identity: raw";
+}
+
 function privacyReport(config: Config) {
 	return [
-		`Capture policy: ${config.capturePolicy ?? "full-debug"}`,
+		`Capture policy: ${config.capturePolicy}`,
+		identityReport(config),
 		`Overrides: prompt=${displayCaptureOverride(config.capturePrompt)}, system=${displayCaptureOverride(config.captureSystemPrompt)}, provider=${displayCaptureOverride(config.captureProviderInput)}, assistant=${displayCaptureOverride(config.captureAssistantOutput)}, tool-input=${displayCaptureOverride(config.captureToolInput)}, tool-output=${displayCaptureOverride(config.captureToolOutput)}, metadata=${displayCaptureOverride(config.captureMetadata)}`,
 		`Budgets: string=${displayPayloadLimit(config.payloadMaxStringChars)}, tool=${displayPayloadLimit(config.payloadMaxToolChars)}, depth=${displayPayloadLimit(config.payloadMaxDepth)}, array=${displayPayloadLimit(config.payloadMaxArrayItems)}, object=${displayPayloadLimit(config.payloadMaxObjectKeys)}, nodes=${displayPayloadLimit(config.payloadMaxNodes)}`,
 	].join("\n");
@@ -191,6 +336,8 @@ function getLiveSettingsView(
 		"payload-max-object-keys": displayPayloadLimit(config.payloadMaxObjectKeys),
 		"payload-max-nodes": displayPayloadLimit(config.payloadMaxNodes),
 		"redaction-enabled": config.redactionEnabled,
+		"identity-mode": config.identityMode,
+		"identity-keep-repo": config.identityKeepRepo,
 		"raw-trace-enabled": config.rawTraceEnabled,
 		"raw-trace-dir": config.rawTraceDir,
 	};
@@ -198,6 +345,12 @@ function getLiveSettingsView(
 
 function announceConfigState(settings: Partial<SettingsValues>) {
 	const config = resolveConfig(settings);
+	// Raw traces can run while tracing is disabled, so report this regardless.
+	if (config.identityError) {
+		recordRuntimeError(
+			`Identity configuration blocks telemetry and raw traces: ${config.identityError}`,
+		);
+	}
 	if (!config.enabled) return;
 	if (!config.publicKey || !config.secretKey) {
 		recordRuntimeError(
@@ -348,13 +501,12 @@ export default async function (pi: ExtensionAPI) {
 		getRuntime,
 		telemetryText,
 		redactionMetadata,
-		extractTextFromContent,
 		standardUsageFromUsage,
 		usageDetailsFromUsage,
 		costDetailsFromUsage,
 		summarizeMessages,
 		summarizeProviderPayload,
-		summarizeProviderRequestMessages,
+		summarizeRawProviderRequestContents,
 		safeJson,
 		estimateJsonBytes,
 		writeRawTrace,
@@ -363,6 +515,7 @@ export default async function (pi: ExtensionAPI) {
 	const toolLifecycle = createToolLifecycleHandlers({
 		getConfig: () => resolveConfig(settings),
 		getSessionState,
+		listSessionStates: () => sessionOwner.values(),
 		canTrace,
 		getRuntime,
 		redactToolContent,
@@ -406,7 +559,6 @@ export default async function (pi: ExtensionAPI) {
 		getRuntime,
 		telemetryText,
 		redactionMetadata,
-		extractTextFromContent,
 		standardUsageFromUsage,
 		usageDetailsFromUsage,
 		costDetailsFromUsage,
@@ -488,7 +640,7 @@ export default async function (pi: ExtensionAPI) {
 				`config source: ${formatConfigSource(settings)}`,
 				`host: ${safeHost(config)}`,
 				`public key: ${maskPublicKey(config.publicKey)}`,
-				`capture policy: ${config.capturePolicy ?? "full-debug"}`,
+				`capture policy: ${config.capturePolicy}`,
 				`active run: ${activeRun ? "yes" : "no"}`,
 				`config path: ${getConfigFilePath()}`,
 				`runtime mode: ${runtimeMode(config)}`,
@@ -525,6 +677,16 @@ export default async function (pi: ExtensionAPI) {
 					"error",
 				);
 			}
+		},
+	});
+
+	pi.registerCommand("langfuse-score", {
+		description:
+			"Rate this session's last finalized trace with /langfuse-score <good|bad> [comment]",
+		handler: async (args, ctx) => {
+			const plan = planFeedback(args, settings, () => getSessionState(ctx));
+			const notice = "notice" in plan ? plan.notice : await sendFeedback(plan);
+			ctx.ui.notify(notice.message, notice.level);
 		},
 	});
 
@@ -643,6 +805,11 @@ export default async function (pi: ExtensionAPI) {
 	pi.on("agent_end", agentLifecycle.agentEnd);
 
 	pi.on("agent_settled", agentLifecycle.agentSettled);
+
+	// pi-ask announces each dialog flow on the shared event bus. Only
+	// correlation, timing, and cancellation metadata are kept.
+	pi.events.on("pi-ask:started", toolLifecycle.askStarted);
+	pi.events.on("pi-ask:completed", toolLifecycle.askCompleted);
 
 	pi.on("session_compact", async (event, ctx) => {
 		const state = getTypedSessionState(ctx);

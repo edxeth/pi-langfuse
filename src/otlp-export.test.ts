@@ -5,8 +5,8 @@ import { ExportResultCode } from "@opentelemetry/core";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
 import type { ReadableSpan, SpanExporter } from "@opentelemetry/sdk-trace-base";
 import { BasicTracerProvider } from "@opentelemetry/sdk-trace-base";
-import { afterEach, describe, expect, it } from "vitest";
-import { createOtlpExporter } from "./otlp-export.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createOtlpExporter, MAX_CONCURRENT_EXPORTS } from "./otlp-export.js";
 
 interface RecordedRequest {
 	method: string;
@@ -116,6 +116,7 @@ const openExporters: SpanExporter[] = [];
 const openFixtures: Fixture[] = [];
 
 afterEach(async () => {
+	vi.restoreAllMocks();
 	await Promise.allSettled(
 		openExporters.map((exporter) => exporter.shutdown()),
 	);
@@ -555,5 +556,473 @@ describe("createOtlpExporter", () => {
 		await exporter.forceFlush?.();
 
 		expect(finalResult).toEqual({ code: ExportResultCode.SUCCESS });
+	});
+});
+
+/** Time for a request that should NOT arrive to show up if it were going to. */
+const SETTLE_MS = 100;
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitFor(condition: () => boolean): Promise<void> {
+	const giveUpAt = Date.now() + 3_000;
+	while (!condition()) {
+		if (Date.now() > giveUpAt) throw new Error("waitFor: condition not met");
+		await sleep(5);
+	}
+}
+
+interface Gate {
+	responder: FixtureResponder;
+	heldCount(): number;
+	peakOpen(): number;
+	/** Answers the requests held so far; later requests are still held. */
+	answerHeld(): void;
+	/** Answers held requests and every later request immediately. */
+	stopHolding(): void;
+}
+
+/**
+ * Server-side gate: holds every request open until the test answers it, and
+ * records the peak number of requests open at once. `answer` decides the
+ * response once a request is let go.
+ */
+function createGate(answer: FixtureResponder = acceptAll): Gate {
+	let holding = true;
+	let open = 0;
+	let peak = 0;
+	const held: Array<() => void> = [];
+	const answerHeld = () => {
+		for (const release of held.splice(0)) release();
+	};
+	return {
+		responder(request, res) {
+			open += 1;
+			peak = Math.max(peak, open);
+			res.on("close", () => {
+				open -= 1;
+			});
+			if (holding) held.push(() => answer(request, res));
+			else answer(request, res);
+		},
+		heldCount: () => held.length,
+		peakOpen: () => peak,
+		answerHeld,
+		stopHolding() {
+			holding = false;
+			answerHeld();
+		},
+	};
+}
+
+function sentSpanIds(rig: TestRig): string[] {
+	return rig.fixture.requests
+		.flatMap((request) => spanIds(request.body).map((span) => span.spanId))
+		.sort();
+}
+
+function expectedSpanIds(spans: ReadableSpan[]): string[] {
+	return spans.map((span) => span.spanContext().spanId).sort();
+}
+
+describe("createOtlpExporter concurrency bound", () => {
+	const BURST = MAX_CONCURRENT_EXPORTS + 21;
+
+	/** One `export()` call per span, like the span processor's immediate mode. */
+	function exportEach(
+		exporter: SpanExporter,
+		spans: ReadableSpan[],
+	): Array<Promise<ExportResult>> {
+		return spans.map((span) => exportAndWait(exporter, [span]));
+	}
+
+	/**
+	 * Fills every slot with a held request, then issues `queued` more exports
+	 * and proves none of them has reached the server yet.
+	 */
+	async function queueBehindFullSlots(
+		rig: TestRig,
+		gate: Gate,
+		queued: number,
+	) {
+		const exporter = rig.createExporter();
+		const spans = createRealSpans(MAX_CONCURRENT_EXPORTS + queued);
+		const results = exportEach(exporter, spans);
+		await waitFor(() => rig.fixture.requests.length >= MAX_CONCURRENT_EXPORTS);
+		await sleep(SETTLE_MS);
+		expect(rig.fixture.requests).toHaveLength(MAX_CONCURRENT_EXPORTS);
+		expect(gate.heldCount()).toBe(MAX_CONCURRENT_EXPORTS);
+		return { exporter, spans, results };
+	}
+
+	it("never has more than the limit of requests open and coalesces the overflow", async () => {
+		const gate = createGate();
+		const rig = await startRig(gate.responder);
+		const spans = createRealSpans(BURST);
+		const results = exportEach(rig.createExporter(), spans);
+
+		await waitFor(() => rig.fixture.requests.length >= MAX_CONCURRENT_EXPORTS);
+		await sleep(SETTLE_MS);
+		expect(rig.fixture.requests).toHaveLength(MAX_CONCURRENT_EXPORTS);
+		gate.stopHolding();
+		const settled = await Promise.all(results);
+
+		expect(gate.peakOpen()).toBeLessThanOrEqual(MAX_CONCURRENT_EXPORTS);
+		expect(settled.every((r) => r.code === ExportResultCode.SUCCESS)).toBe(
+			true,
+		);
+		expect(sentSpanIds(rig)).toEqual(expectedSpanIds(spans));
+		// The overflow left as a few coalesced requests, not one per span.
+		expect(rig.fixture.requests.length).toBeLessThan(BURST / 2);
+		expect(rig.errors).toEqual([]);
+	});
+
+	it("gives every coalesced callback the shared failure and reports it once", async () => {
+		const gate = createGate((request, res) => {
+			if (rig.fixture.requests.indexOf(request) < MAX_CONCURRENT_EXPORTS) {
+				acceptAll(request, res);
+				return;
+			}
+			res.writeHead(401);
+			res.end();
+		});
+		const rig = await startRig(gate.responder);
+		const { results } = await queueBehindFullSlots(rig, gate, 6);
+
+		gate.stopHolding();
+		const settled = await Promise.all(results);
+
+		const started = settled.slice(0, MAX_CONCURRENT_EXPORTS);
+		const coalesced = settled.slice(MAX_CONCURRENT_EXPORTS);
+		expect(started.every((r) => r.code === ExportResultCode.SUCCESS)).toBe(
+			true,
+		);
+		expect(coalesced).toHaveLength(6);
+		expect(coalesced.every((r) => r.code === ExportResultCode.FAILED)).toBe(
+			true,
+		);
+		const messages = new Set(coalesced.map((r) => r.error?.message));
+		expect([...messages]).toHaveLength(1);
+		expect([...messages][0]).toContain("HTTP 401");
+		// One failed export, however many callbacks it carried.
+		expect(rig.errors).toHaveLength(1);
+		expect(rig.errors[0]).toBe([...messages][0]);
+		expect(rig.fixture.requests).toHaveLength(MAX_CONCURRENT_EXPORTS + 1);
+	});
+
+	it("reports SUCCESS for an empty export without taking a slot or sending", async () => {
+		const rig = await startRig();
+		const exporter = rig.createExporter();
+
+		const result = await exportAndWait(exporter, []);
+
+		expect(result).toEqual({ code: ExportResultCode.SUCCESS });
+		expect(rig.fixture.requests).toHaveLength(0);
+	});
+
+	it("fails every coalesced callback once when the batch cannot be serialized", async () => {
+		const gate = createGate();
+		const rig = await startRig(gate.responder);
+		const { exporter, results } = await queueBehindFullSlots(rig, gate, 0);
+		// A span the serializer cannot read poisons the whole coalesced batch.
+		const malformed = {} as unknown as ReadableSpan;
+		const poisoned = [
+			exportAndWait(exporter, [malformed]),
+			exportAndWait(exporter, createRealSpans(1)),
+		];
+
+		gate.stopHolding();
+		const settled = await Promise.all([...results, ...poisoned]);
+
+		const failed = settled.slice(MAX_CONCURRENT_EXPORTS);
+		expect(failed.map((r) => r.code)).toEqual([
+			ExportResultCode.FAILED,
+			ExportResultCode.FAILED,
+		]);
+		expect(failed[0].error?.message).toMatch(/export failed \(\w+\)/);
+		expect(failed[1].error?.message).toBe(failed[0].error?.message);
+		expect(rig.errors).toEqual([failed[0].error?.message]);
+	});
+
+	it("forceFlush resolves only after queued spans are sent", async () => {
+		const gate = createGate();
+		const rig = await startRig(gate.responder);
+		const { exporter, spans, results } = await queueBehindFullSlots(
+			rig,
+			gate,
+			3,
+		);
+
+		let flushed = false;
+		const flush = exporter.forceFlush?.().then(() => {
+			flushed = true;
+		});
+		// Free the slots: the queue goes out as one request, which stays held.
+		gate.answerHeld();
+		await waitFor(
+			() => rig.fixture.requests.length === MAX_CONCURRENT_EXPORTS + 1,
+		);
+		await sleep(SETTLE_MS);
+		expect(flushed).toBe(false);
+
+		gate.stopHolding();
+		await flush;
+
+		expect(sentSpanIds(rig)).toEqual(expectedSpanIds(spans));
+		const settled = await Promise.all(results);
+		expect(settled.every((r) => r.code === ExportResultCode.SUCCESS)).toBe(
+			true,
+		);
+	});
+
+	it("shutdown delivers spans accepted while the exporter was at capacity", async () => {
+		const gate = createGate();
+		const rig = await startRig(gate.responder);
+		const { exporter, spans, results } = await queueBehindFullSlots(
+			rig,
+			gate,
+			3,
+		);
+
+		const closing = exporter.shutdown();
+		gate.answerHeld();
+		await waitFor(
+			() => rig.fixture.requests.length === MAX_CONCURRENT_EXPORTS + 1,
+		);
+		gate.stopHolding();
+		await closing;
+
+		expect(sentSpanIds(rig)).toEqual(expectedSpanIds(spans));
+		const settled = await Promise.all(results);
+		expect(settled.every((r) => r.code === ExportResultCode.SUCCESS)).toBe(
+			true,
+		);
+		const requestsBefore = rig.fixture.requests.length;
+		const late = await exportAndWait(exporter, createRealSpans(1));
+		expect(late.code).toBe(ExportResultCode.FAILED);
+		expect(rig.fixture.requests).toHaveLength(requestsBefore);
+	});
+});
+
+/**
+ * The clock the exporter reads (`Date.now`), frozen at its current value and
+ * moved by the test. The export deadline is measured on this clock, so a test
+ * can place the deadline exactly instead of racing real time. Create spans
+ * before freezing the clock.
+ */
+function freezeClock() {
+	const start = Date.now();
+	let elapsedMs = 0;
+	vi.spyOn(Date, "now").mockImplementation(() => start + elapsedMs);
+	return {
+		/** Sets the time elapsed since the freeze. */
+		setElapsed(ms: number) {
+			elapsedMs = ms;
+		},
+	};
+}
+
+/** A budget far above any real wait of these tests, so only the clock decides. */
+const BUDGET_MS = 30_000;
+
+describe("createOtlpExporter total deadline", () => {
+	/**
+	 * Answers the first request with 503 (after moving the clock to
+	 * `elapsedMs`) and every later request with success.
+	 */
+	function transientThenAccept(
+		onFirst: () => void,
+		retryAfter?: string,
+	): FixtureResponder {
+		let answered = 0;
+		return (request, res) => {
+			answered += 1;
+			if (answered > 1) {
+				acceptAll(request, res);
+				return;
+			}
+			onFirst();
+			res.writeHead(503, retryAfter ? { "retry-after": retryAfter } : {});
+			res.end();
+		};
+	}
+
+	it.each([
+		["a Retry-After wait", "30", "30000ms", true, 100, "100ms"],
+		["a backoff wait", undefined, "250ms", false, 100, "100ms"],
+		[
+			"a Retry-After wait when the deadline has passed",
+			"30",
+			"30000ms",
+			true,
+			-500,
+			"0ms",
+		],
+	])(
+		"gives up with the wait and the time left when %s does not fit the deadline",
+		async (_name, retryAfter, needs, advised, leftMs, shownLeft) => {
+			const spans = createRealSpans(1);
+			const clock = freezeClock();
+			const rig = await startRig(
+				transientThenAccept(
+					() => clock.setElapsed(BUDGET_MS - leftMs),
+					retryAfter,
+				),
+			);
+
+			const result = await exportAndWait(rig.createExporter(BUDGET_MS), spans);
+
+			expect(result.code).toBe(ExportResultCode.FAILED);
+			expect(rig.fixture.requests).toHaveLength(1);
+			expect(rig.errors).toHaveLength(1);
+			expect(rig.errors[0]).toContain("HTTP 503 on attempt 1");
+			expect(rig.errors[0]).toContain(
+				`next retry needs ${needs} but only ${shownLeft} of the ${BUDGET_MS}ms deadline remain`,
+			);
+			expect(rig.errors[0].includes("(Retry-After)")).toBe(advised);
+		},
+	);
+
+	it("gives up when the advised wait uses all of the time left", async () => {
+		const spans = createRealSpans(1);
+		const clock = freezeClock();
+		const budget = 61_000;
+		// One second of the budget is left: a one-second Retry-After uses it all.
+		const exact = await startRig(
+			transientThenAccept(() => clock.setElapsed(budget - 1_000), "1"),
+		);
+
+		const result = await exportAndWait(exact.createExporter(budget), spans);
+
+		expect(result.code).toBe(ExportResultCode.FAILED);
+		expect(exact.fixture.requests).toHaveLength(1);
+		expect(exact.errors[0]).toContain("needs 1000ms but only 1000ms");
+	});
+
+	/**
+	 * Moves the clock once the exporter starts its backoff wait (250 ms after
+	 * the first failure), which is after the time left was computed and before
+	 * the next attempt checks the deadline.
+	 */
+	function moveClockDuringBackoff(
+		clock: ReturnType<typeof freezeClock>,
+		elapsedMs: number,
+	) {
+		const realSetTimeout = globalThis.setTimeout;
+		vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+			handler: () => void,
+			ms?: number,
+		) => {
+			if (ms === 250) clock.setElapsed(elapsedMs);
+			return realSetTimeout(handler, ms);
+		}) as unknown as typeof setTimeout);
+	}
+
+	it.each([
+		["has passed", BUDGET_MS + 5_000],
+		["ends exactly now", BUDGET_MS],
+	])(
+		"does not send another attempt once the deadline %s while it waits to retry",
+		async (_name, elapsedMs) => {
+			const spans = createRealSpans(1);
+			const clock = freezeClock();
+			const rig = await startRig(transientThenAccept(() => undefined));
+			moveClockDuringBackoff(clock, elapsedMs);
+
+			const result = await exportAndWait(rig.createExporter(BUDGET_MS), spans);
+
+			expect(result.code).toBe(ExportResultCode.FAILED);
+			expect(rig.fixture.requests).toHaveLength(1);
+			expect(rig.errors).toEqual([
+				`Langfuse OTLP export failed: export deadline of ${BUDGET_MS}ms exceeded; last failure: HTTP 503`,
+			]);
+		},
+	);
+
+	it("sends another attempt when the wait to retry leaves a millisecond of the deadline", async () => {
+		const spans = createRealSpans(1);
+		const clock = freezeClock();
+		const rig = await startRig(transientThenAccept(() => undefined));
+		moveClockDuringBackoff(clock, BUDGET_MS - 1);
+
+		const result = await exportAndWait(rig.createExporter(BUDGET_MS), spans);
+
+		expect(result).toEqual({ code: ExportResultCode.SUCCESS });
+		expect(rig.fixture.requests).toHaveLength(2);
+		expect(rig.errors).toEqual([]);
+	});
+
+	it("reports an export whose budget was spent before its first request without a last failure", async () => {
+		const spans = createRealSpans(1);
+		const rig = await startRig();
+		const exporter = rig.createExporter(1_000);
+		const start = Date.now();
+		let reads = 0;
+		// The export reads the clock when it starts; every later read is late.
+		vi.spyOn(Date, "now").mockImplementation(() => {
+			reads += 1;
+			return reads === 1 ? start : start + 10_000;
+		});
+
+		const result = await exportAndWait(exporter, spans);
+
+		expect(result.code).toBe(ExportResultCode.FAILED);
+		expect(rig.fixture.requests).toHaveLength(0);
+		expect(rig.errors).toEqual([
+			"Langfuse OTLP export failed: export deadline of 1000ms exceeded",
+		]);
+	});
+
+	it("fails an export with a zero budget against a server that never answers", async () => {
+		const rig = await startRig(() => {
+			// Never respond.
+		});
+
+		const result = await exportAndWait(
+			rig.createExporter(0),
+			createRealSpans(1),
+		);
+
+		expect(result.code).toBe(ExportResultCode.FAILED);
+		expect(rig.errors).toHaveLength(1);
+		expect(rig.errors[0]).toMatch(/deadline/);
+	});
+});
+
+describe("createOtlpExporter response and request limits", () => {
+	it("fails without retrying when the response body exceeds the read limit", async () => {
+		const rig = await startRig((_request, res) => {
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end("x".repeat(1_200_000));
+		});
+
+		const result = await exportAndWait(
+			rig.createExporter(),
+			createRealSpans(1),
+		);
+
+		expect(result.code).toBe(ExportResultCode.FAILED);
+		expect(rig.fixture.requests).toHaveLength(1);
+		expect(rig.errors).toHaveLength(1);
+		expect(rig.errors[0]).toMatch(/response exceeded the \d+-byte read limit/);
+	});
+
+	it("names the position of each failed request of a split export", async () => {
+		const rig = await startRig((_request, res) => {
+			res.writeHead(401);
+			res.end();
+		});
+		// Two spans that cannot share a request.
+		const spans = createRealSpans(2, { "test.big": "x".repeat(2_000_000) });
+
+		const result = await exportAndWait(rig.createExporter(), spans);
+
+		expect(result.code).toBe(ExportResultCode.FAILED);
+		expect(rig.fixture.requests).toHaveLength(2);
+		expect(rig.errors).toHaveLength(1);
+		expect(rig.errors[0]).toContain("(request 1/2)");
+		expect(rig.errors[0]).toContain("(request 2/2)");
 	});
 });

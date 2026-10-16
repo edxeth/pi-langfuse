@@ -4,7 +4,11 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { Config, canTrace } from "./config.js";
-import type { getRuntime, LangfuseGeneration } from "./langfuse-client.js";
+import type {
+	getRuntime,
+	LangfuseGeneration,
+	LangfuseTrace,
+} from "./langfuse-client.js";
 import {
 	type GenerationState,
 	getLifecycleFailure,
@@ -19,12 +23,11 @@ import type { SessionContextLike, SessionState } from "./session-state.js";
 import type {
 	costDetailsFromUsage,
 	estimateJsonBytes,
-	extractTextFromContent,
 	safeJson,
 	standardUsageFromUsage,
 	summarizeMessages,
 	summarizeProviderPayload,
-	summarizeProviderRequestMessages,
+	summarizeRawProviderRequestContents,
 	telemetryText,
 	usageDetailsFromUsage,
 	writeRawTrace,
@@ -32,6 +35,7 @@ import type {
 import {
 	type CapturedProviderRequest,
 	captureProviderRequest,
+	projectAssistantOutput,
 	providerRequestIdentity,
 	providerRequestProvenance,
 	providerRequestSource,
@@ -48,13 +52,12 @@ export interface GenerationLifecycleDependencies {
 	getRuntime: typeof getRuntime;
 	telemetryText: typeof telemetryText;
 	redactionMetadata: typeof redactionMetadata;
-	extractTextFromContent: typeof extractTextFromContent;
 	standardUsageFromUsage: typeof standardUsageFromUsage;
 	usageDetailsFromUsage: typeof usageDetailsFromUsage;
 	costDetailsFromUsage: typeof costDetailsFromUsage;
 	summarizeMessages: typeof summarizeMessages;
 	summarizeProviderPayload: typeof summarizeProviderPayload;
-	summarizeProviderRequestMessages: typeof summarizeProviderRequestMessages;
+	summarizeRawProviderRequestContents: typeof summarizeRawProviderRequestContents;
 	safeJson: typeof safeJson;
 	estimateJsonBytes: typeof estimateJsonBytes;
 	writeRawTrace: typeof writeRawTrace;
@@ -355,6 +358,17 @@ function generationForMessageEvent(
 	return createGenerationState(turn, nextGeneratedRequestKey(turn));
 }
 
+// Every lookup with `create: true` returns a state.
+function getOrCreateGenerationState(
+	turn: TurnState,
+	event: EventRecord,
+	options: GenerationLookupOptions & { create: true },
+): GenerationState;
+function getOrCreateGenerationState(
+	turn: TurnState,
+	event: EventRecord,
+	options: GenerationLookupOptions,
+): GenerationState | undefined;
 function getOrCreateGenerationState(
 	turn: TurnState,
 	event: EventRecord,
@@ -400,6 +414,15 @@ function providerResponseMetadata(
 	return metadata;
 }
 
+/** Hand the input collected since the last turn to this turn, once. */
+function attachPendingTurnInput(prompt: PromptState, turn: TurnState) {
+	if (turn.inputAttached) return;
+	turn.inputMessages = prompt.pendingTurnInput;
+	prompt.pendingTurnInput = [];
+	turn.inputAttached = true;
+	turn.span?.update?.({ input: turn.inputMessages });
+}
+
 export function createGenerationLifecycleHandlers(
 	deps: GenerationLifecycleDependencies,
 ): GenerationLifecycleHandlers {
@@ -415,6 +438,7 @@ export function createGenerationLifecycleHandlers(
 	const ensureGeneration = async (
 		state: SessionState<PromptState>,
 		prompt: PromptState,
+		trace: LangfuseTrace,
 		turn: TurnState,
 		generationState: GenerationState,
 		config: Config,
@@ -440,15 +464,10 @@ export function createGenerationLifecycleHandlers(
 						generationState.requestModel || state.model || undefined;
 					generationState.generation = lf.generation({
 						name: "llm-response",
-						traceId: prompt.trace?.id || "",
+						traceId: trace.id,
 						parentObservationId: turn.span?.id || prompt.promptSpan?.id,
-						input:
-							generationState.inputSnapshot ??
-							deps.telemetryText(
-								config,
-								prompt.userPrompt,
-								config.traceInputMaxChars,
-							),
+						// Every caller applies the input snapshot first.
+						input: generationState.inputSnapshot,
 						model,
 						modelParameters: generationState.modelParameters,
 						metadata: {
@@ -511,16 +530,24 @@ export function createGenerationLifecycleHandlers(
 	const finishGeneration = (
 		state: SessionState<PromptState>,
 		prompt: PromptState,
+		trace: LangfuseTrace,
 		turn: TurnState,
 		generationState: GenerationState,
 		config: Config,
 		body: Parameters<LangfuseGeneration["end"]>[0],
 		usage?: PiUsage,
 	) => {
+		// An ended generation always has its finish promise.
 		if (generationState.finishPromise) return generationState.finishPromise;
-		if (generationState.ended) return Promise.resolve();
 		generationState.finishPromise = (async () => {
-			await ensureGeneration(state, prompt, turn, generationState, config);
+			await ensureGeneration(
+				state,
+				prompt,
+				trace,
+				turn,
+				generationState,
+				config,
+			);
 			if (generationState.ended || !generationState.generation) return;
 
 			generationState.ended = true;
@@ -625,7 +652,6 @@ export function createGenerationLifecycleHandlers(
 			newRequest: true,
 			requestFingerprint: providerRequestIdentity(event.payload),
 		});
-		if (!generationState) return;
 		applyInputSnapshot(generationState, prompt, config, capture);
 		generationState.requestModel = reqModel;
 		generationState.modelParameters = extractModelParameters(event.payload);
@@ -637,13 +663,12 @@ export function createGenerationLifecycleHandlers(
 	) => {
 		const resolved = getSessionPrompt(ctx, event);
 		if (!resolved) return;
-		const { state, prompt } = resolved;
+		const { state, prompt, turn } = resolved;
 		const config = deps.getConfig();
 		const record = eventRecord(event);
-		const turn = getTurn(prompt, record);
-		if (!turn) return;
 
 		try {
+			attachPendingTurnInput(prompt, turn);
 			const payloadSummaryText = deps.safeJson(
 				config,
 				deps.summarizeProviderPayload(config, event.payload, state.model),
@@ -656,20 +681,15 @@ export function createGenerationLifecycleHandlers(
 				capture,
 				prompt.lastContextMessages,
 			);
-			const summarySystemInstruction = () =>
-				capture.systemInstruction !== undefined
-					? deps.telemetryText(
+			const rawSummary =
+				config.rawTraceProviderRequestMode === "summary"
+					? deps.summarizeRawProviderRequestContents(
 							config,
+							capture.contents,
+							fallbackMessages,
 							capture.systemInstruction,
-							config.traceInputMaxChars,
 						)
 					: undefined;
-			const summarizeRequestContents = () =>
-				summarizeProviderRequestContents(
-					config,
-					capture.contents,
-					summarySystemInstruction(),
-				) ?? deps.summarizeProviderRequestMessages(config, fallbackMessages);
 			const writeProviderRequestTrace = () => {
 				if (config.rawTraceProviderRequestMode === "off") return undefined;
 				// When the payload carries no recognizable request contents, the
@@ -686,12 +706,13 @@ export function createGenerationLifecycleHandlers(
 					systemInstruction:
 						config.rawTraceProviderRequestMode === "full"
 							? capture.systemInstruction
-							: summarySystemInstruction(),
+							: rawSummary?.systemPrompt,
 					payloadCaptured: config.captureProviderPayload,
 					payloadSummary: config.captureProviderPayload
 						? payloadSummaryText
 						: undefined,
-					messagesSummary: summarizeRequestContents(),
+					messagesSummary: rawSummary?.messagesSummary,
+					messagesSummaryOmitted: rawSummary?.messagesSummaryOmitted,
 				});
 			};
 			const providerRequestTrace = writeProviderRequestTrace();
@@ -710,7 +731,7 @@ export function createGenerationLifecycleHandlers(
 				capture,
 			);
 		} catch {
-			// Provider payload shaping is diagnostic-only and must not interrupt the request.
+			// Provider diagnostics and turn-input telemetry must not interrupt the request.
 		}
 	};
 
@@ -739,7 +760,14 @@ export function createGenerationLifecycleHandlers(
 			record,
 			generationState.metadata,
 		);
-		await ensureGeneration(state, prompt, turn, generationState, config);
+		await ensureGeneration(
+			state,
+			prompt,
+			prompt.trace,
+			turn,
+			generationState,
+			config,
+		);
 		if (!generationState.generation) return;
 		updateGeneration(generationState, { metadata: generationState.metadata });
 	};
@@ -774,7 +802,14 @@ export function createGenerationLifecycleHandlers(
 		generationState.messageStarted = true;
 		generationState.streamingText = "";
 		generationState.streamingThinking = "";
-		await ensureGeneration(state, prompt, turn, generationState, config);
+		await ensureGeneration(
+			state,
+			prompt,
+			prompt.trace,
+			turn,
+			generationState,
+			config,
+		);
 	};
 
 	const messageUpdate = async (
@@ -823,7 +858,14 @@ export function createGenerationLifecycleHandlers(
 			);
 		}
 
-		await ensureGeneration(state, prompt, turn, generationState, config);
+		await ensureGeneration(
+			state,
+			prompt,
+			prompt.trace,
+			turn,
+			generationState,
+			config,
+		);
 		if (completionStartTime && generationState.generation) {
 			updateGeneration(generationState, {
 				completionStartTime,
@@ -833,39 +875,60 @@ export function createGenerationLifecycleHandlers(
 			});
 		}
 		if (config.captureMessageUpdates && generationState.generation) {
-			updateGeneration(generationState, {
-				output: deps.telemetryText(
+			const rawPartialOutput = projectAssistantOutput(
+				message.content,
+				generationState.streamingText,
+				generationState.streamingThinking,
+			);
+			const partialOutput = {
+				...rawPartialOutput,
+				text: deps.telemetryText(
 					config,
-					generationState.streamingThinking + generationState.streamingText,
+					rawPartialOutput.text,
 					config.traceOutputMaxChars,
 				),
+			};
+			updateGeneration(generationState, {
+				output: partialOutput,
 				metadata: {
-					hasThinking: !!generationState.streamingThinking,
+					hasThinking: Boolean(partialOutput.thinking),
 					partial: true,
 				},
 			});
 		}
 
 		if (assistantEvent.type === "error") {
-			await finishGeneration(state, prompt, turn, generationState, config, {
-				isError: true,
-				statusMessage: String(
-					assistantEvent.reason ?? "provider response failed",
-				),
-				metadata: {
-					...generationState.metadata,
-					providerError: true,
+			await finishGeneration(
+				state,
+				prompt,
+				prompt.trace,
+				turn,
+				generationState,
+				config,
+				{
+					isError: true,
+					statusMessage: String(
+						assistantEvent.reason ?? "provider response failed",
+					),
+					metadata: {
+						...generationState.metadata,
+						providerError: true,
+					},
 				},
-			});
+			);
 		}
 	};
 
 	const messageEnd = async (event: MessageEndEvent, ctx: ExtensionContext) => {
 		const message = asRecord(event.message);
-		if (message?.role !== "assistant") return;
+		if (!message) return;
 		const resolved = getSessionPrompt(ctx, event);
 		if (!resolved) return;
 		const { state, prompt, turn } = resolved;
+		if (message.role !== "assistant") {
+			prompt.pendingTurnInput.push(event.message);
+			return;
+		}
 		if (turn.messageEnded) return;
 		turn.messageEnded = true;
 		const failure = getLifecycleFailure(message);
@@ -874,40 +937,47 @@ export function createGenerationLifecycleHandlers(
 			prompt.failure ??= failure;
 		}
 		const config = deps.getConfig();
-		const content = message.content as
-			| Array<{ type: string; text?: string }>
-			| undefined;
-		const outputText = deps.extractTextFromContent(content).trim();
-		const generationState =
-			deps.canTrace(config) && prompt.trace
-				? getOrCreateGenerationState(turn, eventRecord(event), {
-						create: true,
-						newRequest: false,
-					})
-				: undefined;
+		const trace = deps.canTrace(config) ? prompt.trace : undefined;
+		const traced = trace && {
+			trace,
+			generation: getOrCreateGenerationState(turn, eventRecord(event), {
+				create: true,
+				newRequest: false,
+			}),
+		};
+		const generationState = traced?.generation;
 		if (generationState) {
 			applyInputSnapshot(generationState, prompt, config);
 		}
-		const finalOutput =
-			outputText ||
-			(generationState?.streamingThinking || "") +
-				(generationState?.streamingText || "");
+		const rawAssistantOutput = projectAssistantOutput(
+			message.content,
+			generationState?.streamingText ?? "",
+			generationState?.streamingThinking ?? "",
+		);
+		const assistantOutput = {
+			...rawAssistantOutput,
+			text: deps.telemetryText(
+				config,
+				rawAssistantOutput.text,
+				config.traceOutputMaxChars,
+			),
+		};
+		const finalOutput = assistantOutput.text;
+		turn.assistantOutput = assistantOutput;
 		const usage = message.usage as PiUsage | undefined;
 		const standardUsage = deps.standardUsageFromUsage(usage);
 		const usageDetails = deps.usageDetailsFromUsage(usage);
 		const costDetails = deps.costDetailsFromUsage(usage);
 
-		prompt.lastAssistantText = deps.telemetryText(
-			config,
-			finalOutput,
-			config.traceOutputMaxChars,
-		);
+		prompt.lastAssistantText = finalOutput;
 		prompt.lastUsage = usage;
 		deps.writeRawTrace(config, state, {
 			type: "assistant_output",
 			turnIndex: turn.index,
-			text: finalOutput,
-			thinking: generationState?.streamingThinking || undefined,
+			text: rawAssistantOutput.text,
+			thinking: rawAssistantOutput.thinking,
+			toolCalls: rawAssistantOutput.tool_calls,
+			stopReason: getNonEmptyString(message.stopReason),
 			usage,
 			messageModel: getNonEmptyString(message.model),
 		});
@@ -920,34 +990,34 @@ export function createGenerationLifecycleHandlers(
 			prompt.cacheWrite += usage.cacheWrite ?? 0;
 		}
 
-		if (!generationState) return;
+		if (!traced) return;
+		const { generation } = traced;
 		await finishGeneration(
 			state,
 			prompt,
+			traced.trace,
 			turn,
-			generationState,
+			generation,
 			config,
 			{
-				output:
-					deps.telemetryText(config, finalOutput, config.traceOutputMaxChars) ||
-					undefined,
+				output: assistantOutput,
 				usage: standardUsage,
 				usageDetails,
 				costDetails,
 				modelParameters:
 					extractModelParameters(eventRecord(event)) ||
-					generationState.modelParameters,
+					generation.modelParameters,
 				model:
 					getNonEmptyString(message.model) ||
 					state.model ||
-					generationState.requestModel ||
+					generation.requestModel ||
 					undefined,
 				metadata: {
-					...generationState.metadata,
+					...generation.metadata,
 					model: getNonEmptyString(message.model) || state.model,
 					provider: state.provider,
 					turnIndex: turn.index,
-					thinking: generationState.streamingThinking || undefined,
+					hasThinking: Boolean(assistantOutput.thinking),
 					stopReason: failure?.stopReason,
 					errorMessage: failure?.errorMessage,
 				},
@@ -955,9 +1025,8 @@ export function createGenerationLifecycleHandlers(
 				statusMessage:
 					failure?.errorMessage ||
 					(failure?.stopReason === "error" || message.isError === true
-						? typeof generationState.metadata.providerResponseStatus ===
-							"number"
-							? `provider response failed (${generationState.metadata.providerResponseStatus})`
+						? typeof generation.metadata.providerResponseStatus === "number"
+							? `provider response failed (${generation.metadata.providerResponseStatus})`
 							: "provider response failed"
 						: failure?.stopReason === "aborted"
 							? "provider response aborted"

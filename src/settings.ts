@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { IdentityMode } from "./identity.js";
 import type { CapturePolicy } from "./payload-policy.js";
 
 export const EXTENSION_ID = "pi-langfuse";
@@ -47,6 +48,8 @@ export interface SettingsValues {
 	"payload-max-object-keys"?: PayloadLimitSetting;
 	"payload-max-nodes"?: PayloadLimitSetting;
 	"redaction-enabled": boolean;
+	"identity-mode"?: IdentityMode;
+	"identity-keep-repo"?: boolean;
 	"raw-trace-enabled": boolean;
 	"raw-trace-dir": string;
 }
@@ -81,6 +84,8 @@ export const DEFAULT_SETTINGS: SettingsValues = {
 	"payload-max-object-keys": "unlimited",
 	"payload-max-nodes": "unlimited",
 	"redaction-enabled": true,
+	"identity-mode": "raw",
+	"identity-keep-repo": false,
 	"raw-trace-enabled": false,
 	"raw-trace-dir": "",
 };
@@ -98,6 +103,7 @@ These settings control how the Langfuse extension connects to your Langfuse proj
 - Tag lists are comma-separated.
 - Character limits and payload budgets are bounded during config resolution; use \`unlimited\` for an explicit unlimited budget.
 - Secret redaction is enabled by default. Disable it only for explicit local debugging.
+- Identity mode \`raw\` keeps usernames, home paths, and repository names as captured. \`pseudonymous\` replaces the home directory with \`~\` and hashes the user id and repository identity with a private salt stored in pi-langfuse.json. It reduces direct identifiers but does not anonymize content, file names, branches, or commits. Identity protection does not depend on the secret redaction setting.
 `;
 
 function createSettingsNodes(defaults: SettingsValues) {
@@ -290,6 +296,20 @@ function createSettingsNodes(defaults: SettingsValues) {
 				"Redact known secrets and common token patterns before writing Langfuse or raw trace payloads. Disable only for explicit local debugging.",
 			default: defaults["redaction-enabled"],
 		},
+		"identity-mode": {
+			_tag: "text",
+			label: "Identity Mode",
+			description:
+				"Use raw or pseudonymous. Pseudonymous replaces the home directory with ~ and hashes the user id and repository identity with a private per-config salt. It is not anonymization.",
+			default: defaults["identity-mode"],
+		},
+		"identity-keep-repo": {
+			_tag: "boolean",
+			label: "Keep Repository Identity",
+			description:
+				"In pseudonymous mode, keep repository owner, name, remote path, root name, and project tags readable instead of hashing them.",
+			default: defaults["identity-keep-repo"],
+		},
 		"raw-trace-enabled": {
 			_tag: "boolean",
 			label: "Raw Trace Export",
@@ -375,76 +395,25 @@ export function getStoredSettingsValues(
 	return (allValues[EXTENSION_ID] ?? {}) as Partial<SettingsValues>;
 }
 
+const SETTING_KEYS = Object.keys(DEFAULT_SETTINGS) as Array<
+	keyof SettingsValues
+>;
+
+function settingOrDefault<K extends keyof SettingsValues>(
+	values: Partial<SettingsValues>,
+	key: K,
+): SettingsValues[K] {
+	return values[key] ?? DEFAULT_SETTINGS[key];
+}
+
+/** Every setting, with the default for each one that is not stored. */
 export function getSettingsValues(pi?: ExtensionAPI): SettingsValues {
 	const values = getStoredSettingsValues(pi);
-	return {
-		enabled: values.enabled ?? DEFAULT_SETTINGS.enabled,
-		"public-key": values["public-key"] ?? DEFAULT_SETTINGS["public-key"],
-		"secret-key": values["secret-key"] ?? DEFAULT_SETTINGS["secret-key"],
-		"base-url": values["base-url"] ?? DEFAULT_SETTINGS["base-url"],
-		"user-id": values["user-id"] ?? DEFAULT_SETTINGS["user-id"],
-		"default-tags": values["default-tags"] ?? DEFAULT_SETTINGS["default-tags"],
-		release: values.release ?? DEFAULT_SETTINGS.release,
-		environment: values.environment ?? DEFAULT_SETTINGS.environment,
-		"trace-input-max-chars":
-			values["trace-input-max-chars"] ??
-			DEFAULT_SETTINGS["trace-input-max-chars"],
-		"trace-output-max-chars":
-			values["trace-output-max-chars"] ??
-			DEFAULT_SETTINGS["trace-output-max-chars"],
-		"tool-args-max-chars":
-			values["tool-args-max-chars"] ?? DEFAULT_SETTINGS["tool-args-max-chars"],
-		"tool-output-max-chars":
-			values["tool-output-max-chars"] ??
-			DEFAULT_SETTINGS["tool-output-max-chars"],
-		"capture-tool-progress":
-			values["capture-tool-progress"] ??
-			DEFAULT_SETTINGS["capture-tool-progress"],
-		"capture-message-updates":
-			values["capture-message-updates"] ??
-			DEFAULT_SETTINGS["capture-message-updates"],
-		"capture-policy":
-			values["capture-policy"] ?? DEFAULT_SETTINGS["capture-policy"],
-		"capture-prompt":
-			values["capture-prompt"] ?? DEFAULT_SETTINGS["capture-prompt"],
-		"capture-system-prompt":
-			values["capture-system-prompt"] ??
-			DEFAULT_SETTINGS["capture-system-prompt"],
-		"capture-provider-input":
-			values["capture-provider-input"] ??
-			DEFAULT_SETTINGS["capture-provider-input"],
-		"capture-assistant-output":
-			values["capture-assistant-output"] ??
-			DEFAULT_SETTINGS["capture-assistant-output"],
-		"capture-tool-input":
-			values["capture-tool-input"] ?? DEFAULT_SETTINGS["capture-tool-input"],
-		"capture-tool-output":
-			values["capture-tool-output"] ?? DEFAULT_SETTINGS["capture-tool-output"],
-		"capture-metadata":
-			values["capture-metadata"] ?? DEFAULT_SETTINGS["capture-metadata"],
-		"payload-max-string-chars":
-			values["payload-max-string-chars"] ??
-			DEFAULT_SETTINGS["payload-max-string-chars"],
-		"payload-max-tool-chars":
-			values["payload-max-tool-chars"] ??
-			DEFAULT_SETTINGS["payload-max-tool-chars"],
-		"payload-max-depth":
-			values["payload-max-depth"] ?? DEFAULT_SETTINGS["payload-max-depth"],
-		"payload-max-array-items":
-			values["payload-max-array-items"] ??
-			DEFAULT_SETTINGS["payload-max-array-items"],
-		"payload-max-object-keys":
-			values["payload-max-object-keys"] ??
-			DEFAULT_SETTINGS["payload-max-object-keys"],
-		"payload-max-nodes":
-			values["payload-max-nodes"] ?? DEFAULT_SETTINGS["payload-max-nodes"],
-		"redaction-enabled":
-			values["redaction-enabled"] ?? DEFAULT_SETTINGS["redaction-enabled"],
-		"raw-trace-enabled":
-			values["raw-trace-enabled"] ?? DEFAULT_SETTINGS["raw-trace-enabled"],
-		"raw-trace-dir":
-			values["raw-trace-dir"] ?? DEFAULT_SETTINGS["raw-trace-dir"],
-	};
+	// SAFETY: SETTING_KEYS are exactly the keys of DEFAULT_SETTINGS, a
+	// complete SettingsValues, and each value comes from the same key.
+	return Object.fromEntries(
+		SETTING_KEYS.map((key) => [key, settingOrDefault(values, key)]),
+	) as unknown as SettingsValues;
 }
 
 export function setSettingsValues(nextValues: Partial<SettingsValues>) {

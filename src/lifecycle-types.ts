@@ -1,8 +1,30 @@
+import type { AskFlowState } from "./ask-wait.js";
 import type {
 	LangfuseGeneration,
 	LangfuseSpan,
 	LangfuseTrace,
 } from "./langfuse-client.js";
+import type { TraceDestination } from "./session-state.js";
+
+/** A tool call in the persisted assistant-output projection. */
+export interface AssistantToolCallOutput {
+	/** The Pi tool-call identifier used to correlate execution and result records. */
+	readonly id: string;
+	/** The name of the requested tool. */
+	readonly name: string;
+	/** The arguments supplied to the tool, shaped by the tool-input policy later. */
+	readonly arguments: unknown;
+}
+
+/** A stable, separated view of one assistant response for telemetry sinks. */
+export interface AssistantOutput {
+	/** Visible answer text, never populated from a thinking block. */
+	readonly text: string;
+	/** Tool calls in Pi content order. */
+	readonly tool_calls: ReadonlyArray<AssistantToolCallOutput>;
+	/** Visible, non-redacted reasoning text when present. */
+	readonly thinking?: string;
+}
 
 export interface PiUsage {
 	input?: number;
@@ -51,8 +73,16 @@ export function addIndirectUsage(
 	return true;
 }
 
+/** The last tool result of the prompt, in finalized transcript order. */
+export interface LastToolResult {
+	toolCallId: string;
+	isError: boolean;
+}
+
 export interface PromptState {
 	trace?: LangfuseTrace;
+	/** Destination in effect when the trace was created; later config reloads do not change it. */
+	destination?: TraceDestination;
 	promptSpan?: LangfuseSpan;
 	userPrompt: string;
 	systemPrompt: string;
@@ -60,6 +90,14 @@ export interface PromptState {
 	startedAt: number;
 	toolCalls: number;
 	toolErrors: number;
+	/** Distinct edit/write tool calls attempted, including failed or blocked ones. */
+	editWriteCalls: number;
+	/** Last tool result of the latest turn that finalized any; unset without tool results. */
+	lastToolResult?: LastToolResult;
+	/** pi-ask dialog flows attributed to this prompt, by flow id. */
+	askFlows: Map<string, AskFlowState>;
+	/** Flows whose events matched more than one session; recorded without timing. */
+	ambiguousAskFlowIds: Set<string>;
 	turns: number;
 	tokensIn: number;
 	tokensOut: number;
@@ -74,6 +112,8 @@ export interface PromptState {
 	countedCompactions: Set<string>;
 	lastAssistantText: string;
 	startSignature: string;
+	/** Incoming messages queued for the next provider-request turn boundary. */
+	pendingTurnInput: unknown[];
 	lastUsage?: PiUsage;
 	failure?: LifecycleFailure;
 	/** Most recent failure that a later agent run of this prompt recovered from. */
@@ -104,6 +144,12 @@ export interface TurnState {
 	generations: Map<string, GenerationState>;
 	generationOrder: string[];
 	nextGenerationIndex: number;
+	/** Newly delivered incoming messages consumed by this turn's first request. */
+	inputMessages: unknown[];
+	/** Whether the request boundary has attached the prompt's pending messages. */
+	inputAttached: boolean;
+	/** Final structured assistant response, shared by generation and turn spans. */
+	assistantOutput?: AssistantOutput;
 	requests?: Array<{
 		timestamp: string;
 		payloadSize: number;

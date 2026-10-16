@@ -6,6 +6,7 @@ import {
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	statSync,
 	symlinkSync,
@@ -14,12 +15,18 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
+import type { Config } from "./config.js";
 import {
 	appendRawTrace,
 	defaultRawTraceDir,
 	drainRawTraceQueue,
 	rawTracePathForSession,
 } from "./raw-trace.js";
+import {
+	captureProviderRequest,
+	providerRequestTraceRecord,
+	summarizeRawProviderRequestContents,
+} from "./telemetry-helpers.js";
 
 describe("raw trace writer", () => {
 	it("defaults under the active agent directory", () => {
@@ -86,6 +93,39 @@ describe("raw trace writer", () => {
 			toolCallId: "call_1",
 			content: [{ type: "text", text: "important raw output" }],
 		});
+	});
+
+	it("writes nothing when raw traces are off, or when the session has no file", () => {
+		const record = {
+			type: "tool_result_first_seen",
+			timestamp: "2026-05-01T00:00:00.000Z",
+			toolCallId: "call_1",
+		};
+		const offDir = mkdtempSync(join(tmpdir(), "pi-langfuse-raw-off-test-"));
+		const noFileDir = mkdtempSync(
+			join(tmpdir(), "pi-langfuse-raw-nofile-test-"),
+		);
+		const sessionFile = "/tmp/pi-agent/sessions/--work--/session.jsonl";
+
+		appendRawTrace(
+			{ rawTraceEnabled: false, rawTraceDir: offDir, redactionEnabled: true },
+			sessionFile,
+			record,
+		);
+		appendRawTrace(
+			{ rawTraceEnabled: true, rawTraceDir: noFileDir, redactionEnabled: true },
+			undefined,
+			record,
+		);
+		appendRawTrace(
+			{ rawTraceEnabled: true, rawTraceDir: noFileDir, redactionEnabled: true },
+			"",
+			record,
+		);
+		drainRawTraceQueue();
+
+		expect(readdirSync(offDir)).toEqual([]);
+		expect(readdirSync(noFileDir)).toEqual([]);
 	});
 
 	it("redacts secrets before appending records", () => {
@@ -389,5 +429,363 @@ describe("raw trace writer", () => {
 		expect(rawTracePathForSession(sessionFile, dir)).toBe(
 			join(dir, "--unknown--", "session.jsonl"),
 		);
+	});
+
+	it("keeps the final shaped provider summary within its serialized UTF-8 budget", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-langfuse-raw-summary-test-"));
+		const config: Config = {
+			enabled: false,
+			publicKey: "pk-test",
+			secretKey: "sk-test-secret-value",
+			host: "http://localhost",
+			userId: "test-user",
+			defaultTags: [],
+			release: "",
+			environment: "",
+			traceInputMaxChars: 2_000,
+			traceOutputMaxChars: 2_000,
+			toolArgsMaxChars: 500,
+			toolOutputMaxChars: 2_000,
+			captureToolProgress: true,
+			captureMessageUpdates: false,
+			skipUnpersistedSessions: false,
+			captureProviderPayload: false,
+			providerPayloadMaxChars: 50_000,
+			redactionEnabled: true,
+			redactionAdditionalSecrets: ["RAW-COMPACT-CONFIGURED-SECRET"],
+			rawTraceEnabled: true,
+			rawTraceDir: dir,
+			rawTraceProviderRequestMode: "summary",
+			localAutostart: false,
+			localAutostartDir: "/tmp/langfuse",
+			localAutostartHealthUrl: "http://localhost:3100",
+			localAutostartTimeoutMs: 200,
+			capturePolicy: "full-debug",
+		};
+		const messages = Array.from({ length: 55 }, (_, index) => ({
+			role: "user",
+			content:
+				"raw message " +
+				index +
+				": " +
+				"ordinary context words ".repeat(20) +
+				(index === 54 ? " RAW-COMPACT-CONFIGURED-SECRET" : ""),
+		}));
+		const systemInstruction = "separate system instruction 🙂 ".repeat(30);
+		const capture = captureProviderRequest({
+			model: "summary-model",
+			system: systemInstruction,
+			messages,
+		});
+		const summary = summarizeRawProviderRequestContents(
+			config,
+			capture.contents,
+			undefined,
+			capture.systemInstruction,
+		);
+		const record = providerRequestTraceRecord({
+			captureMode: "summary",
+			turnIndex: 0,
+			model: "summary-model",
+			requestSource: "payload.messages",
+			capture,
+			systemInstruction: summary.systemPrompt,
+			payloadCaptured: false,
+			payloadSummary: undefined,
+			messagesSummary: summary.messagesSummary,
+			messagesSummaryOmitted: summary.messagesSummaryOmitted,
+		});
+		const sessionFile =
+			"/tmp/pi-agent/sessions/--raw-summary--/raw-summary-session.jsonl";
+
+		appendRawTrace(config, sessionFile, {
+			...record,
+			timestamp: new Date().toISOString(),
+		});
+		drainRawTraceQueue();
+
+		const rawPath = rawTracePathForSession(sessionFile, dir);
+		if (!rawPath) throw new Error("provider summary raw path was not created");
+		const saved = JSON.parse(readFileSync(rawPath, "utf-8").trim()) as Record<
+			string,
+			unknown
+		>;
+		const serializedSummary = JSON.stringify(saved.messagesSummary);
+		expect(
+			Buffer.byteLength(
+				JSON.stringify({
+					systemPrompt: saved.systemPrompt,
+					messagesSummary: saved.messagesSummary,
+				}),
+				"utf-8",
+			),
+		).toBeLessThanOrEqual(4_096);
+		expect(Buffer.byteLength(serializedSummary, "utf-8")).toBeLessThanOrEqual(
+			4_096,
+		);
+		expect(Buffer.byteLength(serializedSummary, "utf-8")).toBeLessThan(
+			capture.estimatedBytes ?? Infinity,
+		);
+		expect(saved.estimatedBytes).toBe(capture.estimatedBytes);
+		expect(saved.systemPrompt).toContain("separate system instruction");
+		expect(JSON.stringify(saved.messagesSummary)).not.toContain(
+			"separate system instruction",
+		);
+		expect(saved.messagesSummaryOmitted).toBeGreaterThan(0);
+		expect(serializedSummary).not.toContain("RAW-COMPACT-CONFIGURED-SECRET");
+	});
+});
+
+describe("persisted raw provider summary after final shaping", () => {
+	const SUMMARY_MAX_BYTES = 4_096;
+	const PREVIEW_MAX_CHARS = 200;
+	const SSN_SHAPE = /\b\d{3}-\d{2}-\d{4}\b/;
+	const LONE_SURROGATE =
+		/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+	function summaryConfig(overrides: Partial<Config> = {}): Config {
+		return {
+			enabled: false,
+			publicKey: "pk-test",
+			secretKey: "sk-test-secret-value",
+			host: "http://localhost",
+			userId: "test-user",
+			defaultTags: [],
+			release: "",
+			environment: "",
+			traceInputMaxChars: 2_000,
+			traceOutputMaxChars: 2_000,
+			toolArgsMaxChars: 500,
+			toolOutputMaxChars: 2_000,
+			captureToolProgress: true,
+			captureMessageUpdates: false,
+			skipUnpersistedSessions: false,
+			captureProviderPayload: false,
+			providerPayloadMaxChars: 50_000,
+			redactionEnabled: true,
+			redactionAdditionalSecrets: [],
+			rawTraceEnabled: true,
+			rawTraceDir: mkdtempSync(join(tmpdir(), "pi-langfuse-final-summary-")),
+			rawTraceProviderRequestMode: "summary",
+			localAutostart: false,
+			localAutostartDir: "/tmp/langfuse",
+			localAutostartHealthUrl: "http://localhost:3100",
+			localAutostartTimeoutMs: 200,
+			capturePolicy: "full-debug",
+			...overrides,
+		};
+	}
+
+	/** Run the summary builder and the real writer, then read the persisted JSONL. */
+	function persistSummary(
+		config: Config,
+		messages: unknown[],
+		options: { systemInstruction?: string; mode?: "summary" | "full" } = {},
+	) {
+		const capture = captureProviderRequest({
+			model: "summary-model",
+			...(options.systemInstruction
+				? { system: options.systemInstruction }
+				: {}),
+			messages,
+		});
+		const summary = summarizeRawProviderRequestContents(
+			config,
+			capture.contents,
+			undefined,
+			capture.systemInstruction,
+		);
+		const record = providerRequestTraceRecord({
+			captureMode: options.mode ?? "summary",
+			turnIndex: 0,
+			model: "summary-model",
+			requestSource: "payload.messages",
+			capture,
+			systemInstruction:
+				options.mode === "full"
+					? capture.systemInstruction
+					: summary.systemPrompt,
+			payloadCaptured: false,
+			payloadSummary: undefined,
+			messagesSummary: summary.messagesSummary,
+			messagesSummaryOmitted: summary.messagesSummaryOmitted,
+		});
+		const sessionFile = `/tmp/pi-agent/sessions/--final-summary--/${Math.random()
+			.toString(16)
+			.slice(2)}.jsonl`;
+		appendRawTrace(config, sessionFile, {
+			...record,
+			timestamp: new Date().toISOString(),
+		});
+		drainRawTraceQueue();
+		const rawPath = rawTracePathForSession(sessionFile, config.rawTraceDir);
+		if (!rawPath) throw new Error("final summary raw path was not created");
+		return {
+			capture,
+			summaryBeforeWriter: summary,
+			saved: JSON.parse(readFileSync(rawPath, "utf-8").trim()) as Record<
+				string,
+				unknown
+			>,
+		};
+	}
+
+	const previews = (saved: Record<string, unknown>) =>
+		(saved.messagesSummary as Array<{ role: string; content?: string }>).map(
+			(message) => message.content ?? "",
+		);
+	const combinedBytes = (saved: Record<string, unknown>) =>
+		Buffer.byteLength(
+			JSON.stringify({
+				...(saved.systemPrompt !== undefined
+					? { systemPrompt: saved.systemPrompt }
+					: {}),
+				messagesSummary: saved.messagesSummary,
+			}),
+			"utf-8",
+		);
+	function expectBounded(saved: Record<string, unknown>) {
+		expect(combinedBytes(saved)).toBeLessThanOrEqual(SUMMARY_MAX_BYTES);
+		for (const preview of [
+			...previews(saved),
+			...(typeof saved.systemPrompt === "string" ? [saved.systemPrompt] : []),
+		]) {
+			expect(Array.from(preview).length).toBeLessThanOrEqual(PREVIEW_MAX_CHARS);
+			expect(preview).not.toMatch(LONE_SURROGATE);
+		}
+	}
+
+	// Cutting the preview right after the digits makes an SSN-shaped token that
+	// the writer's own redaction pass replaces with a longer marker.
+	const boundaryMessages = () =>
+		Array.from({ length: 20 }, () => ({
+			role: "user",
+			content: `${"words ".repeat(31)}  111-22-3333XXXX`,
+		}));
+
+	it("keeps previews and the combined bytes bounded when truncation exposes a redaction", () => {
+		const config = summaryConfig();
+		const messages = boundaryMessages();
+		const { saved, summaryBeforeWriter } = persistSummary(config, messages);
+
+		// The pre-writer budget holds, so only the final shaped summary can fail.
+		expect(
+			Buffer.byteLength(
+				JSON.stringify({
+					messagesSummary: summaryBeforeWriter.messagesSummary,
+				}),
+				"utf-8",
+			),
+		).toBeLessThanOrEqual(SUMMARY_MAX_BYTES);
+		expectBounded(saved);
+		expect(JSON.stringify(saved)).not.toMatch(SSN_SHAPE);
+		expect(JSON.stringify(saved)).toContain("[REDACTED:");
+		// Every message is either kept or counted as omitted.
+		const kept = (saved.messagesSummary as unknown[]).filter(
+			(_, index) => saved.messagesSummaryOmitted === 0 || index > 0,
+		).length;
+		expect(kept + (saved.messagesSummaryOmitted as number)).toBe(
+			messages.length,
+		);
+	});
+
+	it("preserves Unicode, omissions, and the omission marker when the writer shrinks the summary", () => {
+		const config = summaryConfig();
+		const messages = Array.from({ length: 30 }, (_, index) => ({
+			role: index % 2 === 0 ? "user" : "assistant",
+			content: `${"🙂 wörds ".repeat(25)}  111-22-3333XXXX #${index}`,
+		}));
+		const { saved } = persistSummary(config, messages, {
+			systemInstruction: `${"système 🙂 ".repeat(20)}  111-22-3333XXXX`,
+		});
+
+		expectBounded(saved);
+		expect(JSON.stringify(saved)).not.toMatch(SSN_SHAPE);
+		const items = saved.messagesSummary as Array<{
+			role: string;
+			content: string;
+		}>;
+		const omitted = saved.messagesSummaryOmitted as number;
+		expect(omitted).toBeGreaterThanOrEqual(10);
+		expect(items[0]).toEqual({
+			role: "system",
+			content: `[${omitted} earlier message(s) omitted]`,
+		});
+		expect(items.length - 1 + omitted).toBe(messages.length);
+		// Retained messages are the latest ones, in order.
+		const retained = items.slice(1).map((item) => item.content);
+		expect(retained.at(-1)).toContain("🙂 wörds");
+		expect(items.slice(1).map((item) => item.role)).toEqual(
+			messages.slice(omitted).map((message) => message.role),
+		);
+	});
+
+	it("applies capture policy and identity normalization before enforcing the bounds", () => {
+		const home = "/home/summary-person";
+		const config = summaryConfig({
+			capturePolicy: "conversations",
+			identityMode: "pseudonymous",
+			identitySalt: "c".repeat(64),
+			identityHome: home,
+			redactionAdditionalSecrets: [`${home}/exact-secret-literal-1234`],
+		});
+		const messages = Array.from({ length: 20 }, (_, index) => ({
+			role: index % 2 === 0 ? "user" : "tool",
+			content: `${home}/project ${"tail ".repeat(36)}  111-22-3333XXXX ${home}/exact-secret-literal-1234`,
+		}));
+		const { saved } = persistSummary(config, messages);
+		const text = JSON.stringify(saved);
+
+		expectBounded(saved);
+		expect(text).not.toContain(home);
+		expect(text).not.toContain("exact-secret-literal-1234");
+		expect(text).not.toMatch(SSN_SHAPE);
+		expect(text).toContain("~/project");
+	});
+
+	it("stays bounded wherever the cut lands among secret-shaped tokens", () => {
+		const config = summaryConfig();
+		for (let padding = 0; padding < 40; padding += 1) {
+			const messages = Array.from({ length: 20 }, (_, index) => ({
+				role: "user",
+				content: `${"x".repeat(padding)} ${"111-22-3333XXXX 4111 1111 1111 1111Y ".repeat(8)} #${index}`,
+			}));
+			const { saved } = persistSummary(config, messages);
+			expectBounded(saved);
+			expect(JSON.stringify(saved)).not.toMatch(SSN_SHAPE);
+		}
+	});
+
+	it("keeps full provider request mode and an in-budget summary unchanged", () => {
+		const config = summaryConfig({ rawTraceProviderRequestMode: "full" });
+		const long = `${"full mode keeps every character ".repeat(30)}111-22-3333XXXX`;
+		const full = persistSummary(config, [{ role: "user", content: long }], {
+			mode: "full",
+		}).saved;
+		const messages = full.messages as Array<{ content: string }>;
+		expect(Array.from(messages[0]?.content ?? "").length).toBeGreaterThan(
+			PREVIEW_MAX_CHARS,
+		);
+		expect(full).not.toHaveProperty("messagesSummary");
+
+		const small = persistSummary(summaryConfig(), [
+			{ role: "user", content: "short question" },
+			{ role: "assistant", content: "short answer" },
+		]).saved;
+		expect(small.messagesSummary).toEqual([
+			{ role: "user", content: "short question" },
+			{ role: "assistant", content: "short answer" },
+		]);
+		expect(small.messagesSummaryOmitted).toBe(0);
+	});
+
+	it("does not bound the summary when redaction cannot expand it", () => {
+		const config = summaryConfig({ redactionEnabled: false });
+		const { saved, summaryBeforeWriter } = persistSummary(
+			config,
+			boundaryMessages(),
+		);
+		expect(saved.messagesSummary).toEqual(summaryBeforeWriter.messagesSummary);
+		expectBounded(saved);
 	});
 });

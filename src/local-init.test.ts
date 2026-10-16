@@ -55,9 +55,32 @@ describe("/langfuse-init", () => {
 		});
 		expect(config.publicKey).toMatch(/^pk-lf-local-/);
 		expect(config.secretKey).toMatch(/^sk-lf-local-/);
-		await expect(
-			readFile(join(agentDir, "langfuse", "docker-compose.yml"), "utf-8"),
-		).resolves.toContain("langfuse-web");
+		const compose = await readFile(
+			join(agentDir, "langfuse", "docker-compose.yml"),
+			"utf-8",
+		);
+		expect(compose).toContain("langfuse-web");
+		for (const [service, test, timeout, startPeriod] of [
+			["minio", '["CMD", "mc", "ready", "local"]', "5s", "60s"],
+			["redis", '["CMD", "redis-cli", "ping"]', "10s", "60s"],
+			["postgres", '["CMD-SHELL", "pg_isready -U postgres"]', "3s", "60s"],
+			[
+				"clickhouse",
+				"wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1",
+				"5s",
+				"120s",
+			],
+		]) {
+			const serviceConfig = compose
+				.split(new RegExp(`^  ${service}:\\n`, "m"))[1]
+				?.split(/^ {2}\S|^\S/m)[0];
+			expect(serviceConfig).toContain(`      test: ${test}\n`);
+			expect(serviceConfig).toContain(`      timeout: ${timeout}\n`);
+			expect(serviceConfig).toContain("      interval: 30s\n");
+			expect(serviceConfig).toContain("      start_interval: 2s\n");
+			expect(serviceConfig).toContain(`      start_period: ${startPeriod}\n`);
+			expect(serviceConfig).toContain("      retries: 3\n");
+		}
 		expect(notifications.map((n) => n.message).join("\n")).toContain(
 			"Local Langfuse initialized",
 		);

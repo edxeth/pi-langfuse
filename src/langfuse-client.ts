@@ -10,9 +10,15 @@ import {
 } from "@langfuse/tracing";
 import { context, trace as otelTrace } from "@opentelemetry/api";
 import { AsyncHooksContextManager } from "@opentelemetry/context-async-hooks";
+import {
+	defaultResource,
+	resourceFromAttributes,
+} from "@opentelemetry/resources";
 import { BasicTracerProvider } from "@opentelemetry/sdk-trace-base";
 import type { Config } from "./config.js";
+import { identityTransformFor } from "./identity.js";
 import { createOtlpExporter, OtlpExportError } from "./otlp-export.js";
+import { readPackageVersion } from "./package-version.js";
 import {
 	type PayloadPolicyConfig,
 	shapeLangfuseObservationBody,
@@ -129,7 +135,7 @@ export interface LangfuseRuntime {
 		sessionId?: string;
 		comment?: string;
 		dataType?: "NUMERIC" | "BOOLEAN";
-	}): void;
+	}): Promise<boolean>;
 	withContext<T>(
 		observation: LangfuseSpan | LangfuseGeneration,
 		fn: () => T,
@@ -171,7 +177,7 @@ interface RuntimeState {
 	readonly observations: Map<string, VendorObservation>;
 	readonly traces: Map<string, RuntimeTrace>;
 	/** In-flight direct score deliveries, awaited on flush and shutdown. */
-	readonly pendingScores: Set<Promise<void>>;
+	readonly pendingScores: Set<Promise<boolean>>;
 }
 
 class RuntimeIdGenerator {
@@ -240,17 +246,23 @@ function recordScoreFailure(error: unknown) {
 		error && typeof error === "object" && "statusCode" in error
 			? error.statusCode
 			: undefined;
-	recordRuntimeError(
-		`Failed to send Langfuse score${typeof status === "number" ? ` (HTTP ${status})` : ": request failed"}`,
-	);
+	// A template nested in a template makes Lizard misjudge where this function
+	// ends, so the suffix is built first.
+	const detail =
+		typeof status === "number" ? ` (HTTP ${status})` : ": request failed";
+	recordRuntimeError(`Failed to send Langfuse score${detail}`);
 }
 
+/** Resolves true when the scores endpoint accepted the score; false after a recorded failure. */
 async function sendScore(
 	scoresApi: LangfuseClient["api"]["scores"],
 	body: Parameters<LangfuseClient["api"]["scores"]["create"]>[0],
-): Promise<void> {
+): Promise<boolean> {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), scoreRequestTimeoutMs);
+	// The result is returned after `finally`: V8 coverage reports returns
+	// inside try/catch as a never-taken `finally` branch.
+	let delivered = false;
 	try {
 		await scoresApi.create(body, {
 			// SDK 5.11.1 clears its own timer at response headers. The caller
@@ -261,11 +273,13 @@ async function sendScore(
 			maxRetries: 0,
 			abortSignal: controller.signal,
 		});
+		delivered = true;
 	} catch (error) {
 		recordScoreFailure(error);
 	} finally {
 		clearTimeout(timer);
 	}
+	return delivered;
 }
 
 function shapeBody<T>(
@@ -388,7 +402,29 @@ function runtimeKey(config: Config) {
 		host: config.host,
 		release: config.release,
 		environment: config.environment,
+		// The processor stamps identity-transformed release and environment
+		// values, so an identity policy change needs a new processor.
+		identityMode: config.identityMode,
+		identityKeepRepo: config.identityKeepRepo,
+		identitySalt: config.identitySalt,
+		identityHome: config.identityHome,
 	});
+}
+
+const SERVICE_NAME = "pi-langfuse";
+
+/**
+ * The SDK default service name embeds the Node binary path
+ * (`unknown_service:<argv0>`), which leaks a local install location. The
+ * resource always names this package, in every identity mode.
+ */
+function createServiceResource() {
+	return defaultResource().merge(
+		resourceFromAttributes({
+			"service.name": SERVICE_NAME,
+			"service.version": readPackageVersion(),
+		}),
+	);
 }
 
 function ensureOtelContextManager() {
@@ -698,6 +734,8 @@ function wrapRuntime(rt: RuntimeState, config: Config): LangfuseRuntime {
 			);
 		},
 		score(body) {
+			// The returned promise settles when delivery does. Fire-and-forget
+			// callers may ignore it; it never rejects.
 			try {
 				// The SDK's queued score.create flushes through the legacy
 				// /api/public/ingestion endpoint and swallows delivery failures,
@@ -722,8 +760,10 @@ function wrapRuntime(rt: RuntimeState, config: Config): LangfuseRuntime {
 				void delivery.finally(() => {
 					rt.pendingScores.delete(delivery);
 				});
+				return delivery;
 			} catch (error) {
 				recordScoreFailure(error);
+				return Promise.resolve(false);
 			}
 		},
 		withContext(observation, fn) {
@@ -747,6 +787,14 @@ function createRuntime(config: Config): RuntimeState {
 		timeoutMs: exportTimeoutMs,
 		onError: (message) => recordRuntimeError(message),
 	});
+	// The processor stamps release and environment on every span outside the
+	// body-shaping path, so pseudonymous mode normalizes them here. Raw mode
+	// passes the configured values through unchanged.
+	const identity = identityTransformFor(config);
+	const stamp = (configured: string, ambient: string | undefined) =>
+		identity
+			? identity.string(configured || ambient || "") || undefined
+			: configured || undefined;
 	const processor = new LangfuseSpanProcessor({
 		// Immediate mode exposes every ended span to our bounded exporter and
 		// awaits active sends on flush. The SDK batch mode silently drops a full
@@ -758,13 +806,17 @@ function createRuntime(config: Config): RuntimeState {
 		publicKey: config.publicKey,
 		secretKey: config.secretKey,
 		baseUrl: config.host,
-		release: config.release || undefined,
-		environment: config.environment || undefined,
+		release: stamp(config.release, process.env.LANGFUSE_RELEASE),
+		environment: stamp(
+			config.environment,
+			process.env.LANGFUSE_TRACING_ENVIRONMENT,
+		),
 		exporter,
 	});
 	const tracerProvider = new BasicTracerProvider({
 		spanProcessors: [processor],
 		idGenerator,
+		resource: createServiceResource(),
 	});
 	setLangfuseTracerProvider(tracerProvider);
 	return {

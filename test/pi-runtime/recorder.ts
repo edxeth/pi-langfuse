@@ -14,7 +14,7 @@ import type { AddressInfo } from "node:net";
  *   read APIs exist here only as server-mode modeling. The extension must
  *   never call them under the single-export pipeline; their hit counters
  *   (pollCounts, v1Hits) turn any read attempt into a visible defect.
- * - POST /api/public/scores: accepted and recorded.
+ * - POST /api/public/scores: accepted and recorded (faults.scoreStatus can reject it).
  * - Legacy routes (/api/public/ingestion, GET /api/public/traces/<id>) answer
  *   404 so any legacy traffic becomes a visible defect.
  *
@@ -60,6 +60,8 @@ export type RecorderFaults = {
 	 * takes longer than a short step budget.
 	 */
 	acceptanceDelayMs: number;
+	/** Status for POST /api/public/scores (default 200); the score is still recorded. */
+	scoreStatus: number;
 };
 
 export type RecordedSpan = {
@@ -70,7 +72,7 @@ export type RecordedSpan = {
 	attributes?: Array<{ key: string; value?: Record<string, unknown> }>;
 };
 
-function spansFromBody(body: unknown): RecordedSpan[] {
+export function spansFromBody(body: unknown): RecordedSpan[] {
 	const out: RecordedSpan[] = [];
 	const payload = body as
 		| {
@@ -121,6 +123,7 @@ export class LangfuseRecorder {
 			v2Status: 200,
 			v1Status: 404,
 			acceptanceDelayMs: 0,
+			scoreStatus: 200,
 		};
 	}
 
@@ -293,6 +296,14 @@ export class LangfuseRecorder {
 					auth: request.headers.authorization ?? null,
 					body,
 				});
+				if (this.faults.scoreStatus !== 200) {
+					record.outcome = `score-rejected-${this.faults.scoreStatus}`;
+					finish(
+						this.faults.scoreStatus,
+						JSON.stringify({ message: "synthetic score failure" }),
+					);
+					return;
+				}
 				record.outcome = "score-accepted";
 				finish(200, "{}");
 				return;

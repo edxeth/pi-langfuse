@@ -14,6 +14,10 @@ import {
 	type PayloadPolicyConfig,
 	shapeRawTraceRecord,
 } from "./payload-policy.js";
+import {
+	boundRawRequestSummaryRecord,
+	isRawRequestSummaryRecord,
+} from "./raw-request-summary.js";
 import { recordRuntimeError } from "./runtime-diagnostics.js";
 
 // Raw traces hold private prompt/tool data, so new files are owner-only and
@@ -64,13 +68,36 @@ function scheduleFlush() {
 	});
 }
 
+// Each pass either cuts the summary or ends the loop, and a cut only removes
+// text or whole messages, so the loop converges in a few passes. The limit
+// turns a violated assumption into a dropped record, never an unbounded or
+// unshaped one.
+const MAX_SUMMARY_SHAPE_PASSES = 32;
+
+/**
+ * Shape a record for writing. A provider-request summary is bounded after
+ * shaping, because shaping can lengthen it, and shaped again after every cut,
+ * because a cut can expose a secret-shaped token that the next pass redacts.
+ * The returned record is always the result of a shaping pass.
+ */
+function shapeFinalRecord(config: RawTraceConfig, record: RawTraceRecord) {
+	let shaped = shapeRawTraceRecord(config, record);
+	if (!isRawRequestSummaryRecord(shaped)) return shaped;
+	for (let pass = 0; pass < MAX_SUMMARY_SHAPE_PASSES; pass += 1) {
+		const bounded = boundRawRequestSummaryRecord(shaped);
+		if (bounded === shaped) return shaped;
+		shaped = shapeRawTraceRecord(config, bounded);
+	}
+	throw new Error(
+		`raw provider summary did not settle within ${MAX_SUMMARY_SHAPE_PASSES} shaping passes`,
+	);
+}
+
 function flushQueue() {
-	while (writeQueue.length > 0) {
-		const item = writeQueue.shift();
-		if (!item) break;
+	for (let item = writeQueue.shift(); item; item = writeQueue.shift()) {
 		const { path, config, record } = item;
 		try {
-			const sanitizedRecord = shapeRawTraceRecord(config, record);
+			const sanitizedRecord = shapeFinalRecord(config, record);
 			appendPrivateTrace(
 				path,
 				`${JSON.stringify(sanitizedRecord, jsonReplacer)}\n`,
@@ -210,6 +237,8 @@ export function appendRawTrace(
 	record: RawTraceRecord,
 ) {
 	if (!config.rawTraceEnabled || !sessionFile) return;
+	// An unusable identity policy must never fall back to raw records.
+	if (config.identityError) return;
 	const path = rawTracePathForSession(sessionFile, config.rawTraceDir);
 	if (!path) return;
 	try {

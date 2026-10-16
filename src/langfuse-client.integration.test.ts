@@ -688,6 +688,52 @@ describe("langfuse v5 local runtime", () => {
 		}
 	});
 
+	it("runs work without span context for an observation that has already ended", async () => {
+		const server = createServer((_request, response) => {
+			response.statusCode = 200;
+			response.setHeader("content-type", "application/json");
+			response.end("{}");
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", () => resolve());
+		});
+
+		try {
+			const address = server.address() as AddressInfo;
+			const runtime = await getRuntime({
+				...baseConfig,
+				host: `http://127.0.0.1:${address.port}`,
+			});
+			const trace = runtime.trace({ name: "pi-agent" });
+			const prompt = runtime.span({
+				name: "agent.prompt",
+				traceId: trace.id,
+			});
+			const turn = runtime.span({
+				name: "agent.turn",
+				traceId: trace.id,
+				parentObservationId: prompt.id,
+			});
+			const activeTraceId = () =>
+				otelTrace.getActiveSpan()?.spanContext().traceId;
+			const live = runtime.withContext(turn, activeTraceId);
+			turn.end();
+			const work = vi.fn(activeTraceId);
+
+			const afterEnd = runtime.withContext(turn, work);
+
+			expect(live).toBe(trace.id);
+			expect(work).toHaveBeenCalledTimes(1);
+			expect(afterEnd).toBeUndefined();
+		} finally {
+			await shutdownClient();
+			await new Promise<void>((resolve, reject) => {
+				server.close((error) => (error ? reject(error) : resolve()));
+			});
+		}
+	});
+
 	it("exports data prefixes unchanged without automatic media uploads", async () => {
 		const restoreTimeouts = setRuntimeTimeoutsForTest({ exportMs: 200 });
 		const previousMediaEnv = process.env.LANGFUSE_MEDIA_UPLOAD_ENABLED;

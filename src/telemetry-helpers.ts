@@ -2,7 +2,18 @@ import { createHash } from "node:crypto";
 import { basename } from "node:path";
 import { isCaptureEnabled } from "./capture-policy.js";
 import type { Config } from "./config.js";
-import type { PiUsage, PromptState } from "./lifecycle-types.js";
+import type {
+	AssistantOutput,
+	AssistantToolCallOutput,
+	PiUsage,
+	PromptState,
+} from "./lifecycle-types.js";
+import {
+	fitRawRequestSummary,
+	type MessageSummary,
+	RAW_REQUEST_SUMMARY_MAX_MESSAGES,
+	rawSummaryItems,
+} from "./raw-request-summary.js";
 import { appendRawTrace } from "./raw-trace.js";
 import { redactionMetadata, redactString } from "./redaction.js";
 import type { SessionState } from "./session-state.js";
@@ -80,6 +91,83 @@ export function extractTextFromContent(
 		.filter((item) => item?.type === "text" && item.text)
 		.map((item) => item.text)
 		.join("\n");
+}
+
+function isVisibleThinkingBlock(
+	item: unknown,
+): item is { type: "thinking"; thinking: string } {
+	return (
+		isRecord(item) &&
+		item.type === "thinking" &&
+		item.redacted !== true &&
+		typeof item.thinking === "string" &&
+		item.thinking.length > 0
+	);
+}
+
+/** Extract visible thinking blocks without copying their opaque replay fields. */
+function extractVisibleThinkingFromContent(content: unknown): string {
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter(isVisibleThinkingBlock)
+		.map((block) => block.thinking)
+		.join("\n");
+}
+
+function textBlocksFromContent(
+	content: unknown,
+): Array<{ type: string; text?: string }> | undefined {
+	if (!Array.isArray(content)) return undefined;
+	const blocks: Array<{ type: string; text?: string }> = [];
+	for (const item of content) {
+		if (!isRecord(item) || typeof item.type !== "string") continue;
+		blocks.push({
+			type: item.type,
+			...(typeof item.text === "string" ? { text: item.text } : {}),
+		});
+	}
+	return blocks;
+}
+
+function isToolCallBlock(item: unknown): item is AssistantToolCallOutput {
+	return (
+		isRecord(item) &&
+		item.type === "toolCall" &&
+		typeof item.id === "string" &&
+		typeof item.name === "string" &&
+		item.arguments !== undefined
+	);
+}
+
+/** Extract normalized Pi tool calls without retaining provider replay signatures. */
+function extractToolCallsFromContent(
+	content: unknown,
+): AssistantToolCallOutput[] {
+	if (!Array.isArray(content)) return [];
+	return content
+		.filter(isToolCallBlock)
+		.map(({ id, name, arguments: args }) => ({ id, name, arguments: args }));
+}
+
+/**
+ * Project Pi assistant content and optional stream fallbacks into distinct
+ * answer, tool-call, and visible-thinking fields.
+ */
+export function projectAssistantOutput(
+	content: unknown,
+	streamingText = "",
+	streamingThinking = "",
+): AssistantOutput {
+	const finalText = extractTextFromContent(
+		textBlocksFromContent(content),
+	).trim();
+	const thinking =
+		extractVisibleThinkingFromContent(content) || streamingThinking;
+	return {
+		text: finalText || streamingText,
+		tool_calls: extractToolCallsFromContent(content),
+		...(thinking ? { thinking } : {}),
+	};
 }
 
 export function summarizeMessageContent(config: Config, content: unknown) {
@@ -194,9 +282,12 @@ function providerRequestSourceMarker(
 }
 
 /** Wire item count of recognized contents: items length, one for text. */
-function requestItemCount(contents: ProviderRequestContents | undefined) {
-	if (!contents) return undefined;
+function providerRequestItemCount(contents: ProviderRequestContents) {
 	return "items" in contents ? contents.items.length : 1;
+}
+
+function requestItemCount(contents: ProviderRequestContents | undefined) {
+	return contents ? providerRequestItemCount(contents) : undefined;
 }
 
 /** Bounded display summary of recognized request contents. */
@@ -226,9 +317,9 @@ function summarizeProviderRequestForDisplay(
 }
 
 /**
- * Summarize captured provider request contents for any recognized shape with
- * the same per-item bounds and redaction chat messages receive. Used for raw
- * provider_request summaries and generation inputs alike.
+ * Summarize captured provider request contents for generation inputs using
+ * the existing full per-item bounds and redaction. Raw provider records use a
+ * separate compact preview path.
  */
 export function summarizeProviderRequestContents(
 	config: Config,
@@ -253,6 +344,85 @@ export function summarizeProviderRequestContents(
 		),
 		systemInstruction,
 	);
+}
+
+function summarizeRawContents(
+	config: Config,
+	contents: ProviderRequestContents,
+): MessageSummary[] | undefined {
+	if (contents.field === "contents") {
+		return summarizeGoogleContents(config, contents.items, undefined);
+	}
+	if (contents.field === "input-items") {
+		return summarizeProviderRequestInput(config, contents.items);
+	}
+	if (contents.field === "input-text") {
+		return summarizeProviderRequestInput(config, contents.text);
+	}
+	return summarizeMessages(
+		config,
+		contents.items as Array<{ role?: string; content?: unknown }>,
+	);
+}
+
+/** Per-message summary of the request, with the item count it was cut from. */
+function rawRequestSummarySource(
+	config: Config,
+	contents: ProviderRequestContents | undefined,
+	fallbackMessages: unknown,
+): { summary: MessageSummary[] | undefined; count: number } | undefined {
+	if (contents) {
+		return {
+			summary: summarizeRawContents(config, contents),
+			count: providerRequestItemCount(contents),
+		};
+	}
+	if (!Array.isArray(fallbackMessages)) return undefined;
+	return {
+		summary: summarizeProviderRequestMessages(config, fallbackMessages),
+		count: fallbackMessages.length,
+	};
+}
+
+/**
+ * Compact only raw provider-request summaries. Generation inputs continue to
+ * use their existing full per-message summarizer and wire-input measure.
+ */
+export function summarizeRawProviderRequestContents(
+	config: Config,
+	contents: ProviderRequestContents | undefined,
+	fallbackMessages: unknown,
+	systemInstruction?: string,
+): {
+	messagesSummary: MessageSummary[] | undefined;
+	messagesSummaryOmitted: number | undefined;
+	systemPrompt: string | undefined;
+} {
+	const source = rawRequestSummarySource(config, contents, fallbackMessages);
+	if (!source?.summary) {
+		return {
+			messagesSummary: undefined,
+			messagesSummaryOmitted: undefined,
+			systemPrompt: undefined,
+		};
+	}
+
+	const systemInstructionText = systemInstruction
+		? telemetryText(config, systemInstruction, config.traceInputMaxChars)
+		: undefined;
+	const selected = source.summary.slice(-RAW_REQUEST_SUMMARY_MAX_MESSAGES);
+	// The writer shapes this summary again and enforces the same bounds on
+	// the final result; see `raw-request-summary.ts`.
+	const fitted = fitRawRequestSummary({
+		systemPrompt: systemInstructionText,
+		messages: selected,
+		omitted: Math.max(0, source.count - selected.length),
+	});
+	return {
+		messagesSummary: rawSummaryItems(fitted),
+		messagesSummaryOmitted: fitted.omitted,
+		systemPrompt: fitted.systemPrompt,
+	};
 }
 
 /** Prepend a bounded system-instruction summary item when one was observed. */
@@ -427,6 +597,13 @@ export interface CapturedProviderRequest {
 	 * counted into the wire metrics of the contents.
 	 */
 	systemInstruction: string | undefined;
+	/**
+	 * Names of payload fields that make the request depend on conversation
+	 * state held by the provider and not observed here (`previous_response_id`,
+	 * `conversation`). Their ids are never recorded. Undefined when the payload
+	 * carried none, so the observed contents are self-contained.
+	 */
+	serverSideContext: string[] | undefined;
 }
 
 /** Google requests keep the system prompt in `config.systemInstruction`. */
@@ -465,23 +642,46 @@ function anthropicSystemInstruction(
 }
 
 /**
+ * Responses requests may keep the system prompt in the top-level
+ * `instructions` string beside `input` (the Codex Responses protocol always
+ * does); other Responses adapters send it as a leading developer/system input
+ * item instead, which the captured items already contain.
+ */
+function responsesInstructions(
+	payload: Record<string, unknown>,
+): string | undefined {
+	const value = payload.instructions;
+	return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/**
+ * Where each recognized contents shape keeps its separate system instruction.
+ * Context messages are Pi's own, not a provider payload, so they have none.
+ */
+const SYSTEM_INSTRUCTION_BY_FIELD: Record<
+	ProviderRequestContents["field"],
+	(payload: Record<string, unknown>) => string | undefined
+> = {
+	contents: googleSystemInstruction,
+	messages: anthropicSystemInstruction,
+	"context-messages": () => undefined,
+	"input-items": responsesInstructions,
+	"input-text": responsesInstructions,
+};
+
+/**
  * The separate system instruction observed beside the recognized contents,
- * if the shape keeps one: Google `config.systemInstruction` or the Anthropic
- * top-level `system`. It is recorded as its own field, never counted into
- * the wire metrics of the contents.
+ * if the shape keeps one: Google `config.systemInstruction`, the Anthropic
+ * top-level `system`, or the Responses top-level `instructions`. It is
+ * recorded as its own field, never counted into the wire metrics of the
+ * contents.
  */
 function systemInstructionFrom(
 	payload: Record<string, unknown> | undefined,
 	contents: ProviderRequestContents | undefined,
 ): string | undefined {
 	if (!payload || !contents) return undefined;
-	if (contents.field === "contents") {
-		return googleSystemInstruction(payload);
-	}
-	if (contents.field === "messages") {
-		return anthropicSystemInstruction(payload);
-	}
-	return undefined;
+	return SYSTEM_INSTRUCTION_BY_FIELD[contents.field](payload);
 }
 
 /**
@@ -530,7 +730,27 @@ export function captureProviderRequest(
 				: undefined,
 		estimatedBytes: estimateJsonBytes(captured),
 		systemInstruction: systemInstructionFrom(payload, contents),
+		serverSideContext: serverSideContextFrom(payload),
 	};
+}
+
+/** Payload fields through which a Responses request references stored context. */
+const SERVER_SIDE_CONTEXT_FIELDS = ["previous_response_id", "conversation"];
+
+/**
+ * The provider hook sees the payload before any later reduction, so only the
+ * references present in it are reported. Null and empty values are absent.
+ */
+function serverSideContextFrom(
+	payload: Record<string, unknown> | undefined,
+): string[] | undefined {
+	if (!payload) return undefined;
+	const present = SERVER_SIDE_CONTEXT_FIELDS.filter((field) => {
+		const value = payload[field];
+		if (typeof value === "string") return value.length > 0;
+		return isRecord(value);
+	});
+	return present.length > 0 ? present : undefined;
 }
 
 /**
@@ -594,6 +814,8 @@ export interface ProviderRequestTraceInput {
 	payloadSummary: string | undefined;
 	/** Bounded display summary of the request contents (summary mode). */
 	messagesSummary: unknown;
+	/** Number of raw-summary messages omitted by the window or byte budget. */
+	messagesSummaryOmitted?: number;
 }
 
 /**
@@ -611,6 +833,7 @@ export function providerRequestTraceRecord(
 		requestSource: input.requestSource,
 		messageCount: input.capture.messageCount,
 		estimatedBytes: input.capture.estimatedBytes,
+		serverSideContext: input.capture.serverSideContext,
 		payloadCaptured: input.payloadCaptured,
 		payloadSummary: input.payloadSummary,
 	};
@@ -630,6 +853,7 @@ export function providerRequestTraceRecord(
 		...base,
 		captureMode: "summary",
 		messagesSummary: input.messagesSummary,
+		messagesSummaryOmitted: input.messagesSummaryOmitted,
 		fullMessagesOmitted:
 			input.capture.captured !== undefined ? true : undefined,
 		...systemPrompt,

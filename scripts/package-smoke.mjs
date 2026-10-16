@@ -29,7 +29,72 @@ function runNpm(args, cwd) {
 	});
 }
 
+// Runtime isolation: the packaged code must never see user config or
+// credentials. Package acquisition (npm) keeps the ambient environment; every
+// load of the installed code uses this owned, synthetic one.
+const isolationRoot = join(temporaryRoot, "runtime");
+const isolatedHome = join(isolationRoot, "home");
+const isolatedAgentDir = join(isolationRoot, "agent");
+const isolatedSessionDir = join(isolationRoot, "sessions");
+const isolatedRawTraceDir = join(isolationRoot, "raw-traces");
+const syntheticLoopbackHost = "http://127.0.0.1:9";
+const isolatedOverrides = {
+	HOME: isolatedHome,
+	USERPROFILE: isolatedHome,
+	PI_CODING_AGENT_DIR: isolatedAgentDir,
+	PI_CODING_AGENT_SESSION_DIR: isolatedSessionDir,
+	PI_LANGFUSE_CONFIG: join(isolationRoot, "pi-langfuse.json"),
+	PI_LANGFUSE_RAW_TRACE_DIR: isolatedRawTraceDir,
+	PI_LANGFUSE_RAW_TRACE: "0",
+	PI_LANGFUSE_AUTOSTART: "0",
+	PI_LANGFUSE_IDENTITY: "raw",
+	LANGFUSE_PUBLIC_KEY: "pk-lf-smoke-isolation",
+	LANGFUSE_SECRET_KEY: "sk-lf-smoke-isolation",
+	LANGFUSE_BASE_URL: syntheticLoopbackHost,
+};
+
+function isScrubbedKey(key) {
+	return (
+		key.startsWith("LANGFUSE_") ||
+		key.startsWith("PI_LANGFUSE_") ||
+		key === "PI_CODING_AGENT_DIR" ||
+		key === "PI_CODING_AGENT_SESSION_DIR" ||
+		key === "PI_PACKAGE_DIR"
+	);
+}
+
+/** Ambient environment minus every Langfuse/Pi path key, plus the pins. */
+function isolatedRuntimeEnvironment() {
+	return {
+		...Object.fromEntries(
+			Object.entries(process.env).filter(([key]) => !isScrubbedKey(key)),
+		),
+		...isolatedOverrides,
+	};
+}
+
+function assertIsolated(environment, label) {
+	for (const [key, expected] of Object.entries(isolatedOverrides)) {
+		if (environment[key] !== expected) {
+			throw new Error(`${label}: runtime isolation did not pin ${key}`);
+		}
+	}
+	for (const key of Object.keys(environment)) {
+		if (isScrubbedKey(key) && !(key in isolatedOverrides)) {
+			throw new Error(`${label}: unexpected ${key} in the isolated runtime`);
+		}
+	}
+}
+
 try {
+	for (const directory of [
+		isolatedHome,
+		isolatedAgentDir,
+		isolatedSessionDir,
+		isolatedRawTraceDir,
+	]) {
+		mkdirSync(directory, { recursive: true });
+	}
 	const packageJson = JSON.parse(
 		readFileSync(join(projectRoot, "package.json"), "utf8"),
 	);
@@ -66,7 +131,18 @@ try {
 	);
 	writeFileSync(
 		join(fixtureDirectory, "load-entrypoint.mjs"),
-		`import registerExtension from "pi-langfuse";
+		`import { readFileSync } from "node:fs";
+import registerExtension from "pi-langfuse";
+import { readPackageVersion } from "pi-langfuse/dist/package-version.js";
+
+// The OpenTelemetry resource reports this version, so the compiled layout
+// must resolve the installed package's own manifest.
+const installedManifest = JSON.parse(
+	readFileSync(new URL("./node_modules/pi-langfuse/package.json", import.meta.url), "utf8"),
+);
+if (readPackageVersion() !== installedManifest.version) {
+	throw new Error("compiled package did not resolve its own version");
+}
 
 const commands = [];
 const pi = {
@@ -98,6 +174,9 @@ if (!commands.includes("langfuse-status")) {
 		"node_modules",
 		"pi-langfuse",
 	);
+	if (existsSync(join(installedPackageDirectory, "docs", "plans"))) {
+		throw new Error("installed package must not contain local working plans");
+	}
 	for (const documentationPath of [
 		"docs/architecture.md",
 		"docs/extension-settings-best-practices.md",
@@ -129,11 +208,14 @@ if (!commands.includes("langfuse-status")) {
 	if (!existsSync(join(installedPackageDirectory, "src", "index.ts"))) {
 		throw new Error("installed package is missing src/index.ts");
 	}
+	const compiledLoadEnvironment = isolatedRuntimeEnvironment();
+	assertIsolated(compiledLoadEnvironment, "compiled entrypoint load");
 	execFileSync(
 		process.execPath,
 		[join(fixtureDirectory, "load-entrypoint.mjs")],
 		{
 			cwd: fixtureDirectory,
+			env: compiledLoadEnvironment,
 			stdio: "inherit",
 		},
 	);
@@ -155,18 +237,20 @@ if (!commands.includes("langfuse-status")) {
 			`installed Pi does not expose the extension loader at ${loaderPath}`,
 		);
 	}
-	const isolatedAgentDir = join(temporaryRoot, "agent-dir");
-	mkdirSync(isolatedAgentDir, { recursive: true });
-	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-	const savedLangfuseEnv = [];
-	process.env.PI_CODING_AGENT_DIR = isolatedAgentDir;
+	// Pin the in-process environment too, and restore every touched key.
+	const savedEnvironment = new Map();
 	for (const key of Object.keys(process.env)) {
-		if (key.startsWith("LANGFUSE_")) {
-			savedLangfuseEnv.push([key, process.env[key]]);
+		if (isScrubbedKey(key) || key in isolatedOverrides) {
+			savedEnvironment.set(key, process.env[key]);
 			delete process.env[key];
 		}
 	}
+	for (const key of Object.keys(isolatedOverrides)) {
+		if (!savedEnvironment.has(key)) savedEnvironment.set(key, undefined);
+	}
+	Object.assign(process.env, isolatedOverrides);
 	try {
+		assertIsolated(process.env, "Pi loader");
 		const { loadExtensions } = await import(pathToFileURL(loaderPath));
 		const { extensions, errors } = await loadExtensions(
 			installedManifestEntries.map((entry) =>
@@ -191,6 +275,7 @@ if (!commands.includes("langfuse-status")) {
 			"langfuse:toggle",
 			"langfuse-status",
 			"langfuse-test",
+			"langfuse-score",
 			"langfuse-privacy",
 		]) {
 			if (!loadedCommands.includes(expectedCommand)) {
@@ -200,13 +285,10 @@ if (!commands.includes("langfuse-status")) {
 			}
 		}
 	} finally {
-		if (previousAgentDir === undefined) {
-			delete process.env.PI_CODING_AGENT_DIR;
-		} else {
-			process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-		}
-		for (const [key, value] of savedLangfuseEnv) {
-			process.env[key] = value;
+		for (const key of Object.keys(isolatedOverrides)) delete process.env[key];
+		for (const [key, value] of savedEnvironment) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
 		}
 	}
 	console.log(

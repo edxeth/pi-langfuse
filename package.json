@@ -11,6 +11,7 @@
 	"files": [
 		"dist",
 		"docs",
+		"!docs/plans",
 		"src"
 	],
 	"scripts": {
@@ -62,12 +63,15 @@
 		"@opentelemetry/context-async-hooks": "^2.11.0",
 		"@opentelemetry/core": "^2.11.0",
 		"@opentelemetry/exporter-trace-otlp-http": "^0.220.0",
+		"@opentelemetry/otlp-exporter-base": "^0.220.0",
 		"@opentelemetry/otlp-transformer": "0.220.0",
+		"@opentelemetry/resources": "^2.11.0",
 		"@opentelemetry/sdk-trace-base": "^2.11.0"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.3.5",
 		"@types/node": "^22.0.0",
+		"@vitest/coverage-v8": "2.1.9",
 		"husky": "^9.1.7",
 		"lint-staged": "^16.4.0",
 		"release-it": "^18.1.1",
@@ -77,6 +81,11 @@
 	"peerDependencies": {
 		"@axnic/pi-extension-settings": "^0.2.0",
 		"@earendil-works/pi-coding-agent": ">=0.87.1"
+	},
+	"overrides": {
+		"release-it": {
+			"undici": "6.29.1"
+		}
 	},
 	"peerDependenciesMeta": {
 		"@axnic/pi-extension-settings": {

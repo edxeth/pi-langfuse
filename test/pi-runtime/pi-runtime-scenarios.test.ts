@@ -486,6 +486,43 @@ describe("pi runtime scenarios (real Pi SDK sessions)", () => {
 		);
 	});
 
+	it("records one raw prompt start per distinct announced prompt when identical starts overlap a pending start", async () => {
+		useBoundedTimeouts();
+		const announced: string[] = [];
+		const announcer: InlineExtension = (pi: ExtensionAPI) => {
+			pi.on("before_agent_start", (event) => {
+				if (event.messageType === "user") announced.push(event.prompt);
+			});
+		};
+		const runtimeCase = await createRuntimeCase({
+			name: "overlapping-prompt-starts",
+			provider: { kind: "faux" },
+			extensionFactories: [announcer],
+		});
+		activeCase = runtimeCase;
+		const { piAi, faux, session } = runtimeCase;
+		faux?.setResponses([
+			piAi.fauxAssistantMessage([piAi.fauxText("synthetic answer")]),
+		]);
+
+		// The locked Pi (1.3.0) announces a prompt before it rejects a concurrent
+		// one as busy, so all three public calls reach the extension. Only the
+		// extension's own ownership is asserted: this test does not claim any
+		// change to which concurrent prompts Pi accepts.
+		const outcomes = await Promise.allSettled(
+			["A", "B", "B"].map((prompt) => session.prompt(prompt)),
+		);
+		drainRawTraceQueue();
+
+		expect(announced).toEqual(["A", "B", "B"]);
+		expect(outcomes[0]?.status).toBe("fulfilled");
+		expect(
+			readRawTraceRecords(runtimeCase.rawTraceDir)
+				.filter((record) => record.type === "agent_prompt_start")
+				.map((record) => record.prompt),
+		).toEqual(["A", "B"]);
+	});
+
 	it("credits compaction usage exactly once and records no phantom wire records for unrecognized payloads", async () => {
 		useBoundedTimeouts();
 		const pad = "context padding for compaction. ".repeat(400);
@@ -739,5 +776,215 @@ describe("pi runtime scenarios (real Pi SDK sessions)", () => {
 		}
 
 		expect(sinkText).not.toContain(SECRET_KEY);
+	});
+
+	it("captures separated assistant output and request-boundary turn inputs through real Pi events", async () => {
+		useBoundedTimeouts();
+		const toolCallId = "call-structured-1";
+		const toolArguments = { query: "LOOKUP-ARGUMENT" };
+		const firstAnswerText = "assistant text before tool";
+		const thinkingText = "visible synthetic thinking";
+		const toolOutput = "synthetic prior tool result";
+		const finalAnswer = "final synthetic answer";
+		const providerUsage = usageOf(12, 5, 0);
+		const provider = await startPiMessagesServer((call) =>
+			call === 1
+				? {
+						events: [
+							{ type: "thinking_start", contentIndex: 0 },
+							{
+								type: "thinking_delta",
+								contentIndex: 0,
+								delta: thinkingText,
+							},
+							{
+								type: "thinking_end",
+								contentIndex: 0,
+								content: thinkingText,
+							},
+							{ type: "text_start", contentIndex: 1 },
+							{
+								type: "text_delta",
+								contentIndex: 1,
+								delta: firstAnswerText,
+							},
+							{
+								type: "text_end",
+								contentIndex: 1,
+								content: firstAnswerText,
+							},
+							{
+								type: "toolcall_start",
+								contentIndex: 2,
+								id: toolCallId,
+								toolName: "probe_lookup",
+							},
+							{
+								type: "toolcall_delta",
+								contentIndex: 2,
+								delta: JSON.stringify(toolArguments),
+							},
+							{
+								type: "toolcall_end",
+								contentIndex: 2,
+								toolCall: {
+									type: "toolCall",
+									id: toolCallId,
+									name: "probe_lookup",
+									arguments: toolArguments,
+								},
+							},
+							{ type: "done", reason: "toolCall", usage: providerUsage },
+						],
+					}
+				: { events: textAnswerEvents(finalAnswer, providerUsage) },
+		);
+		activeProviderServers.push(provider);
+		const runtimeCase = await createRuntimeCase({
+			name: "structured-output-turn-input",
+			provider: { kind: "pi-messages", baseUrl: provider.url },
+			settings: {
+				"capture-policy": "full-debug",
+				...UNLIMITED_PAYLOAD,
+			},
+			customToolsFactory: (piAiModule: PiAiModule) => [
+				{
+					name: "probe_lookup",
+					label: "Probe Lookup",
+					description: "Returns fixed synthetic content.",
+					parameters: piAiModule.Type.Object({
+						query: piAiModule.Type.String(),
+					}),
+					execute: async () => ({
+						content: [{ type: "text", text: toolOutput }],
+						details: { kind: "synthetic" },
+					}),
+				},
+			],
+		});
+		activeCase = runtimeCase;
+		const { session } = runtimeCase;
+
+		const events = captureSessionEvents(session);
+		await session.prompt("initial synthetic user request");
+		await session.waitForIdle();
+		session.dispose();
+		drainRawTraceQueue();
+		expect(provider.requests).toHaveLength(2);
+
+		const endedMessages = events
+			.filter((event) => event.type === "message_end")
+			.map((event) => event.message as Record<string, unknown> | undefined)
+			.filter((message): message is Record<string, unknown> =>
+				Boolean(message),
+			);
+		expect(
+			endedMessages.some(
+				(message) =>
+					message.role === "user" &&
+					JSON.stringify(message.content).includes(
+						"initial synthetic user request",
+					),
+			),
+		).toBe(true);
+		expect(
+			endedMessages.some(
+				(message) =>
+					message.role === "toolResult" &&
+					message.toolCallId === toolCallId &&
+					JSON.stringify(message.content).includes(toolOutput),
+			),
+		).toBe(true);
+
+		const spans = latestSpanPerId(decodedAcceptedSpans(runtimeCase.recorder));
+		const byName = spansByName(spans);
+		const turns = byName["agent.turn"] ?? [];
+		expect(turns).toHaveLength(2);
+		const turnByIndex = new Map(
+			turns.map((span) => [Number(observationMeta(span, "turnIndex")), span]),
+		);
+		const firstTurn = turnByIndex.get(0);
+		const secondTurn = turnByIndex.get(1);
+		if (!firstTurn || !secondTurn)
+			throw new Error("both request turn spans are required");
+		const firstInput = JSON.stringify(
+			firstTurn.attrs["langfuse.observation.input"],
+		);
+		const secondInput = JSON.stringify(
+			secondTurn.attrs["langfuse.observation.input"],
+		);
+		expect(firstInput).toContain("initial synthetic user request");
+		expect(firstInput).not.toContain(toolOutput);
+		expect(secondInput).toContain(toolCallId);
+		expect(secondInput).toContain(toolOutput);
+		expect(secondInput).not.toContain("initial synthetic user request");
+
+		const generationByTurn = new Map(
+			(byName["llm-response"] ?? []).map((span) => [
+				Number(observationMeta(span, "turnIndex")),
+				span,
+			]),
+		);
+		const firstGeneration = generationByTurn.get(0);
+		const secondGeneration = generationByTurn.get(1);
+		if (!firstGeneration || !secondGeneration)
+			throw new Error("both request generation spans are required");
+		const parseOutput = (span: DecodedSpan) => {
+			const value = span.attrs["langfuse.observation.output"];
+			return typeof value === "string" ? JSON.parse(value) : value;
+		};
+		expect(parseOutput(firstGeneration)).toEqual({
+			text: firstAnswerText,
+			tool_calls: [
+				{
+					id: toolCallId,
+					name: "probe_lookup",
+					arguments: toolArguments,
+				},
+			],
+			thinking: thinkingText,
+		});
+		expect(parseOutput(secondGeneration)).toEqual({
+			text: finalAnswer,
+			tool_calls: [],
+		});
+		expect(String(observationMeta(firstGeneration, "hasThinking"))).toBe(
+			"true",
+		);
+		expect(
+			firstGeneration.attrs["langfuse.observation.metadata.thinking"],
+		).toBe(undefined);
+		expect(parseOutput(firstTurn)).toEqual(parseOutput(firstGeneration));
+		expect(parseOutput(secondTurn)).toEqual(parseOutput(secondGeneration));
+
+		const raw = readRawTraceRecords(runtimeCase.rawTraceDir);
+		const firstRawOutput = raw.find(
+			(record) =>
+				record.type === "assistant_output" &&
+				(record.turnIndex as number | undefined) === 0,
+		);
+		const rawToolCall = raw.find(
+			(record) =>
+				record.type === "tool_call" && record.toolCallId === toolCallId,
+		);
+		if (!firstRawOutput || !rawToolCall)
+			throw new Error("assistant and tool-call raw records are required");
+		expect(firstRawOutput).toMatchObject({
+			text: firstAnswerText,
+			thinking: thinkingText,
+			toolCalls: [
+				{
+					id: toolCallId,
+					name: "probe_lookup",
+					arguments: toolArguments,
+				},
+			],
+		});
+		expect(rawToolCall.toolCallId).toBe(
+			(firstRawOutput.toolCalls as Array<{ id: string }>)[0]?.id,
+		);
+		expect(
+			byName["agent.prompt"]?.[0]?.attrs["langfuse.observation.output"],
+		).toBe(finalAnswer);
 	});
 });

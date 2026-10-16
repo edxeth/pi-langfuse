@@ -19,7 +19,7 @@ import {
 	latestSpanPerId,
 	spansByName,
 } from "./otlp.js";
-import type { RecorderRecord } from "./recorder.js";
+import { type RecorderRecord, spansFromBody } from "./recorder.js";
 
 /**
  * Transport-fault regressions at the real Pi seam under the single-export
@@ -207,9 +207,16 @@ describe("pi runtime transport recovery (single OTLP export pipeline)", () => {
 		expect(getReadRequests(recorder)).toEqual([]);
 
 		// --- recovery without another prompt: one rejected attempt, one accepted retry ---
+		// The exporter coalesces spans that wait for a free slot, so the number
+		// of requests varies; what must hold is one rejection, one accepted
+		// request per remaining send, and every span accepted exactly once.
 		expect(recorder.postsRejected).toBe(1);
-		expect(recorder.postsAccepted).toBe(6);
-		expect(recorder.postsTotal).toBe(7);
+		expect(recorder.postsTotal).toBe(recorder.postsAccepted + 1);
+		const acceptedSpanIds = recorder
+			.acceptedPosts()
+			.flatMap((post) => [...spanIdsOf(post)]);
+		expect(acceptedSpanIds).toHaveLength(6);
+		expect(new Set(acceptedSpanIds).size).toBe(6);
 		const rejectedPost = otlpPosts(recorder).find((post) =>
 			post.outcome.startsWith("rejected-"),
 		);
@@ -327,16 +334,34 @@ describe("pi runtime transport recovery (single OTLP export pipeline)", () => {
 		const recorder = runtimeCase.recorder;
 
 		// --- bounded transport behavior: initial attempt plus three retries ---
-		expect(recorder.postsTotal).toBe(24);
+		// Spans that wait for a free exporter slot leave as one coalesced
+		// export, so the export count varies from one to six; each failed
+		// export makes exactly four attempts and reports once.
+		const failedExports = diagnostics.messages.length;
+		expect(failedExports).toBeGreaterThanOrEqual(1);
+		expect(failedExports).toBeLessThanOrEqual(6);
+		expect(recorder.postsTotal).toBe(4 * failedExports);
+		// Coalescing changes how spans share requests, not who is sent: each of
+		// the six ended observations is posted in exactly four attempts.
+		const attemptsBySpan = new Map<string, number>();
+		for (const record of recorder.records) {
+			if (!record.path.includes("/otel/v1/traces")) continue;
+			for (const span of spansFromBody(record.body)) {
+				attemptsBySpan.set(
+					span.spanId,
+					(attemptsBySpan.get(span.spanId) ?? 0) + 1,
+				);
+			}
+		}
+		expect([...attemptsBySpan.values()]).toEqual([4, 4, 4, 4, 4, 4]);
 		expect(recorder.postsAccepted).toBe(0);
 		expect(recorder.index.size).toBe(0);
 		expect(getReadRequests(recorder)).toEqual([]);
 		expect(recorder.legacyHits).toEqual([]);
 
 		// --- the failure surfaces deterministically through the subscription ---
-		// Six ended observations each report one failed export, not an
-		// additional wrapper warning from forceFlush.
-		expect(diagnostics.messages).toHaveLength(6);
+		// Each failed export reports once, not once per ended observation and
+		// not as an additional wrapper warning from forceFlush.
 		const message = diagnostics.messages[0] ?? "";
 		expect(message).toContain("Langfuse OTLP export failed");
 		expect(message).toContain("HTTP 503");
@@ -390,17 +415,20 @@ describe("pi runtime transport recovery (single OTLP export pipeline)", () => {
 
 		const recorder = runtimeCase.recorder;
 
-		expect(recorder.postsTotal).toBe(6);
-		expect(
-			new Set(otlpPosts(recorder).flatMap((post) => [...spanIdsOf(post)])).size,
-		).toBe(6);
+		// One attempt per export, never a retry: every span appears in exactly
+		// one request, however many spans the exporter coalesced into it.
+		const postedSpanIds = otlpPosts(recorder).flatMap((post) => [
+			...spanIdsOf(post),
+		]);
+		expect(postedSpanIds).toHaveLength(6);
+		expect(new Set(postedSpanIds).size).toBe(6);
 		expect(recorder.postsAccepted).toBe(0);
 		expect(recorder.index.size).toBe(0);
 		// A partial rejection is reported in-band; no read API is consulted.
 		expect(getReadRequests(recorder)).toEqual([]);
 
-		// Each ended observation reports its rejection exactly once.
-		expect(diagnostics.messages).toHaveLength(6);
+		// Each export reports its rejection exactly once.
+		expect(diagnostics.messages).toHaveLength(recorder.postsTotal);
 		const message = diagnostics.messages[0] ?? "";
 		expect(message).toContain("rejected 1 span(s)");
 		expect(message).toContain("not retried (OTLP partial success)");

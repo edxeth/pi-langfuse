@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { InlineExtension } from "@earendil-works/pi-coding-agent";
+import { afterEach } from "vitest";
 import registerExtension from "../../src/index.js";
 import { shutdownClient } from "../../src/langfuse-client.js";
 import { drainRawTraceQueue } from "../../src/raw-trace.js";
@@ -32,10 +33,17 @@ import { type LangfuseRecorder, startLangfuseRecorder } from "./recorder.js";
  *
  * The inherited environment is pinned and scrubbed before the Pi SDK is
  * imported. Nothing here touches the network beyond 127.0.0.1.
+ *
+ * A case is owned by a lease taken before the first `await`. Vitest does not
+ * cancel a timed-out test, so an abandoned `createRuntimeCase` can resume
+ * after the test failed; the lease lets teardown discard it (see
+ * `RuntimeCaseLease`). An `afterEach` hook registered here closes any case
+ * the test never assigned to its own teardown variable.
  */
 
 type ScenarioSession = {
 	prompt(text: string): Promise<void>;
+	abort(): Promise<void>;
 	waitForIdle(): Promise<void>;
 	dispose(): void;
 	compact(instructions?: string): Promise<unknown>;
@@ -135,6 +143,11 @@ export type RuntimeCaseOptions = {
 	customToolsFactory?: (piAi: PiAiModule) => Array<Record<string, unknown>>;
 	/** Pi settings merged into the in-memory SettingsManager. */
 	piSettings?: Record<string, unknown>;
+	/**
+	 * Bound on how long closing the case waits for in-flight startup or Pi
+	 * work to stop (default 5 s).
+	 */
+	closeTimeoutMs?: number;
 };
 
 export type DiscoverySummary = {
@@ -155,7 +168,11 @@ export type RuntimeCase = {
 	piAi: PiAiModule;
 	faux: FauxProviderHandle | undefined;
 	discovery: DiscoverySummary;
-	/** Restore the environment, close servers, and remove all case files. */
+	/**
+	 * Stop Pi work, restore the environment, close servers, and remove all
+	 * case files. Idempotent. After it runs the case refuses further session
+	 * calls, so a test body that outlived a timeout cannot prompt it.
+	 */
 	teardown(): Promise<void>;
 };
 
@@ -268,10 +285,315 @@ async function importPiAi(): Promise<PiAiModule> {
 	return import(pathToFileURL(entry).href) as Promise<PiAiModule>;
 }
 
+/** Default bound on how long a caller waits for a case to finish closing. */
+const CASE_CLOSE_TIMEOUT_MS = 5_000;
+
+const openLeases = new Set<RuntimeCaseLease>();
+
+/**
+ * Cleanup failures that surfaced after the caller of `close()` had already
+ * given up on its bound. The next `closeOpenRuntimeCases` or
+ * `createRuntimeCase` reports them, so a late failure is never lost.
+ */
+const abandonedCleanupFailures: unknown[] = [];
+
+/**
+ * Ownership of one runtime case, taken before the first `await`.
+ *
+ * Vitest does not cancel a timed-out test's promise: `createRuntimeCase` keeps
+ * running after the test failed and its hooks ran, and so does any session
+ * call the test started. The lease is how teardown reaches that work.
+ *
+ * - `close()` marks the lease closed at once. A startup checks the mark after
+ *   every `await`, disposes what it created, and rejects instead of returning
+ *   a case nobody owns. The guarded session refuses new calls.
+ * - Every promise a guarded session call returns is tracked from invocation to
+ *   settlement. The SDK's `abort()` resolves once the SDK is idle, which is
+ *   earlier than a prompt held in `before_agent_start` (the SDK does not count
+ *   it as running yet) and than a tool that ignores abort, so abort alone does
+ *   not stop owned work. Cleanup waits for every tracked call.
+ * - The lease owns the process environment and the case directory. They are
+ *   released only after the work has settled, never because a caller's bound
+ *   expired. A bounded `close()` that times out is a caller failure; cleanup
+ *   keeps running in the background, the lease stays open, and no new case can
+ *   start until it finishes.
+ */
+class RuntimeCaseLease {
+	closing = false;
+	private starting = true;
+	private disposal: Promise<void> | undefined;
+	private closure: Promise<void> | undefined;
+	private readonly startupSettled: Promise<void>;
+	private settleStartup: () => void = () => {};
+	private restoreEnvironment: () => void = () => {};
+	private readonly inFlight = new Set<Promise<void>>();
+	private abortFailure: { error: unknown } | undefined;
+	private waitingCallers = 0;
+	caseDir: string | undefined;
+	recorder: LangfuseRecorder | undefined;
+	session: ScenarioSession | undefined;
+	private sessionDisposed = false;
+
+	constructor(
+		readonly name: string,
+		private readonly closeTimeoutMs: number,
+	) {
+		this.startupSettled = new Promise<void>((resolve) => {
+			this.settleStartup = resolve;
+		});
+	}
+
+	useEnvironment(restore: () => void) {
+		this.restoreEnvironment = restore;
+	}
+
+	/** Throws when the owner closed the case while startup was awaiting. */
+	assertOpen(step: string) {
+		if (this.closing) {
+			throw new Error(
+				`runtime case ${this.name} was closed before startup finished (after ${step}); the abandoned startup was discarded`,
+			);
+		}
+	}
+
+	/** Startup finished and handed the case to its test. */
+	markReady() {
+		this.assertOpen("session creation");
+		this.starting = false;
+		this.settleStartup();
+	}
+
+	/** Startup ended with an error, after the lease disposed its resources. */
+	markFailed() {
+		this.starting = false;
+		this.settleStartup();
+	}
+
+	/** Follow `work` until it settles, whether it resolves or rejects. */
+	private track(work: PromiseLike<unknown>) {
+		const settled: Promise<void> = Promise.resolve(work)
+			.then(
+				() => undefined,
+				() => undefined,
+			)
+			.finally(() => this.inFlight.delete(settled));
+		this.inFlight.add(settled);
+	}
+
+	/** Wrap the session so a closed case refuses calls and open calls are tracked. */
+	guardSession(session: ScenarioSession): ScenarioSession {
+		this.session = session;
+		return new Proxy(session, {
+			get: (target, property) => {
+				const value = Reflect.get(target, property, target);
+				if (typeof value !== "function") return value;
+				return (...args: unknown[]) => {
+					if (property === "dispose") {
+						this.sessionDisposed = true;
+					} else if (this.closing && property !== "abort") {
+						throw new Error(
+							`runtime case ${this.name} is closed; session.${String(property)}() was refused`,
+						);
+					}
+					const result = value.apply(target, args);
+					if (isThenable(result)) this.track(result);
+					return result;
+				};
+			},
+		});
+	}
+
+	/**
+	 * Close the case within the caller's bound. A bound that expires rejects
+	 * the caller only: the cleanup keeps running and keeps owning the case.
+	 * Calling `close()` again joins the same cleanup.
+	 */
+	async close() {
+		this.closing = true;
+		this.closure ??= this.closeToCompletion();
+		this.waitingCallers += 1;
+		try {
+			await withTimeout(
+				this.closure,
+				this.closeTimeoutMs,
+				`runtime case ${this.name} did not finish closing within ${this.closeTimeoutMs} ms (startup or Pi work is still running); the case keeps its environment and directory, and no new case can start, until that work settles`,
+			);
+		} finally {
+			this.waitingCallers -= 1;
+		}
+	}
+
+	private async closeToCompletion() {
+		try {
+			// An in-flight startup disposes itself at its next check.
+			if (this.starting) await this.startupSettled;
+			await this.dispose();
+		} catch (error) {
+			// With no caller waiting, nobody else would see this failure.
+			if (this.waitingCallers === 0) abandonedCleanupFailures.push(error);
+			throw error;
+		}
+	}
+
+	/** Stop the session, wait for its work to settle, then release. Idempotent. */
+	dispose(): Promise<void> {
+		this.closing = true;
+		this.disposal ??= this.disposeOnce();
+		return this.disposal;
+	}
+
+	private async disposeOnce() {
+		const failures: unknown[] = [];
+		const attempt = async (step: () => unknown) => {
+			try {
+				await step();
+			} catch (error) {
+				failures.push(error);
+			}
+		};
+
+		await attempt(() => this.stopSession());
+		// No bound here: releasing the environment while a call is still running
+		// would hand it to the next case. Callers bound their own wait.
+		await this.settleTrackedWork();
+		if (this.abortFailure) failures.push(this.abortFailure.error);
+		await attempt(async () => {
+			drainRawTraceQueue();
+			await shutdownClient();
+		});
+		// Nothing owned is running now, so the environment can be restored.
+		await attempt(() => this.restoreEnvironment());
+		try {
+			await attempt(() => this.recorder?.close());
+		} finally {
+			try {
+				if (this.caseDir)
+					rmSync(this.caseDir, { recursive: true, force: true });
+			} catch (error) {
+				failures.push(error);
+			}
+			openLeases.delete(this);
+		}
+		if (failures.length === 1) throw failures[0];
+		if (failures.length > 1) {
+			throw new AggregateError(
+				failures,
+				`runtime case ${this.name} cleanup failed`,
+			);
+		}
+	}
+
+	/** Abort and dispose the SDK session; they do not join its pending work. */
+	private stopSession() {
+		const session = this.session;
+		if (!session) return;
+		if (!this.sessionDisposed) {
+			this.sessionDisposed = true;
+			// Abort first: it settles the run the SDK knows about. Its failure
+			// is reported after the join, once the session has gone quiet.
+			const aborting = session.abort();
+			aborting.catch((error: unknown) => {
+				this.abortFailure = { error };
+			});
+			// Abort waits for SDK idleness, so it too can outlive the bound.
+			this.track(aborting);
+		}
+		session.dispose();
+	}
+
+	private async settleTrackedWork() {
+		while (this.inFlight.size > 0) {
+			await Promise.all([...this.inFlight]);
+		}
+	}
+}
+
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"then" in value &&
+		typeof value.then === "function"
+	);
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string) {
+	let timer: NodeJS.Timeout | undefined;
+	const expired = new Promise<never>((_resolve, reject) => {
+		timer = setTimeout(() => reject(new Error(message)), ms);
+	});
+	return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Close every case that is still open. Registered as an `afterEach` hook below
+ * so a case is released even when its test timed out before `activeCase` was
+ * assigned and the test's own teardown had nothing to call.
+ */
+export async function closeOpenRuntimeCases() {
+	const results = await Promise.allSettled(
+		[...openLeases].map((lease) => lease.close()),
+	);
+	const failures = [
+		...results.flatMap((result) =>
+			result.status === "rejected" ? [result.reason] : [],
+		),
+		...abandonedCleanupFailures.splice(0),
+	];
+	if (failures.length > 0) {
+		throw new AggregateError(failures, "runtime case cleanup failed");
+	}
+}
+
+afterEach(closeOpenRuntimeCases);
+
 export async function createRuntimeCase(
 	options: RuntimeCaseOptions,
 ): Promise<RuntimeCase> {
+	const open = openLeases.values().next().value;
+	if (open) {
+		throw new Error(
+			`createRuntimeCase(${options.name}): runtime case ${open.name} is still open; tear it down before starting another`,
+		);
+	}
+	if (abandonedCleanupFailures.length > 0) {
+		throw new AggregateError(
+			abandonedCleanupFailures.splice(0),
+			`createRuntimeCase(${options.name}): an earlier runtime case failed to clean up after its caller stopped waiting`,
+		);
+	}
+	// Everything up to the first `await` runs synchronously, so the lease and
+	// its environment are in place before any teardown can observe the case.
+	const lease = new RuntimeCaseLease(
+		options.name,
+		options.closeTimeoutMs ?? CASE_CLOSE_TIMEOUT_MS,
+	);
+	openLeases.add(lease);
+	try {
+		const runtimeCase = await startRuntimeCase(options, lease);
+		lease.markReady();
+		return runtimeCase;
+	} catch (error) {
+		try {
+			await lease.dispose();
+		} catch (disposeError) {
+			throw new AggregateError(
+				[error, disposeError],
+				`runtime case ${options.name} failed to start and its cleanup also failed`,
+			);
+		} finally {
+			lease.markFailed();
+		}
+		throw error;
+	}
+}
+
+async function startRuntimeCase(
+	options: RuntimeCaseOptions,
+	lease: RuntimeCaseLease,
+): Promise<RuntimeCase> {
 	const caseDir = mkdtempSync(join(tmpdir(), `pi-runtime-${options.name}-`));
+	lease.caseDir = caseDir;
 	const agentDir = join(caseDir, "agent");
 	// The workspace sits below an owned ancestor directory so the harness can
 	// plant discovery bait where Pi's ancestor walks (context files, .agents
@@ -284,6 +606,12 @@ export async function createRuntimeCase(
 	for (const dir of [agentDir, workDir, home, sessionDir, rawTraceDir]) {
 		mkdirSync(dir, { recursive: true });
 	}
+	lease.useEnvironment(
+		isolateEnvironment({
+			...baseCaseEnv(agentDir, home),
+			...(options.env ?? {}),
+		}),
+	);
 
 	// Discovery bait, planted only in directories this case owns: an ancestor
 	// context file on the workspace's walk chain and skills in every user- and
@@ -315,10 +643,8 @@ export async function createRuntimeCase(
 	);
 
 	const recorder = await startLangfuseRecorder(options.name);
-	const restoreEnvironment = isolateEnvironment({
-		...baseCaseEnv(agentDir, home),
-		...(options.env ?? {}),
-	});
+	lease.recorder = recorder;
+	lease.assertOpen("recorder start");
 
 	const provider = options.provider;
 	const providerBaseUrl =
@@ -386,145 +712,137 @@ export async function createRuntimeCase(
 		)}\n`,
 	);
 
-	try {
-		const { pi, piAi } = await loadPiSdk();
+	const { pi, piAi } = await loadPiSdk();
+	lease.assertOpen("Pi SDK import");
 
-		const modelRuntime = await pi.ModelRuntime.create({
-			authPath: join(agentDir, "auth.json"),
-			modelsPath: providerModelsPath,
-			allowModelNetwork: false,
-			refreshOnCreate: false,
-		});
+	const modelRuntime = await pi.ModelRuntime.create({
+		authPath: join(agentDir, "auth.json"),
+		modelsPath: providerModelsPath,
+		allowModelNetwork: false,
+		refreshOnCreate: false,
+	});
+	lease.assertOpen("model runtime creation");
 
-		let faux: FauxProviderHandle | undefined;
-		const model =
-			provider.kind === "pi-messages"
-				? modelRuntime.getModel("probe-gw", "probe-model")
-				: (() => {
-						const handle = piAi.fauxProvider({
-							provider: "faux-local",
-							api: "faux-api",
-							models: [
-								{
-									id: "faux-model",
-									name: "Faux Model",
-									reasoning: false,
-									input: ["text"],
-									cost: {
-										input: 0.1,
-										output: 0.2,
-										cacheRead: 0,
-										cacheWrite: 0,
-									},
-									contextWindow: 128000,
-									maxTokens: 8192,
+	let faux: FauxProviderHandle | undefined;
+	const model =
+		provider.kind === "pi-messages"
+			? modelRuntime.getModel("probe-gw", "probe-model")
+			: (() => {
+					const handle = piAi.fauxProvider({
+						provider: "faux-local",
+						api: "faux-api",
+						models: [
+							{
+								id: "faux-model",
+								name: "Faux Model",
+								reasoning: false,
+								input: ["text"],
+								cost: {
+									input: 0.1,
+									output: 0.2,
+									cacheRead: 0,
+									cacheWrite: 0,
 								},
-							],
-						});
-						modelRuntime.registerNativeProvider(handle.provider);
-						faux = handle;
-						return handle.getModel();
-					})();
-		if (!model) {
-			throw new Error("deterministic provider model was not resolvable");
-		}
-
-		const resourceLoader = new pi.DefaultResourceLoader({
-			cwd: workDir,
-			agentDir,
-			extensionFactories: [
-				registerExtension as unknown as InlineExtension,
-				...(options.extensionFactories ?? []),
-			],
-			// No user, project, ancestor, or package resource may reach the
-			// session; only inline factories load (the loader appends them even
-			// with noExtensions). Package discovery has no flag; it is bounded
-			// by the empty temporary agent dir and asserted via the results.
-			noExtensions: true,
-			noSkills: true,
-			noPromptTemplates: true,
-			noThemes: true,
-			noContextFiles: true,
-		});
-		await resourceLoader.reload();
-
-		// Every discovery category must be empty BEFORE the session or the
-		// provider is used, in every case. A failure here aborts the case; the
-		// catch below still restores the environment and closes the recorder.
-		const discovery: DiscoverySummary = {
-			skills: resourceLoader.getSkills().skills.length,
-			prompts: resourceLoader.getPrompts().prompts.length,
-			themes: resourceLoader.getThemes().themes.length,
-			agentsFiles: resourceLoader.getAgentsFiles().agentsFiles.length,
-			extensions: resourceLoader.getExtensions().extensions.length,
-			extensionErrors: resourceLoader.getExtensions().errors.length,
-		};
-		const expectedExtensions = 1 + (options.extensionFactories?.length ?? 0);
-		if (
-			discovery.skills !== 0 ||
-			discovery.prompts !== 0 ||
-			discovery.themes !== 0 ||
-			discovery.agentsFiles !== 0 ||
-			discovery.extensionErrors > 0 ||
-			discovery.extensions !== expectedExtensions
-		) {
-			throw new Error(
-				`isolated case discovery is not clean: ${JSON.stringify({
-					...discovery,
-					errors: resourceLoader.getExtensions().errors,
-					agentsFiles: resourceLoader.getAgentsFiles().agentsFiles,
-				})}`,
-			);
-		}
-
-		const settingsManager = pi.SettingsManager.inMemory({
-			retry: {
-				enabled: true,
-				maxRetries: 3,
-				baseDelayMs: 5,
-				maxAgentDelayMs: 60,
-			},
-			...(options.piSettings ?? {}),
-		});
-
-		const { session } = await pi.createAgentSession({
-			cwd: workDir,
-			agentDir,
-			model,
-			thinkingLevel: "off",
-			modelRuntime,
-			resourceLoader,
-			sessionManager: pi.SessionManager.create(workDir, sessionDir),
-			settingsManager,
-			customTools: options.customToolsFactory?.(piAi),
-		});
-
-		return {
-			caseDir,
-			rawTraceDir,
-			sessionDir,
-			recorder,
-			session,
-			piAi,
-			faux,
-			discovery,
-			async teardown() {
-				try {
-					drainRawTraceQueue();
-					await shutdownClient();
-				} finally {
-					restoreEnvironment();
-					await recorder.close();
-					rmSync(caseDir, { recursive: true, force: true });
-				}
-			},
-		};
-	} catch (error) {
-		restoreEnvironment();
-		await recorder.close();
-		rmSync(caseDir, { recursive: true, force: true });
-		throw error;
+								contextWindow: 128000,
+								maxTokens: 8192,
+							},
+						],
+					});
+					modelRuntime.registerNativeProvider(handle.provider);
+					faux = handle;
+					return handle.getModel();
+				})();
+	if (!model) {
+		throw new Error("deterministic provider model was not resolvable");
 	}
+
+	const resourceLoader = new pi.DefaultResourceLoader({
+		cwd: workDir,
+		agentDir,
+		extensionFactories: [
+			registerExtension as unknown as InlineExtension,
+			...(options.extensionFactories ?? []),
+		],
+		// No user, project, ancestor, or package resource may reach the
+		// session; only inline factories load (the loader appends them even
+		// with noExtensions). Package discovery has no flag; it is bounded
+		// by the empty temporary agent dir and asserted via the results.
+		noExtensions: true,
+		noSkills: true,
+		noPromptTemplates: true,
+		noThemes: true,
+		noContextFiles: true,
+	});
+	await resourceLoader.reload();
+	lease.assertOpen("resource loading");
+
+	// Every discovery category must be empty BEFORE the session or the
+	// provider is used, in every case. A failure here aborts the case; the
+	// caller still disposes the lease, restoring the environment and closing
+	// the recorder.
+	const discovery: DiscoverySummary = {
+		skills: resourceLoader.getSkills().skills.length,
+		prompts: resourceLoader.getPrompts().prompts.length,
+		themes: resourceLoader.getThemes().themes.length,
+		agentsFiles: resourceLoader.getAgentsFiles().agentsFiles.length,
+		extensions: resourceLoader.getExtensions().extensions.length,
+		extensionErrors: resourceLoader.getExtensions().errors.length,
+	};
+	const expectedExtensions = 1 + (options.extensionFactories?.length ?? 0);
+	if (
+		discovery.skills !== 0 ||
+		discovery.prompts !== 0 ||
+		discovery.themes !== 0 ||
+		discovery.agentsFiles !== 0 ||
+		discovery.extensionErrors > 0 ||
+		discovery.extensions !== expectedExtensions
+	) {
+		throw new Error(
+			`isolated case discovery is not clean: ${JSON.stringify({
+				...discovery,
+				errors: resourceLoader.getExtensions().errors,
+				agentsFiles: resourceLoader.getAgentsFiles().agentsFiles,
+			})}`,
+		);
+	}
+
+	const settingsManager = pi.SettingsManager.inMemory({
+		retry: {
+			enabled: true,
+			maxRetries: 3,
+			baseDelayMs: 5,
+			maxAgentDelayMs: 60,
+		},
+		...(options.piSettings ?? {}),
+	});
+
+	const { session } = await pi.createAgentSession({
+		cwd: workDir,
+		agentDir,
+		model,
+		thinkingLevel: "off",
+		modelRuntime,
+		resourceLoader,
+		sessionManager: pi.SessionManager.create(workDir, sessionDir),
+		settingsManager,
+		customTools: options.customToolsFactory?.(piAi),
+	});
+	// Register the session with the lease before checking it, so a case closed
+	// during session creation still aborts and disposes this session.
+	const guardedSession = lease.guardSession(session);
+	lease.assertOpen("session creation");
+
+	return {
+		caseDir,
+		rawTraceDir,
+		sessionDir,
+		recorder,
+		session: guardedSession,
+		piAi,
+		faux,
+		discovery,
+		teardown: () => lease.close(),
+	};
 }
 
 export type SessionEvent = { type: string } & Record<string, unknown>;

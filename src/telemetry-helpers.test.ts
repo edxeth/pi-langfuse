@@ -3,7 +3,9 @@ import type { Config } from "./config.js";
 import {
 	captureProviderRequest,
 	extractTextFromContent,
+	projectAssistantOutput,
 	providerRequestIdentity,
+	providerRequestTraceRecord,
 	summarizeMessages,
 	summarizeProviderPayload,
 	summarizeProviderRequestInput,
@@ -677,6 +679,116 @@ describe("installed provider payload shapes", () => {
 		).toBeUndefined();
 	});
 
+	it("extracts the Responses top-level instructions beside input items or text", () => {
+		const items = captureProviderRequest({
+			model: "m",
+			instructions: "RESPONSES-instructions",
+			input: [{ role: "user", content: "RESPONSES-user turn" }],
+		});
+		expect(items.contents?.field).toBe("input-items");
+		expect(items.systemInstruction).toBe("RESPONSES-instructions");
+		expect(items.messageCount).toBe(1);
+		expect(
+			captureProviderRequest({
+				model: "m",
+				instructions: "RESPONSES-instructions",
+				input: "plain text",
+			}).systemInstruction,
+		).toBe("RESPONSES-instructions");
+		// Without instructions, or with a non-text value, nothing is claimed.
+		expect(
+			captureProviderRequest({ model: "m", input: [] }).systemInstruction,
+		).toBeUndefined();
+		expect(
+			captureProviderRequest({ model: "m", instructions: { a: 1 }, input: [] })
+				.systemInstruction,
+		).toBeUndefined();
+	});
+
+	it("keeps one-character Responses instructions and stored-context references, and ignores empty ones", () => {
+		const input = [{ role: "user", content: "continue" }];
+
+		expect(
+			captureProviderRequest({ model: "m", instructions: "x", input })
+				.systemInstruction,
+		).toBe("x");
+		expect(
+			captureProviderRequest({ model: "m", instructions: "", input })
+				.systemInstruction,
+		).toBeUndefined();
+		expect(
+			captureProviderRequest({ model: "m", previous_response_id: "x", input })
+				.serverSideContext,
+		).toEqual(["previous_response_id"]);
+	});
+
+	it("takes one-character visible thinking over the streamed fallback, and the fallback for empty thinking", () => {
+		expect(
+			projectAssistantOutput(
+				[{ type: "thinking", thinking: "a" }],
+				"",
+				"STREAMED",
+			).thinking,
+		).toBe("a");
+		expect(
+			projectAssistantOutput(
+				[{ type: "thinking", thinking: "" }],
+				"",
+				"STREAMED",
+			).thinking,
+		).toBe("STREAMED");
+	});
+
+	it("records which stored-context references a request carries, never their ids", () => {
+		const input = [{ role: "user", content: "continue" }];
+		const both = captureProviderRequest({
+			model: "m",
+			input,
+			previous_response_id: "resp_SECRETID",
+			conversation: { id: "conv_SECRETID" },
+		});
+		expect(both.serverSideContext).toEqual([
+			"previous_response_id",
+			"conversation",
+		]);
+		expect(
+			captureProviderRequest({ model: "m", input, conversation: "conv_x" })
+				.serverSideContext,
+		).toEqual(["conversation"]);
+		for (const extra of [
+			{},
+			{ previous_response_id: null },
+			{ previous_response_id: "" },
+			{ conversation: null },
+			{ conversation: 5 },
+		]) {
+			expect(
+				captureProviderRequest({ model: "m", input, ...extra })
+					.serverSideContext,
+			).toBeUndefined();
+		}
+
+		// Both record modes carry the names, and no id.
+		for (const captureMode of ["full", "summary"] as const) {
+			const record = providerRequestTraceRecord({
+				captureMode,
+				turnIndex: 0,
+				model: "m",
+				requestSource: "payload.input",
+				capture: both,
+				systemInstruction: undefined,
+				payloadCaptured: false,
+				payloadSummary: undefined,
+				messagesSummary: undefined,
+			});
+			expect(record.serverSideContext).toEqual([
+				"previous_response_id",
+				"conversation",
+			]);
+			expect(JSON.stringify(record)).not.toContain("SECRETID");
+		}
+	});
+
 	it("summarizes Anthropic payloads with the system prompt as the leading item", () => {
 		const summary = summarizeProviderPayload(
 			config,
@@ -949,5 +1061,78 @@ describe("provider request identity", () => {
 
 		expect(providerRequestIdentity(cyclic)).toBeUndefined();
 		expect(providerRequestIdentity({ value: 1n })).toBeUndefined();
+	});
+});
+
+describe("assistant output projection", () => {
+	it("separates answer text, tool calls, and visible thinking", () => {
+		expect(
+			projectAssistantOutput([
+				{ type: "thinking", thinking: "plan first", thinkingSignature: "sig" },
+				{ type: "text", text: "  the answer  " },
+				{
+					type: "toolCall",
+					id: "call-1",
+					name: "read",
+					arguments: { path: "a.txt" },
+					thoughtSignature: "opaque",
+				},
+			]),
+		).toEqual({
+			text: "the answer",
+			tool_calls: [
+				{ id: "call-1", name: "read", arguments: { path: "a.txt" } },
+			],
+			thinking: "plan first",
+		});
+	});
+
+	it("joins several visible thinking blocks and skips redacted and empty ones", () => {
+		expect(
+			projectAssistantOutput([
+				{ type: "thinking", thinking: "one" },
+				{ type: "thinking", thinking: "hidden", redacted: true },
+				{ type: "thinking", thinking: "" },
+				{ type: "thinking", thinking: 7 },
+				{ type: "thinking", thinking: "two" },
+			]).thinking,
+		).toBe("one\ntwo");
+	});
+
+	it("ignores content items that are not well-formed blocks", () => {
+		expect(
+			projectAssistantOutput([
+				null,
+				"text",
+				{ text: "no type" },
+				{ type: 5, text: "numeric type" },
+				{ type: "text", text: 9 },
+				{ type: "text", text: "kept" },
+			]),
+		).toEqual({ text: "kept", tool_calls: [] });
+	});
+
+	it.each([
+		["a missing id", { type: "toolCall", name: "x", arguments: {} }],
+		["a missing name", { type: "toolCall", id: "i", arguments: {} }],
+		["missing arguments", { type: "toolCall", id: "i", name: "x" }],
+		[
+			"another block type",
+			{ type: "tool_use", id: "i", name: "x", arguments: {} },
+		],
+	])("does not report a tool call with %s", (_label, block) => {
+		expect(projectAssistantOutput([block]).tool_calls).toEqual([]);
+	});
+
+	it("falls back to streamed text and thinking when the content has none", () => {
+		expect(projectAssistantOutput("not blocks", "streamed", "mused")).toEqual({
+			text: "streamed",
+			tool_calls: [],
+			thinking: "mused",
+		});
+		expect(projectAssistantOutput(undefined)).toEqual({
+			text: "",
+			tool_calls: [],
+		});
 	});
 });

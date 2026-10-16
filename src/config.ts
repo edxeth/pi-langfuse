@@ -1,5 +1,14 @@
 import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
+import {
+	IDENTITY_MODES,
+	type IdentityConfig,
+	type IdentityMode,
+	parseIdentityMode,
+	parseStrictBoolean,
+} from "./identity.js";
+import { describeError, loadOrCreateIdentitySalt } from "./identity-salt.js";
 import {
 	type CapturePolicy,
 	DEFAULT_CAPTURE_POLICY,
@@ -17,7 +26,7 @@ export type ConfigSource =
 	| "defaults"
 	| "mixed";
 
-export interface Config {
+export interface Config extends IdentityConfig {
 	publicKey: string;
 	secretKey: string;
 	host: string;
@@ -54,25 +63,60 @@ export interface Config {
 	rawTraceEnabled: boolean;
 	rawTraceDir: string;
 	rawTraceProviderRequestMode: RawTraceProviderRequestMode;
+	/**
+	 * Operator-declared license text recorded in training exports. Empty means
+	 * undeclared; the export does not verify it.
+	 */
+	exportLicense?: string;
+	/**
+	 * Operator-declared training consent: "unknown" (default), "granted", or
+	 * "denied". Validated at export time; never inferred from scans or licenses.
+	 */
+	exportConsent?: string;
+	/**
+	 * Set when the config file holds an export declaration of the wrong JSON
+	 * type. Only a `--format` export refuses on it; live telemetry is unaffected.
+	 */
+	exportLicenseError?: string;
+	exportConsentError?: string;
 	localAutostart: boolean;
 	localAutostartDir: string;
 	localAutostartHealthUrl: string;
 	localAutostartTimeoutMs: number;
 }
 
-function readConfigJson(path: string): Partial<Config> {
-	if (!existsSync(path)) return {};
+interface ConfigFileState {
+	values: Partial<Config> & Record<string, unknown>;
+	/** The file exists but could not be read as a JSON object. */
+	unreadable: boolean;
+}
+
+function readConfigJson(path: string): ConfigFileState {
+	if (!existsSync(path)) return { values: {}, unreadable: false };
 	try {
 		const content = readFileSync(path, "utf-8");
-		return JSON.parse(content) as Partial<Config>;
+		const parsed = JSON.parse(content) as unknown;
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+			return {
+				// SAFETY: the guard above proved a JSON object; each key is
+				// validated where it is read, as before this change.
+				values: parsed as Partial<Config> & Record<string, unknown>,
+				unreadable: false,
+			};
+		}
+		recordRuntimeError(`Failed to load ${path}`, "not a JSON object");
 	} catch (e) {
 		recordRuntimeError(`Failed to load ${path}`, e);
-		return {};
 	}
+	return { values: {}, unreadable: true };
+}
+
+function loadConfigFileState(): ConfigFileState {
+	return readConfigJson(getConfigFilePath());
 }
 
 function loadConfigFile(): Partial<Config> {
-	return readConfigJson(getConfigFilePath());
+	return loadConfigFileState().values;
 }
 
 function clampNumber(
@@ -313,9 +357,158 @@ function resolveCapturePolicy(
 	return sawInvalid ? "metadata-only" : DEFAULT_CAPTURE_POLICY;
 }
 
+function isBlank(value: unknown) {
+	return (
+		value === undefined || (typeof value === "string" && value.trim() === "")
+	);
+}
+
+/** First non-blank candidate in precedence order, or undefined. */
+function firstConfigured(
+	...candidates: Array<{ source: string; value: unknown }>
+) {
+	return candidates.find(({ value }) => !isBlank(value));
+}
+
+const FAIL_CLOSED_IDENTITY = {
+	identityMode: "pseudonymous",
+	identityKeepRepo: false,
+} as const;
+
+/** One checked identity setting, or the reason it is unusable. */
+type Resolved<T> = { value: T } | { error: string };
+
+function resolveIdentityMode(
+	settings: Partial<SettingsValues>,
+	file: ConfigFileState,
+): Resolved<IdentityMode> {
+	const mode = firstConfigured(
+		{ source: "identity-mode setting", value: settings["identity-mode"] },
+		{
+			source: "identityMode in the config file",
+			value: file.values.identityMode,
+		},
+		{ source: "PI_LANGFUSE_IDENTITY", value: process.env.PI_LANGFUSE_IDENTITY },
+	);
+	// An unreadable file outranks the environment, so its mode is unknown
+	// unless the settings panel already decided.
+	if (file.unreadable && isBlank(settings["identity-mode"])) {
+		return {
+			error: `the config file ${getConfigFilePath()} is not a readable JSON object, so the identity mode cannot be determined`,
+		};
+	}
+	const parsedMode = mode ? parseIdentityMode(mode.value) : "raw";
+	if (!parsedMode) {
+		return {
+			error: `${mode?.source} must be one of ${IDENTITY_MODES.join(", ")}`,
+		};
+	}
+	return { value: parsedMode };
+}
+
+function resolveKeepRepository(
+	settings: Partial<SettingsValues>,
+	file: ConfigFileState,
+): Resolved<boolean> {
+	const keepRepo = firstConfigured(
+		{
+			source: "identity-keep-repo setting",
+			value: settings["identity-keep-repo"],
+		},
+		{
+			source: "identityKeepRepo in the config file",
+			value: file.values.identityKeepRepo,
+		},
+		{
+			source: "PI_LANGFUSE_IDENTITY_KEEP_REPO",
+			value: process.env.PI_LANGFUSE_IDENTITY_KEEP_REPO,
+		},
+	);
+	const parsedKeepRepo = keepRepo ? parseStrictBoolean(keepRepo.value) : false;
+	if (parsedKeepRepo === undefined) {
+		return { error: `${keepRepo?.source} must be true or false` };
+	}
+	return { value: parsedKeepRepo };
+}
+
+function failClosedIdentity(message: string): IdentityConfig {
+	return { ...FAIL_CLOSED_IDENTITY, identityError: message };
+}
+
+function pseudonymousIdentity(keepRepo: boolean): IdentityConfig {
+	try {
+		return {
+			identityMode: "pseudonymous",
+			identityKeepRepo: keepRepo,
+			identitySalt: loadOrCreateIdentitySalt(getConfigFilePath()),
+			identityHome: homedir(),
+		};
+	} catch (error) {
+		return failClosedIdentity(describeError(error));
+	}
+}
+
+/**
+ * Resolve the identity policy with strict validation. A setting that cannot
+ * be understood never falls back to raw output: the result carries
+ * `identityError`, and telemetry, raw traces, and exports refuse to run.
+ * Only a missing configuration resolves to the legacy raw default, and raw
+ * mode never reads, creates, or rewrites the salt.
+ */
+function resolveIdentity(
+	settings: Partial<SettingsValues>,
+	file: ConfigFileState,
+): IdentityConfig {
+	const mode = resolveIdentityMode(settings, file);
+	if ("error" in mode) return failClosedIdentity(mode.error);
+	const keepRepo = resolveKeepRepository(settings, file);
+	if ("error" in keepRepo) return failClosedIdentity(keepRepo.error);
+	if (mode.value === "raw") {
+		return { identityMode: "raw", identityKeepRepo: keepRepo.value };
+	}
+	return pseudonymousIdentity(keepRepo.value);
+}
+
+/**
+ * Resolve the operator's export declarations. A file value outranks the
+ * environment. Only a missing (or blank) declaration gets the default; a
+ * present value of the wrong JSON type is reported instead of being coerced
+ * to a different declaration (`["granted"]` must not become "granted", `{}`
+ * must not become "[object Object]").
+ */
+function resolveExportDeclarations(
+	file: Record<string, unknown>,
+): Pick<
+	Config,
+	| "exportLicense"
+	| "exportConsent"
+	| "exportLicenseError"
+	| "exportConsentError"
+> {
+	const declared = (key: "exportLicense" | "exportConsent", env: string) => {
+		const value = Object.hasOwn(file, key) ? file[key] : process.env[env];
+		if (value === undefined) return { text: "" };
+		if (typeof value !== "string") {
+			return {
+				text: "",
+				error: `${key} in the config file must be a string, not ${value === null ? "null" : Array.isArray(value) ? "an array" : typeof value}`,
+			};
+		}
+		return { text: value.trim() };
+	};
+	const license = declared("exportLicense", "PI_LANGFUSE_EXPORT_LICENSE");
+	const consent = declared("exportConsent", "PI_LANGFUSE_EXPORT_CONSENT");
+	return {
+		exportLicense: license.text,
+		exportConsent: consent.text || "unknown",
+		...(license.error ? { exportLicenseError: license.error } : {}),
+		...(consent.error ? { exportConsentError: consent.error } : {}),
+	};
+}
+
 export function resolveConfig(settings: Partial<SettingsValues>): Config {
-	const fileConfig = loadConfigFile() as Partial<Config> &
-		Record<string, unknown>;
+	const fileState = loadConfigFileState();
+	const fileConfig = fileState.values;
 	const host =
 		settings["base-url"] ||
 		fileConfig.host ||
@@ -506,6 +699,7 @@ export function resolveConfig(settings: Partial<SettingsValues>): Config {
 			1_000_000,
 		),
 		redactionEnabled,
+		...resolveIdentity(settings, fileState),
 		redactionAdditionalSecrets: parseList(
 			fileConfig.redactionAdditionalSecrets ??
 				process.env.PI_LANGFUSE_REDACTION_SECRETS,
@@ -526,6 +720,7 @@ export function resolveConfig(settings: Partial<SettingsValues>): Config {
 			parseProviderRequestMode(process.env.PI_LANGFUSE_RAW_PROVIDER_REQUEST) ??
 			parseProviderRequestMode(fileConfig.rawTraceProviderRequestMode) ??
 			"summary",
+		...resolveExportDeclarations(fileConfig),
 		localAutostart,
 		localAutostartDir: String(
 			fileConfig.localAutostartDir ??
@@ -548,7 +743,12 @@ export function resolveConfig(settings: Partial<SettingsValues>): Config {
 }
 
 export function canTrace(config: Config): boolean {
-	return config.enabled && !!config.publicKey && !!config.secretKey;
+	return (
+		config.enabled &&
+		!config.identityError &&
+		!!config.publicKey &&
+		!!config.secretKey
+	);
 }
 
 export function getConfigWarnings(config: Config): string[] {

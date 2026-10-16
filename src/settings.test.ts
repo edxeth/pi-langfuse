@@ -32,6 +32,9 @@ describe("settings", () => {
 	it("should return default settings when file does not exist", () => {
 		const settings = getSettingsValues();
 		expect(settings).toEqual(DEFAULT_SETTINGS);
+		// Raw identity, with repository identity hidden, is the documented default.
+		expect(settings["identity-mode"]).toBe("raw");
+		expect(settings["identity-keep-repo"]).toBe(false);
 	});
 
 	it("should merge stored values with defaults", () => {

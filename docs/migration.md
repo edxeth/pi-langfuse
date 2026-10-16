@@ -44,6 +44,12 @@ pi-agent
 
 Existing raw-trace JSONL files and export inputs remain readable. New payload policies apply to new Langfuse and raw-trace writes. Export redaction remains enabled independently of live capture settings.
 
+### Structured assistant output
+
+New `llm-response` generation and `agent.turn` span outputs are objects of the form `{ text, tool_calls, thinking? }`, rather than plain strings. `text` contains answer text only. Tool-call arguments use the independent tool-input capture policy. Visible thinking is optional and policy-controlled; generation metadata uses `hasThinking` instead of a `thinking` content field. Prompt-level trace output remains a plain answer string.
+
+Raw `assistant_output` JSONL records keep answer-only `text` and add `toolCalls`; they may also include visible `thinking`. Existing raw records remain readable, but consumers that assume new Langfuse generation or turn outputs are strings must read the object's `text` field and handle `tool_calls`. A tool-only response may have empty `text` with non-empty `tool_calls`.
+
 ## Local self-hosting
 
 Existing generated Langfuse Server v3 Compose files, credentials, and volumes remain in place. Do not run init in a directory that contains user files. Version 2.0 does not recreate databases or migrate volumes.

@@ -3,8 +3,10 @@ import type {
 	AgentSettledEvent,
 	AgentStartEvent,
 	BeforeAgentStartEvent,
+	BeforeAgentStartUserEvent,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { type AskWaitSummary, summarizeAskWait } from "./ask-wait.js";
 import type { Config, canTrace } from "./config.js";
 import type { flushClient, getRuntime } from "./langfuse-client.js";
 import {
@@ -16,7 +18,11 @@ import {
 import type { ensureLocalLangfuseStarted } from "./local-autostart.js";
 import type { redactionMetadata } from "./redaction.js";
 import { recordRuntimeError } from "./runtime-diagnostics.js";
-import type { SessionContextLike, SessionState } from "./session-state.js";
+import {
+	type SessionContextLike,
+	type SessionState,
+	traceDestination,
+} from "./session-state.js";
 import type { collectSourceMetadata } from "./source-metadata.js";
 import type {
 	buildTraceTags,
@@ -29,8 +35,20 @@ import type {
 	writeRawTrace,
 } from "./telemetry-helpers.js";
 
-function promptStartSignature(
+/**
+ * Whether a start announces a user prompt. Since Pi 1.2.0 the event also
+ * announces runs started by pi.sendMessage(..., { triggerTurn: true })
+ * (messageType "custom"), which carry a custom message and no prompt. Pi
+ * before 1.2.0 sends no messageType, so the prompt itself is checked.
+ */
+function isPromptStart(
 	event: BeforeAgentStartEvent,
+): event is BeforeAgentStartUserEvent {
+	return "prompt" in event && typeof event.prompt === "string";
+}
+
+function promptStartSignature(
+	event: BeforeAgentStartUserEvent,
 	cwd: string,
 	sessionFile: string,
 ) {
@@ -40,6 +58,13 @@ function promptStartSignature(
 		systemPrompt: event.systemPrompt || "",
 		cwd,
 	});
+}
+
+function ownsPrompt(state: SessionState<PromptState>, signature: string) {
+	const prompt = state.promptState;
+	return Boolean(
+		prompt && !prompt.finalizing && prompt.startSignature === signature,
+	);
 }
 
 export interface AgentLifecycleDependencies {
@@ -86,6 +111,97 @@ export interface AgentLifecycleHandlers {
 	) => Promise<void>;
 }
 
+interface PromptScore {
+	name: string;
+	value: number;
+	dataType?: "BOOLEAN";
+}
+
+/** Counts and rates that describe how the prompt's tool use went. */
+function healthScores(prompt: PromptState, incomplete: boolean): PromptScore[] {
+	const toolSuccessRate =
+		prompt.toolCalls > 0
+			? Math.max(0, (prompt.toolCalls - prompt.toolErrors) / prompt.toolCalls)
+			: 1;
+	const sessionHadErrors = prompt.toolErrors > 0 || incomplete;
+	return [
+		{ name: "tool_call_count", value: prompt.toolCalls },
+		{ name: "turn_count", value: prompt.turns },
+		{ name: "total_tool_errors", value: prompt.toolErrors },
+		{ name: "tool_success_rate", value: toolSuccessRate },
+		{
+			name: "session_had_errors",
+			value: sessionHadErrors ? 1 : 0,
+			dataType: "BOOLEAN",
+		},
+	];
+}
+
+function lastToolScores(prompt: PromptState): PromptScore[] {
+	if (!prompt.lastToolResult) return [];
+	return [
+		{
+			name: "last_tool_is_error",
+			value: prompt.lastToolResult.isError ? 1 : 0,
+			dataType: "BOOLEAN",
+		},
+	];
+}
+
+/**
+ * Only a fully measured wait becomes a score; incomplete or ambiguous
+ * instrumentation stays in the trace metadata. A wait duration exists only
+ * for a measured wait.
+ */
+function askWaitScores(askWait: AskWaitSummary | undefined): PromptScore[] {
+	return askWait?.waitMs === undefined
+		? []
+		: [{ name: "ask_user_wait_ms", value: askWait.waitMs }];
+}
+
+/**
+ * Operational observations, not task outcomes: attempted edit/write calls
+ * (failed or blocked ones included), the error flag of the last tool result in
+ * transcript order, and pi-ask dialog time.
+ */
+function operationalScores(
+	prompt: PromptState,
+	askWait: AskWaitSummary | undefined,
+): PromptScore[] {
+	return [
+		{ name: "edit_write_call_count", value: prompt.editWriteCalls },
+		...lastToolScores(prompt),
+		...askWaitScores(askWait),
+	];
+}
+
+/**
+ * Explicit feedback targets this trace and the destination it was created
+ * for, not the configuration in effect at finalization.
+ */
+function rememberFinalizedTrace(
+	state: SessionState<PromptState>,
+	prompt: PromptState,
+) {
+	if (!prompt.trace || !prompt.destination) return;
+	state.lastFinalizedTrace = {
+		traceId: prompt.trace.id,
+		destination: prompt.destination,
+	};
+}
+
+/**
+ * Pi 1.2.0 adds `aborted`, which the locked 0.99.2 types lack. An abort
+ * that left no failed assistant message still ends the prompt incomplete;
+ * a missing or false flag changes nothing.
+ */
+function markAbortedSettle(prompt: PromptState, event: AgentSettledEvent) {
+	// SAFETY: the locked event type has no `aborted` field. The cast widens it
+	// to `unknown`, and the strict `=== true` check admits only a real boolean.
+	if ((event as { aborted?: unknown }).aborted !== true) return;
+	prompt.failure ??= { stopReason: "aborted" };
+}
+
 export function createAgentLifecycleHandlers(
 	deps: AgentLifecycleDependencies,
 ): AgentLifecycleHandlers {
@@ -93,25 +209,14 @@ export function createAgentLifecycleHandlers(
 		prompt: PromptState,
 		config: Config,
 		incomplete: boolean,
+		askWait: AskWaitSummary | undefined,
 	) => {
 		if (!deps.canTrace(config) || !prompt.trace) return;
-		const toolSuccessRate =
-			prompt.toolCalls > 0
-				? Math.max(0, (prompt.toolCalls - prompt.toolErrors) / prompt.toolCalls)
-				: 1;
-		const sessionHadErrors = prompt.toolErrors > 0 || incomplete;
 		try {
 			const lf = await deps.getRuntime(config);
 			for (const score of [
-				{ name: "tool_call_count", value: prompt.toolCalls },
-				{ name: "turn_count", value: prompt.turns },
-				{ name: "total_tool_errors", value: prompt.toolErrors },
-				{ name: "tool_success_rate", value: toolSuccessRate },
-				{
-					name: "session_had_errors",
-					value: sessionHadErrors ? 1 : 0,
-					dataType: "BOOLEAN" as const,
-				},
+				...healthScores(prompt, incomplete),
+				...operationalScores(prompt, askWait),
 			]) {
 				lf.score({
 					...score,
@@ -144,11 +249,18 @@ export function createAgentLifecycleHandlers(
 				(hadPendingWork ? "agent finalization" : undefined);
 			const failure = prompt.failure;
 			const abandoned = Boolean(abandonmentReason);
+			const askWait = summarizeAskWait(
+				prompt.askFlows.values(),
+				prompt.ambiguousAskFlowIds.size,
+			);
 			const incomplete = abandoned || Boolean(failure);
+			// A template nested in a template makes Lizard misjudge where this
+			// function ends, so the suffix is built first.
+			const failureDetail = failure?.errorMessage
+				? `: ${failure.errorMessage}`
+				: "";
 			const failureStatus = failure
-				? `agent ${failure.stopReason}${
-						failure.errorMessage ? `: ${failure.errorMessage}` : ""
-					}`
+				? `agent ${failure.stopReason}${failureDetail}`
 				: undefined;
 			prompt.finalizing = true;
 			prompt.finalizationPromise = (async () => {
@@ -221,6 +333,10 @@ export function createAgentLifecycleHandlers(
 						turns: prompt.turns,
 						toolCalls: prompt.toolCalls,
 						toolErrors: prompt.toolErrors,
+						askUserWait: askWait,
+						// Scalars propagate to trace-level metadata, so latency can be filtered.
+						askUserWaitStatus: askWait?.status,
+						askUserWaitMs: askWait?.waitMs,
 						tokensIn: prompt.tokensIn,
 						tokensOut: prompt.tokensOut,
 						cacheRead: prompt.cacheRead,
@@ -235,7 +351,8 @@ export function createAgentLifecycleHandlers(
 					},
 				});
 
-				if (config) await recordPromptScores(prompt, config, incomplete);
+				if (config)
+					await recordPromptScores(prompt, config, incomplete, askWait);
 
 				if (!prompt.promptSpanEnded) {
 					prompt.promptSpanEnded = true;
@@ -270,7 +387,10 @@ export function createAgentLifecycleHandlers(
 					});
 				}
 
-				if (state.promptState === prompt) state.promptState = null;
+				if (state.promptState === prompt) {
+					rememberFinalizedTrace(state, prompt);
+					state.promptState = null;
+				}
 			})();
 		}
 
@@ -289,40 +409,26 @@ export function createAgentLifecycleHandlers(
 		if (!state) return;
 		const config = deps.getConfig();
 		deps.updateStatus(ctx, config);
-		// Since Pi 1.2.0 this event also announces runs started by
-		// pi.sendMessage(..., { triggerTurn: true }) (messageType "custom"), which
-		// carry a custom message and no prompt. A custom message is not a user
-		// prompt, so agent_start traces the run as unannounced. The prompt check
-		// stands in for messageType until the pinned Pi types declare it.
-		if (typeof event.prompt !== "string") return;
+		// A custom message is not a user prompt, so agent_start traces such a
+		// run as unannounced.
+		if (!isPromptStart(event)) return;
 		const sessionFile = ctx.sessionManager.getSessionFile();
 		if (config.skipUnpersistedSessions && !sessionFile) return;
 		if (!deps.canTrace(config) && !config.rawTraceEnabled) return;
 		state.sessionFile = sessionFile || "";
 		const cwd = event.systemPromptOptions?.cwd || process.cwd();
 		const signature = promptStartSignature(event, cwd, state.sessionFile);
-		const currentPrompt = state.promptState;
-		if (
-			currentPrompt &&
-			!currentPrompt.finalizing &&
-			currentPrompt.startSignature === signature
-		)
-			return;
+		if (ownsPrompt(state, signature)) return;
 
-		const pendingStart = state.promptStartPromise;
-		if (pendingStart) {
-			if (state.promptStartSignature === signature) {
-				await pendingStart;
-				return;
-			}
-			await pendingStart;
-			const promptAfterPending = state.promptState;
-			if (
-				promptAfterPending &&
-				!promptAfterPending.finalizing &&
-				promptAfterPending.startSignature === signature
-			)
-				return;
+		// Waiters on one start resume together, and the first to run publishes its
+		// own pending start before the next one runs. Read the pending start again
+		// after every wait, with no await between the last read and the claim
+		// below: the prompt the awaited start left behind says nothing about a
+		// start claimed in the meantime.
+		while (state.promptStartPromise) {
+			const startsThisPrompt = state.promptStartSignature === signature;
+			await state.promptStartPromise;
+			if (startsThisPrompt || ownsPrompt(state, signature)) return;
 		}
 
 		const promptStart = (async () => {
@@ -341,6 +447,9 @@ export function createAgentLifecycleHandlers(
 				startedAt: Date.now(),
 				toolCalls: 0,
 				toolErrors: 0,
+				editWriteCalls: 0,
+				askFlows: new Map(),
+				ambiguousAskFlowIds: new Set(),
 				turns: 0,
 				tokensIn: 0,
 				tokensOut: 0,
@@ -354,6 +463,7 @@ export function createAgentLifecycleHandlers(
 				countedCompactions: new Set<string>(),
 				lastAssistantText: "",
 				startSignature: signature,
+				pendingTurnInput: [],
 				recoveredFailureCount: 0,
 				sourceMetadata,
 				activeTurns: new Map(),
@@ -414,6 +524,7 @@ export function createAgentLifecycleHandlers(
 
 				if (state.promptState === prompt) {
 					prompt.trace = trace;
+					prompt.destination = traceDestination(config);
 					prompt.promptSpan = lf.span({
 						name: "agent.prompt",
 						traceId: trace.id,
@@ -470,6 +581,9 @@ export function createAgentLifecycleHandlers(
 				startedAt: Date.now(),
 				toolCalls: 0,
 				toolErrors: 0,
+				editWriteCalls: 0,
+				askFlows: new Map(),
+				ambiguousAskFlowIds: new Set(),
 				turns: 0,
 				tokensIn: 0,
 				tokensOut: 0,
@@ -483,6 +597,7 @@ export function createAgentLifecycleHandlers(
 				countedCompactions: new Set<string>(),
 				lastAssistantText: "",
 				startSignature: signature,
+				pendingTurnInput: [],
 				recoveredFailureCount: 0,
 				sourceMetadata,
 				activeTurns: new Map(),
@@ -539,6 +654,7 @@ export function createAgentLifecycleHandlers(
 
 				if (state.promptState === prompt) {
 					prompt.trace = trace;
+					prompt.destination = traceDestination(config);
 					prompt.promptSpan = lf.span({
 						name: "agent.prompt",
 						traceId: trace.id,
@@ -574,10 +690,10 @@ export function createAgentLifecycleHandlers(
 		// never re-emit before_agent_start. Guards from the finished run must not
 		// swallow the continuation's turns.
 		if (prompt.activeTurns.size === 0) prompt.completedTurnIndexes.clear();
-		if (!deps.canTrace(config) || !prompt.trace || prompt.promptSpanEnded)
-			return;
+		// Finalization sets `finalizing` before it ends the prompt span, so the
+		// checks above also cover an ended span.
+		if (!deps.canTrace(config) || !prompt.trace) return;
 		const trace = prompt.trace;
-		if (!trace) return;
 		if (!prompt.promptSpanStartPromise) {
 			prompt.promptSpanStartPromise = (async () => {
 				try {
@@ -585,7 +701,6 @@ export function createAgentLifecycleHandlers(
 					if (
 						state.promptState !== prompt ||
 						prompt.finalizing ||
-						prompt.promptSpanEnded ||
 						prompt.promptSpan
 					)
 						return;
@@ -658,7 +773,7 @@ export function createAgentLifecycleHandlers(
 	};
 
 	const agentSettled = async (
-		_event: AgentSettledEvent,
+		event: AgentSettledEvent,
 		ctx: ExtensionContext,
 	) => {
 		const state = deps.getSessionState(ctx);
@@ -666,6 +781,7 @@ export function createAgentLifecycleHandlers(
 		if (!state || !prompt || prompt.finalizing) return;
 		// Pi emits agent_settled only after retry, compaction, and queued
 		// continuations are done: the first boundary that may end the trace.
+		markAbortedSettle(prompt, event);
 		await finalizePrompt(state, deps.getConfig(), true);
 	};
 

@@ -30,6 +30,7 @@ describe("index (extension entry)", () => {
 		delete process.env.PI_LANGFUSE_CAPTURE_PROVIDER_PAYLOAD;
 		delete process.env.PI_LANGFUSE_CAPTURE_POLICY;
 		delete process.env.PI_CODING_AGENT_DIR;
+		delete process.env.PI_LANGFUSE_CONFIG;
 	});
 
 	afterEach(async () => {
@@ -183,6 +184,66 @@ describe("index (extension entry)", () => {
 			expect(messagesA).toHaveLength(2);
 		} finally {
 			await (stop[1] as EventHandler)({}, a);
+		}
+	});
+
+	it("prefixes a diagnostic with Langfuse unless it already names the extension", async () => {
+		mockPi.events.emit.mockImplementation((event, probe) => {
+			if (event === "extension:settings:get") probe.values = { enabled: false };
+		});
+		await registerExtension(mockPi as unknown as ExtensionArg);
+		const start = mockPi.on.mock.calls.find(
+			(call) => call[0] === "session_start",
+		);
+		if (!start) throw new Error("session lifecycle not registered");
+		const messages: string[] = [];
+		await (start[1] as EventHandler)(
+			{},
+			{
+				hasUI: true,
+				ui: { notify: (message: string) => messages.push(message) },
+				sessionManager: { getSessionFile: () => "/tmp/prefix/session.jsonl" },
+			},
+		);
+
+		recordRuntimeError("export failed");
+		recordRuntimeError("Langfuse: already named");
+
+		expect(messages).toEqual([
+			"Langfuse: export failed",
+			"Langfuse: already named",
+		]);
+	});
+
+	it("rebinds diagnostics to the most recently started surviving session", async () => {
+		mockPi.events.emit.mockImplementation((event, probe) => {
+			if (event === "extension:settings:get") probe.values = { enabled: false };
+		});
+		await registerExtension(mockPi as unknown as ExtensionArg);
+		const start = mockPi.on.mock.calls.find(
+			(call) => call[0] === "session_start",
+		);
+		const stop = mockPi.on.mock.calls.find(
+			(call) => call[0] === "session_shutdown",
+		);
+		if (!start || !stop) throw new Error("session lifecycle not registered");
+		const inboxes: Record<string, string[]> = { a: [], b: [], c: [] };
+		const context = (id: string) => ({
+			hasUI: true,
+			ui: { notify: (message: string) => inboxes[id]?.push(message) },
+			sessionManager: { getSessionFile: () => `/tmp/rebind/${id}.jsonl` },
+		});
+		const [a, b, c] = [context("a"), context("b"), context("c")];
+		for (const ctx of [a, b, c]) await (start[1] as EventHandler)({}, ctx);
+		try {
+			await (stop[1] as EventHandler)({}, c);
+			recordRuntimeError("failure after the newest session closed");
+
+			expect(inboxes.b).toHaveLength(1);
+			expect(inboxes.a).toEqual([]);
+		} finally {
+			await (stop[1] as EventHandler)({}, a);
+			await (stop[1] as EventHandler)({}, b);
 		}
 	});
 
@@ -632,6 +693,33 @@ describe("index (extension entry)", () => {
 		const summaryJson = JSON.stringify(providerRequest?.messagesSummary);
 		expect(summaryJson).toContain("PI-wire turn");
 		expect(summaryJson).not.toContain("CTX-context only");
+	});
+
+	it("marks stored-context references on emitted provider_request records in both modes", async () => {
+		const payload = {
+			model: "test-model",
+			previous_response_id: "resp_STOREDID",
+			input: [{ role: "user", content: "continue" }],
+		};
+		for (const mode of [undefined, "full"] as const) {
+			const records = await captureRawProviderRequestRecords({ mode, payload });
+			const providerRequest = records.find(
+				(record) => record.type === "provider_request",
+			);
+
+			expect(providerRequest?.serverSideContext).toEqual([
+				"previous_response_id",
+			]);
+			expect(JSON.stringify(providerRequest)).not.toContain("resp_STOREDID");
+		}
+		// A self-contained request carries no marker at all.
+		const plain = await captureRawProviderRequestRecords({
+			mode: "full",
+			payload: { model: "test-model", input: payload.input },
+		});
+		expect(
+			plain.find((record) => record.type === "provider_request"),
+		).not.toHaveProperty("serverSideContext");
 	});
 
 	it("never presents the context fallback as a captured wire request", async () => {

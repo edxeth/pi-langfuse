@@ -1,4 +1,4 @@
-import { ExportResultCode } from "@opentelemetry/core";
+import { type ExportResult, ExportResultCode } from "@opentelemetry/core";
 import { JsonTraceSerializer } from "@opentelemetry/otlp-transformer";
 import type { ReadableSpan, SpanExporter } from "@opentelemetry/sdk-trace-base";
 
@@ -13,6 +13,15 @@ import type { ReadableSpan, SpanExporter } from "@opentelemetry/sdk-trace-base";
  * through the `onError` callback instead of diag logging. Configuration is
  * fully explicit: OTEL_* environment variables are never read.
  *
+ * Concurrency: at most `MAX_CONCURRENT_EXPORTS` exports run at once. The
+ * span processor's immediate mode calls `export()` once per ended span, so a
+ * burst would otherwise open one request per span and miss deadlines under
+ * load. While all slots are busy, `export()` queues its spans; when a slot
+ * frees, every queued span goes out as one export and every queued callback
+ * receives that export's result. `onError` fires once per failed export, not
+ * once per callback. `forceFlush()` and `shutdown()` wait for queued and
+ * running work alike.
+ *
  * Wire contract: POST `${host}/api/public/otel/v1/traces`, Basic auth,
  * `application/json` bodies produced by `JsonTraceSerializer` from the real
  * spans, so trace and span identities reach the server unchanged.
@@ -23,15 +32,25 @@ export interface OtlpExporterOptions {
 	publicKey: string;
 	secretKey: string;
 	/**
-	 * Total budget for one `export()` call: all requests, retries, and
-	 * response reads must finish inside it. The deadline aborts in-flight
-	 * work; it is not reset per attempt.
+	 * Total budget for one export: all requests, retries, and response reads
+	 * must finish inside it. The budget starts when the export starts running,
+	 * not while its spans wait for a free slot (a wait bounded by the budgets
+	 * of the exports ahead). The deadline aborts in-flight work; it is not
+	 * reset per attempt.
 	 */
 	timeoutMs: number;
 	/** App-edge sink for safe, actionable, bounded failure summaries. */
 	onError: (message: string) => void;
 }
 
+/**
+ * Export requests in flight at once. Throughput comes from batch size, not
+ * parallelism: spans that arrive while all slots are busy coalesce into the
+ * next export. Four keeps one slow response from stalling delivery (three
+ * slots stay free) while holding sockets, memory, and server-side
+ * concurrency to a small constant however large a burst is.
+ */
+export const MAX_CONCURRENT_EXPORTS = 4;
 // Bound each request below Langfuse's ingestion size limit.
 const MAX_REQUEST_BYTES = 3_500_000;
 const MAX_RESPONSE_BYTES = 1_000_000;
@@ -67,6 +86,14 @@ type AttemptResult =
 
 type SendOutcome = { ok: true } | { ok: false; reason: string };
 
+type ResultCallback = (result: ExportResult) => void;
+
+/** Spans accepted by `export()` that wait for a free export slot. */
+interface QueuedExport {
+	spans: ReadableSpan[];
+	resultCallback: ResultCallback;
+}
+
 class ResponseTooLargeError extends Error {}
 
 /** Export failure already delivered to the diagnostic sink. */
@@ -83,25 +110,31 @@ export function createOtlpExporter(options: OtlpExporterOptions): SpanExporter {
 	};
 	const timeoutMs = Math.max(1, Math.trunc(options.timeoutMs));
 	const inFlight = new Set<Promise<void>>();
+	const queue: QueuedExport[] = [];
 	let shutDown = false;
 
-	function deliver(
-		resultCallback: (result: { code: ExportResultCode; error?: Error }) => void,
-		summary: string | undefined,
-	): void {
-		if (summary === undefined) {
-			resultCallback({ code: ExportResultCode.SUCCESS });
-			return;
-		}
+	/** Reports a failure to the sink once and builds the shared result. */
+	function resultFor(summary: string | undefined): ExportResult {
+		if (summary === undefined) return { code: ExportResultCode.SUCCESS };
 		options.onError(summary);
-		resultCallback({
+		return {
 			code: ExportResultCode.FAILED,
 			error: new OtlpExportError(summary),
+		};
+	}
+
+	function deliver(
+		resultCallbacks: ResultCallback[],
+		summary: string | undefined,
+	): void {
+		const result = resultFor(summary);
+		resultCallbacks.forEach((resultCallback) => {
+			resultCallback(result);
 		});
 	}
 
 	async function exportSpans(
-		resultCallback: (result: { code: ExportResultCode; error?: Error }) => void,
+		resultCallbacks: ResultCallback[],
 		spans: ReadableSpan[],
 	): Promise<void> {
 		const controller = new AbortController();
@@ -136,7 +169,7 @@ export function createOtlpExporter(options: OtlpExporterOptions): SpanExporter {
 				if (!outcome.ok) failures.push(`${outcome.reason}${label}`);
 			}
 			deliver(
-				resultCallback,
+				resultCallbacks,
 				joinReasons("Langfuse OTLP export failed", [...failures, ...problems]),
 			);
 		} finally {
@@ -150,7 +183,10 @@ export function createOtlpExporter(options: OtlpExporterOptions): SpanExporter {
 		deadline: number,
 	): Promise<SendOutcome> {
 		let lastFailure: string | undefined;
-		for (let attempt = 1; attempt <= MAX_HTTP_ATTEMPTS; attempt += 1) {
+		let attempt = 1;
+		// Every pass returns, waits for the next attempt, or stops at the
+		// attempt cap.
+		for (; ; attempt += 1) {
 			if (deadline - Date.now() <= 0) {
 				return {
 					ok: false,
@@ -185,12 +221,7 @@ export function createOtlpExporter(options: OtlpExporterOptions): SpanExporter {
 			if (result.class === "terminal")
 				return { ok: false, reason: result.reason };
 			if (result.status !== undefined) lastFailure = `HTTP ${result.status}`;
-			if (attempt >= MAX_HTTP_ATTEMPTS) {
-				return {
-					ok: false,
-					reason: `${lastFailure} persisted for all ${attempt} attempts within the ${timeoutMs}ms deadline`,
-				};
-			}
+			if (attempt >= MAX_HTTP_ATTEMPTS) break;
 			const delayMs = result.retryAfterMs ?? backoffDelayMs(attempt);
 			const remainingMs = deadline - Date.now();
 			if (delayMs >= remainingMs) {
@@ -205,7 +236,10 @@ export function createOtlpExporter(options: OtlpExporterOptions): SpanExporter {
 			}
 			await delay(delayMs, controller.signal);
 		}
-		return { ok: false, reason: "retry budget exhausted" };
+		return {
+			ok: false,
+			reason: `${lastFailure} persisted for all ${attempt} attempts within the ${timeoutMs}ms deadline`,
+		};
 	}
 
 	async function sendAttempt(
@@ -235,36 +269,62 @@ export function createOtlpExporter(options: OtlpExporterOptions): SpanExporter {
 		return { class: "terminal", reason: `HTTP ${response.status}` };
 	}
 
+	/** Runs one export for the whole batch; never rejects. */
+	async function runBatch(batch: QueuedExport[]): Promise<void> {
+		const resultCallbacks = batch.map((entry) => entry.resultCallback);
+		try {
+			await exportSpans(
+				resultCallbacks,
+				batch.flatMap((entry) => entry.spans),
+			);
+		} catch (error) {
+			deliver(
+				resultCallbacks,
+				`Langfuse OTLP export failed (${errorName(error)})`,
+			);
+		}
+	}
+
+	/**
+	 * Starts one export for everything queued when a slot is free. The slot is
+	 * released and the next batch started before `run` settles, so a waiter on
+	 * `inFlight` never observes a gap while queued work remains.
+	 */
+	function startQueued(): void {
+		if (queue.length === 0 || inFlight.size >= MAX_CONCURRENT_EXPORTS) return;
+		const run: Promise<void> = runBatch(queue.splice(0)).finally(() => {
+			inFlight.delete(run);
+			startQueued();
+		});
+		inFlight.add(run);
+	}
+
+	/** Resolves once no export is running and none is queued. */
+	async function drain(): Promise<void> {
+		while (inFlight.size > 0 || queue.length > 0) {
+			await Promise.allSettled([...inFlight]);
+		}
+	}
+
 	return {
 		export(spans, resultCallback) {
 			if (shutDown) {
 				const summary =
 					"Langfuse OTLP export dropped: exporter already shut down";
-				deliver(resultCallback, summary);
+				deliver([resultCallback], summary);
 				return;
 			}
 			if (spans.length === 0) {
 				resultCallback({ code: ExportResultCode.SUCCESS });
 				return;
 			}
-			const run = exportSpans(resultCallback, spans).catch((error: unknown) => {
-				deliver(
-					resultCallback,
-					`Langfuse OTLP export failed (${errorName(error)})`,
-				);
-			});
-			inFlight.add(run);
-			const settle = () => {
-				inFlight.delete(run);
-			};
-			run.then(settle, settle);
+			queue.push({ spans, resultCallback });
+			startQueued();
 		},
-		async forceFlush() {
-			await Promise.allSettled([...inFlight]);
-		},
+		forceFlush: drain,
 		async shutdown() {
 			shutDown = true;
-			await Promise.allSettled([...inFlight]);
+			await drain();
 		},
 	};
 }

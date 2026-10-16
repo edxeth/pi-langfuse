@@ -101,16 +101,18 @@ The extension does not load an extension-local `config.json`. Use `pi-langfuse.j
 | **Capture Provider Payload** | `PI_LANGFUSE_CAPTURE_PROVIDER_PAYLOAD` | `false` | Optional provider payload capture inside Langfuse metadata. |
 | **Secret Redaction** | `PI_LANGFUSE_REDACTION` / `PI_LANGFUSE_UNREDACTED=1` | `true` | Redact known secrets and common token/PII-shaped patterns before Langfuse/raw-trace writes. Settings/config values take precedence over env opt-outs. |
 | **Additional Redaction Secrets** | `PI_LANGFUSE_REDACTION_SECRETS` | - | Comma-separated literal secrets to redact in addition to env/config secrets. |
+| **Identity Mode** | `PI_LANGFUSE_IDENTITY` | `raw` | `raw` keeps usernames, home paths, and repository names as captured. `pseudonymous` hashes the user ID and repository identity with a private salt and rewrites the home directory to `~`. This is pseudonymization, not anonymization. See [Identity pseudonymization](#identity-pseudonymization). |
+| **Keep Repository Identity** | `PI_LANGFUSE_IDENTITY_KEEP_REPO` | `false` | Config key `identityKeepRepo`. Only `true` keeps repository owner, name, remote path, root name, and project tags readable in `pseudonymous` mode. |
 | **Raw Trace Export** | `PI_LANGFUSE_RAW_TRACE` | `false` | Redacted JSONL companion stream for training/distillation data. |
 | **Raw Trace Directory** | `PI_LANGFUSE_RAW_TRACE_DIR` | `$PI_CODING_AGENT_DIR/langfuse/raw-traces` | Root directory for raw trace companion files. |
-| **Raw Provider Request Mode** | `PI_LANGFUSE_RAW_PROVIDER_REQUEST` | `summary` | Controls `provider_request` raw records: `summary` stores bounded request shape, `full` stores the exact redacted request contents, `off` skips the record. |
+| **Raw Provider Request Mode** | `PI_LANGFUSE_RAW_PROVIDER_REQUEST` | `summary` | Controls `provider_request` raw records: `summary` stores bounded request shape, `full` stores the exact redacted request contents (required for `--format` training records), `off` skips the record. |
 | **Capture Policy** | `PI_LANGFUSE_CAPTURE_POLICY` | `full-debug` | Select `metadata-only`, `prompts-only`, `conversations`, or `full-debug`. |
 | **Capture Overrides** | `PI_LANGFUSE_CAPTURE_*` | `inherit` | Set field overrides to `on` or `off` for prompt, system prompt, provider input, assistant output, tool input, tool output, or metadata. |
 | **Payload Budgets** | `PI_LANGFUSE_PAYLOAD_MAX_*` | `unlimited` | Bound strings, tool strings, depth, array items, object keys, or total nodes. Use `unlimited` for an explicit unlimited value. |
 
 ## Commands
 
-Six slash commands drive setup, runtime control, diagnostics, and exports. Run them inside the Pi TUI.
+Seven slash commands drive setup, runtime control, diagnostics, feedback, and exports. Run them inside the Pi TUI.
 
 | Command | Description |
 | :--- | :--- |
@@ -118,6 +120,7 @@ Six slash commands drive setup, runtime control, diagnostics, and exports. Run t
 | `/langfuse:toggle` | Enable or disable tracing. |
 | `/langfuse-status` | Print safe configuration and runtime status. |
 | `/langfuse-test` | Check connectivity and send an isolated test trace. |
+| `/langfuse-score` | Rate this session's last finalized trace as good or bad. |
 | `/langfuse-privacy` | Show or persist the capture policy. |
 | `/langfuse:export` | Create a local redacted export of sessions and raw traces. |
 
@@ -175,19 +178,34 @@ Prints safe runtime and config status: the ON/OFF label, resolved config source 
 
 Requires configured keys. The command makes an authenticated request to `<host>/api/public/projects` and then sends an isolated test trace under a bounded timeout. It reports pass or fail without flushing or closing an active session runtime. Errors are redacted before they reach the notification.
 
+### /langfuse-score
+
+```text
+/langfuse-score <good|bad> [comment]
+```
+
+Writes a `user_feedback` BOOLEAN score (`good` = 1, `bad` = 0) on the last trace this session finalized. Any other first word prints usage and writes nothing.
+
+- **Target.** Only the invoking session's last finalized trace qualifies. A prompt that is still running is never scored; while one runs, the command targets the previous finalized trace. The command rejects the request when the session has not finalized a trace.
+- **Destination.** The trace keeps the Langfuse host and public key it was created for. After a configuration change that points elsewhere, the command rejects the request instead of writing to another project. It accepts the request again once the original destination is configured.
+- **Comment.** The comment is optional. A comment over 4000 characters is rejected with its length (never echoed) and nothing is saved. Otherwise the original text is redacted first (always, whatever the redaction setting, with the full configuration), then flattened to one line and cut to 500 characters. Redacting first keeps secrets that contain whitespace or span lines matchable, and a cut never leaves a secret fragment.
+- **Delivery.** Success means the scores endpoint accepted the score. A rejected or failed delivery shows an error notification and a runtime diagnostic; the command never reports enqueueing as success. Repeating the command adds another score.
+
 ### /langfuse-privacy
 
 ```text
 /langfuse-privacy [policy]
 ```
 
-With no argument or `show`, prints the capture policy, per-field capture overrides, and payload budgets. With one of `metadata-only`, `prompts-only`, `conversations`, or `full-debug`, it persists the policy to settings and refreshes the active config. Any other input prints usage.
+With no argument or `show`, prints the capture policy, the identity mode, per-field capture overrides, and payload budgets. With one of `metadata-only`, `prompts-only`, `conversations`, or `full-debug`, it persists the policy to settings and refreshes the active config. Any other input prints usage.
 
 ### /langfuse:export
 
 ```text
 /langfuse:export [--out <dir>] [--sessions-dir <dir>] [--raw-dir <dir>]
                  [--sessions-only] [--raw-only] [--no-trufflehog] [--require-trufflehog]
+                 [--format openai-chat|anthropic-messages|sharegpt]
+                 [--license <text>] [--consent unknown|granted|denied]
 ```
 
 Creates a local redacted copy of Pi sessions and raw traces. The command blocks the TUI during processing. Redaction is always on for exports, and original files are never modified. For the full pipeline, output files, and the recommended standalone CLI for bulk runs, see [Export pipeline](#export-pipeline).
@@ -257,6 +275,28 @@ Trace (name: "pi-agent")
         └── Span (name: "tool:<name>")          <-- Arguments/Results
 ```
 
+### Prompt scores
+
+Each prompt finalizes its scores once, when Pi reports the run settled (`agent_settled`), including runs that no `before_agent_start` announced. Scores describe observed events. They are not task success, proof that files changed, human participation, or user acceptance. Use `/langfuse-score` for an explicit judgment.
+
+| Score | Type | Meaning |
+| :--- | :--- | :--- |
+| `tool_call_count`, `turn_count`, `total_tool_errors`, `tool_success_rate`, `session_had_errors` | numeric / boolean | Existing operational health signals. A run that Pi reports as aborted, or that ended on a failed assistant message, counts as incomplete. A failure that a later run of the same prompt recovered from does not. |
+| `last_tool_is_error` | boolean | `isError` of the last tool result in the prompt, in Pi's finalized transcript order (the last turn that returned tool results), not the order in which parallel tools finished. Omitted when the prompt has no tool result. |
+| `edit_write_call_count` | numeric | Distinct `edit` and `write` tool calls attempted, counted once per tool call id. Failed and blocked attempts count; the count does not show that any file changed. |
+| `ask_user_wait_ms` | numeric | Time that [pi-ask](https://github.com/FasalZein/pi-ask) dialogs were open, as the union of the intervals between each flow's `pi-ask:started` and `pi-ask:completed` events (overlapping flows count once). Omitted unless every observed flow was measured. |
+
+`ask_user_wait_ms` reads the pi-ask lifecycle events and keeps only flow id, tool call id, source, timestamps, and the cancellation flag and reason, never questions or answers. Setup and the rest of the `ask_user` tool span are not part of it, and a cancelled dialog still counts as open time. A dialog that a bridge answered through `pi-ask:submit` is still a dialog flow, so the value is not proof that a person was present. Total prompt latency (`durationMs`) is unchanged.
+
+Flows are matched to a prompt by tool call id. A flow without one (such as `/answer`) belongs to no prompt. When the same tool call id is active in more than one session, the flow is attributed to none of them. The prompt metadata `askUserWait` (also `askUserWaitStatus` and `askUserWaitMs` on the trace) reports the outcome, and the `tool:<name>` span metadata `askUserWait` lists the flows of that tool:
+
+- Absent: no pi-ask flow was observed. This is missing instrumentation, not a measured zero.
+- `measured`: every flow has a start and an end; `waitMs` can be 0.
+- `incomplete`: a flow lacks its start or end event, has no valid timestamp for one of them (absent or non-finite; receipt time is never substituted), or ends before it starts. No score is written.
+- `ambiguous`: an event matched several sessions. No score is written.
+
+Native Pi `ui_prompt_start` and `ui_prompt_end` events are not used: they carry no tool call id, and using both sources would double-count.
+
 ## Raw traces
 
 Langfuse is optimized for observability, not training archives. UI fields can be truncated and traces may be restructured. Raw traces are the append-only JSONL companion for fine-tuning, distillation, and audit.
@@ -284,7 +324,7 @@ Record types: `session_start`, `agent_prompt_start`, `provider_request`, `tool_c
 
 The key record is `tool_result_first_seen`: it captures a redacted summary of tool output before later extensions can compress or rewrite it. Configured capture policies and payload budgets shape new records. Raw traces continue writing even if Langfuse tracing is disabled or the server is unavailable. Raw trace writes are queued from event handlers and drained synchronously on session shutdown so no data is lost on clean exit. Very large records still require redaction, JSON serialization, and disk I/O, so use full provider-request capture only for controlled debug or data-capture runs.
 
-`provider_request` records store bounded summaries by default: model, request source, item count, estimated bytes, and redacted message summaries. Recognized request shapes include Chat Completions `messages`, Responses `input`, Google `contents` (with `config.systemInstruction` recorded as the system prompt field), and pi-protocol `context.messages`. Set `rawTraceProviderRequestMode` or `PI_LANGFUSE_RAW_PROVIDER_REQUEST=full` to capture the exact full redacted request contents sent to the LLM. Set it to `off` to skip `provider_request` records entirely. `PI_LANGFUSE_RAW_PROVIDER_REQUEST` is a per-process override, so `PI_LANGFUSE_RAW_PROVIDER_REQUEST=full pi` can run one controlled exact-capture session without permanently changing the config file. `session_end` marks a clean session shutdown.
+`provider_request` records store bounded summaries by default: model, request source, item count, estimated bytes, and redacted message summaries. Recognized request shapes include Chat Completions `messages`, Responses `input` (with a top-level `instructions` string recorded as the system prompt field), Google `contents` (with `config.systemInstruction` recorded as the system prompt field), and pi-protocol `context.messages`. Set `rawTraceProviderRequestMode` or `PI_LANGFUSE_RAW_PROVIDER_REQUEST=full` to capture the exact full redacted request contents sent to the LLM. Set it to `off` to skip `provider_request` records entirely. `PI_LANGFUSE_RAW_PROVIDER_REQUEST` is a per-process override, so `PI_LANGFUSE_RAW_PROVIDER_REQUEST=full pi` can run one controlled exact-capture session without permanently changing the config file. `session_end` marks a clean session shutdown.
 
 #### Session lifecycle
 
@@ -356,6 +396,10 @@ Flags:
 --raw-only                export raw traces only
 --require-trufflehog      reject export if TruffleHog is unavailable
 --no-trufflehog           skip external scan (local debug only)
+--format <name>           also write training-index.<name>.jsonl review records
+                          (requires the TruffleHog scan; refuses --no-trufflehog)
+--license <text>          operator-declared license for review records
+--consent <value>         operator-declared consent: unknown (default), granted, denied
 ```
 
 ### Export invariants
@@ -363,6 +407,41 @@ Flags:
 - Redaction is always on. `PI_LANGFUSE_UNREDACTED` and `redactionEnabled` only affect live telemetry, not exports.
 - Absolute source paths are replaced with `[PATH_ROOT]`.
 - Original files are never modified (read-only copy).
+- TruffleHog runs detection-only (`--no-verification --no-update`): no candidate credential is sent to a vendor to check whether it is valid.
+
+### Training review records (`--format`)
+
+`--format openai-chat`, `anthropic-messages`, or `sharegpt` additionally writes `training-index.<format>.jsonl` next to the usual artifacts. These are **local review records, not certified provider-upload-ready datasets**. Nothing is uploaded, and no per-record permission system exists.
+
+One record is one normally completed assistant generation: the full provider context observed in a raw `provider_request`, with the answer of the `assistant_output` that followed it appended. Tool calls and results earlier in that context stay in it. Records come only from raw traces that passed the built-in scan, and the generated records are scanned again. `--format` makes the external scan mandatory, as if `--require-trufflehog` were given: records are kept only if TruffleHog was available, exited with status 0 (a signal-killed or otherwise incomplete run counts as failure even with empty output), and reported no findings. Otherwise the export is `rejected` and the review file is empty. `--format` with `--no-trufflehog` is refused before anything is written. A passing scan is not permission to train. `--format` also cannot be combined with `--sessions-only`: Pi session files are not converted.
+
+A value-taking option (`--out`, `--sessions-dir`, `--raw-dir`, `--format`, `--license`, `--consent`) followed directly by another recognized option is refused as missing its value and never swallows that option, so `--license --consent denied` cannot hide a denial. An explicit empty argument (`--license ""`) is a valid empty license.
+
+A sample is accepted only if all of these hold, otherwise it is rejected with a reason code and counted in `report.json`, `REVIEW.md`, and the CLI output (`training.rejectionReasons`):
+
+- The answer ended with `stopReason: "stop"`, has text, and has no tool calls. `aborted`, `error`, `length`, and tool-call endings are rejected, as are history turns that ended that way.
+- The request is a `full` capture of a supported shape: Pi-native `context.messages`, Responses `input` (items or a string, plus top-level `instructions`), or Chat Completions / Anthropic `messages`. Google `contents`, images and other non-text blocks, custom tool calls, unknown roles, and mid-conversation system messages are rejected. The default `summary` mode, legacy records, and raw records without capture provenance cannot be converted.
+- Capture was complete. Each `provider_request` and `assistant_output` raw record carries `captureProvenance`, measured where the record is shaped: a content field is listed under `verified` only if its emitted value equals the same field shaped with every capture field forced on and every payload limit lifted. Fields that the capture policy or a payload budget cut appear under `degraded` as `policy-omitted` or `budget-truncated`, and records with any such required field are rejected. Redaction, identity normalization, and the always-removed opaque reasoning payloads are not counted as degradation.
+- No history item states an incomplete status. Responses messages, function calls, function outputs, and reasoning items may carry `status`; any explicit value other than `completed` (`in_progress`, `incomplete`, or anything else) rejects the sample. An absent or null status is accepted because the input schema allows it.
+- The request is self-contained. If the provider payload referenced stored context (`previous_response_id` or `conversation`), the raw record carries `serverSideContext` (the field names only, never the ids) and the sample is rejected (`request-server-side-context`): the captured items are not the context the model saw. Nothing is looked up or reconstructed. The marker is written by the provider hook from the payload it observes, before any later adapter reduces a continuation request; it makes no claim about what a given adapter sends afterwards. Records written before this marker existed cannot show it.
+- Tool calls and results pair exactly: unique non-empty ids, every call answered once by a matching result before the next turn, no orphan or duplicate results, parseable object arguments.
+- The pairing of request and answer is unambiguous. Within one prompt (raw `agent_prompt_start` records split prompts, and `turnIndex` restarts for each), a request pairs only with the next request-or-answer record when it answers the same turn. A turn index that occurs on more than one request or answer in a prompt, such as a provider retry, rejects all records involved (`ambiguous-turn`) instead of guessing the order.
+
+Format notes:
+
+| Format | Shape | Not carried |
+| --- | --- | --- |
+| `openai-chat` | `{messages}`; assistant `tool_calls[].function.arguments` is a JSON string; tool messages use `tool_call_id` | tool definitions, reasoning, the tool error flag (listed in `omitted` when present) |
+| `anthropic-messages` | `{system, messages}`; `tool_use.input` is an object; `tool_result` blocks sit in the user message right after their `tool_use`, `is_error` is kept | tool definitions, reasoning |
+| `sharegpt` | `{system?, conversations}` with `human`/`gpt` turns only; the system prompt is a top-level `system` string, a private convention because ShareGPT has no system role or tool schema | everything with tool calls or results is rejected, never flattened to prose |
+
+Tool arguments are normalized through JSON parse and stringify, so whitespace can differ from the source. Multiple text blocks join with a newline. Reasoning text and encrypted or signed reasoning state are never copied into answer text; each record lists what was left out in `omitted`.
+
+Privacy for `--format` is fixed regardless of live capture settings: redaction on, identity pseudonymous with repository identity hashed. The identity salt must exist before anything is written, and it is created in the `PI_LANGFUSE_CONFIG` file if missing; an unreadable, malformed, or unwritable config stops the export. Derivative file and directory names, manifests, and index references are pseudonymized too (the encoded home directory becomes `~`); source files are never renamed. Pseudonymous is not anonymous: code, commits, relative paths, and business content can still identify people or repositories.
+
+`--license <text>` / `exportLicense` (default empty) and `--consent unknown|granted|denied` / `exportConsent` (default `unknown`) are operator declarations that are copied into every record. They are never inferred from a scan, a license, or an approval, and nothing verifies them. A missing license or unknown consent produces a warning. `denied` refuses the export. Environment variables `PI_LANGFUSE_EXPORT_LICENSE` and `PI_LANGFUSE_EXPORT_CONSENT` set the same values. The config file value outranks the environment. A config declaration of the wrong JSON type (an array, object, number, boolean, or `null`) is never coerced: a `--format` export refuses with `invalid-export-option` naming the key, unless a flag replaces that declaration. Defaults (empty license, `unknown` consent) apply only to missing or blank values. Live telemetry and exports without `--format` ignore these keys.
+
+Both are review records only. Neither the declarations nor a clean scan grant training rights.
 
 ## Privacy
 
@@ -385,6 +464,20 @@ PI_LANGFUSE_UNREDACTED=1 pi
 The sanitizer covers: configured secret keys, secret-like env values, `PI_LANGFUSE_REDACTION_SECRETS` literals, sensitive object fields, private-key blocks, bearer tokens, GitHub/HuggingFace/OpenAI/Anthropic/AWS/Stripe/SendGrid/Docker/Slack tokens, JWTs, `.env`-style assignments, URL-embedded credentials, email/phone/SSN/credit-card PII, data URLs, and large base64/hex blobs.
 
 Even redacted traces can contain private business data that is not token-shaped. Treat raw traces as private.
+
+### Identity pseudonymization
+
+`identityMode` (`settings` > `pi-langfuse.json` > `PI_LANGFUSE_IDENTITY`) selects `raw` (default, unchanged output) or `pseudonymous`. In `pseudonymous` mode the shared output sanitizer, which feeds Langfuse spans, scores, raw traces, and exports, does the following:
+
+- Hashes `userId` and the `repo_identity`, `repo_owner`, `repo_name`, `git_remote_path`, and `repo_root_name` metadata (including `.pi-langfuse.metadata.json` overrides) and `project:` tags with a salted HMAC, unless `identityKeepRepo` is `true`.
+- Rewrites your home directory prefix to `~` in every emitted string at directory boundaries, including nested text, errors, serialized fragments, and the encoded home name inside Pi session folder names (`--home-user-project--` becomes `--~-project--`).
+- Never changes the file paths the extension reads internally.
+
+The salt is a random 256-bit value stored as `identitySalt` in the file at `PI_LANGFUSE_CONFIG` (default `<agent-dir>/langfuse/pi-langfuse.json`). It is created once, only when `pseudonymous` mode first needs it, with owner-only permissions, an atomic rename, and a lock for concurrent first use. Existing keys are kept. `raw` mode never creates or rewrites the file. A malformed or non-object config file, an invalid `identitySalt`, or a salt that cannot be written is never overwritten or regenerated: telemetry, raw traces, and exports stay off until you fix it (`/langfuse-privacy` shows the reason). A config file that exists but cannot be read leaves the identity mode unknown, so it also stops telemetry unless the settings panel sets the mode. Keep the salt private: sharing it lets others test guesses against the hashes. Deleting it changes every pseudonym. Salt creation takes a `<config path>.lock` file; a process that finds it waits five seconds and then fails closed. pi-langfuse never removes that lock automatically, so after a killed Pi process, verify that nothing is running and delete the lock yourself. `/langfuse-init` does not merge with an existing `pi-langfuse.json` (including a salt-only one), so initialize the stack before you enable pseudonymous capture.
+
+Identity protection does not depend on the secret redaction setting. The OpenTelemetry resource always reports `service.name=pi-langfuse` and `service.version` from this package, in both modes, so the Node binary path no longer leaks.
+
+This is pseudonymization, not anonymization. Directory and file names below your home directory, branch names, commit hashes, prompts, code, tool output, and other content can still identify you or a repository. Raw trace files on disk keep their local names, and artifact names are masked only for `--format` exports. See [docs/privacy.md](./docs/privacy.md) for the full scope.
 
 ### Old data
 

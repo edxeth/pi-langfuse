@@ -19,11 +19,20 @@ Options:
   --raw-only               Export only raw trace JSONL derivatives
   --no-trufflehog          Skip TruffleHog scan explicitly
   --require-trufflehog     Reject export if TruffleHog is unavailable or fails
+  --format <name>          Also write training-index.<name>.jsonl local review records from
+                           raw traces: openai-chat, anthropic-messages, or sharegpt.
+                           Forces pseudonymous identity (repository identity hashed) and requires a
+                           completed TruffleHog scan; cannot be combined with --no-trufflehog.
+                           These are review records only, not permission to train.
+  --license <text>         Operator-declared license recorded in review records (default: empty)
+  --consent <value>        Operator-declared training consent: unknown (default), granted, denied.
+                           denied refuses the export. Neither declaration is verified.
   --help                   Show this help
 
 Examples:
   pi-langfuse-export --sessions-only --sessions-dir ~/.pi/agent/sessions --out ~/pi-redacted-sessions --require-trufflehog
   pi-langfuse-export --sessions-dir ~/.pi/agent/sessions --raw-dir ~/.pi/agent/langfuse/raw-traces --out ~/pi-training-export --require-trufflehog
+  pi-langfuse-export --raw-only --format openai-chat --license "internal-use-only" --consent granted --out ~/pi-review-export --require-trufflehog
 `);
 }
 
@@ -53,6 +62,9 @@ const report = exportRedactedData(resolveConfig({}), args, {
 if (report.error) {
 	process.stderr.write(`Export failed: ${report.error.message}\n`);
 }
+for (const warning of report.training?.warnings ?? []) {
+	process.stderr.write(`Warning: ${warning}\n`);
+}
 const status = report.error ? "failed" : report.status;
 console.log(
 	JSON.stringify(
@@ -61,6 +73,7 @@ console.log(
 			outDir: report.outDir,
 			summary: report.summary,
 			trufflehog: report.trufflehog,
+			training: report.training,
 			error: report.error,
 		},
 		null,

@@ -118,3 +118,13 @@ export function isCaptureEnabled(
 	if (typeof override === "boolean") return override;
 	return POLICY_FIELDS[policyFor(config.capturePolicy)][field];
 }
+
+/**
+ * Whether every capture field is enabled. Together with unlimited payload
+ * limits this means shaping can neither omit nor truncate captured content.
+ */
+export function allCaptureFieldsEnabled(config: CapturePolicyConfig): boolean {
+	return (Object.keys(OVERRIDE_KEYS) as CaptureField[]).every((field) =>
+		isCaptureEnabled(config, field),
+	);
+}

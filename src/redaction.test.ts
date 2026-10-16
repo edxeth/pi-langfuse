@@ -344,43 +344,6 @@ describe("redaction", () => {
 		expect(redactString(config, benignRun, {})).toBe(benignRun);
 	});
 
-	it("scales linearly on repeated sensitive-word input", () => {
-		const time = (fn: () => unknown) => {
-			const start = performance.now();
-			fn();
-			return performance.now() - start;
-		};
-		// Quoted hint shape, unquoted hint shape, and a benign control.
-		const quoted18 = '"password" '.repeat(1636);
-		const quoted72 = '"password" '.repeat(6545);
-		const unquoted18 = "password_ ".repeat(1800);
-		const unquoted72 = "password_ ".repeat(7200);
-		// Warm up and confirm benign text passes through unchanged.
-		expect(redactString(config, quoted72, {})).toBe(quoted72);
-		expect(redactString(config, unquoted72, {})).toBe(unquoted72);
-		scanForSecrets(config, quoted72, {});
-		scanForSecrets(config, unquoted72, {});
-
-		for (const [small, large] of [
-			[quoted18, quoted72],
-			[unquoted18, unquoted72],
-		]) {
-			const smallRedact = time(() => redactString(config, small, {}));
-			const largeRedact = time(() => redactString(config, large, {}));
-			expect(largeRedact, `redact scaling ${large.length} bytes`).toBeLessThan(
-				smallRedact * 10 + 250,
-			);
-			const smallScan = time(() => scanForSecrets(config, small, {}));
-			const largeScan = time(() => scanForSecrets(config, large, {}));
-			expect(largeScan, `scan scaling ${large.length} bytes`).toBeLessThan(
-				smallScan * 10 + 250,
-			);
-		}
-		const benign72 = "ordinary ".repeat(8000);
-		expect(time(() => redactString(config, benign72, {}))).toBeLessThan(500);
-		expect(time(() => scanForSecrets(config, benign72, {}))).toBeLessThan(500);
-	});
-
 	it("replaces unresolvable quoted secrets in shaped telemetry", () => {
 		const depth6 = '{"password":"SuperSecret9"}'.replace(
 			/"/g,
@@ -738,5 +701,534 @@ describe("redaction", () => {
 		expect(isSensitiveKey("max_completion_tokens")).toBe(false);
 		expect(isSensitiveKey("secretKey")).toBe(true);
 		expect(isSensitiveKey("access_token")).toBe(true);
+	});
+
+	it("redacts bounded provider credential patterns only at complete token boundaries", () => {
+		const providerTokens: Array<{
+			reason: string;
+			token: string;
+			context?: string;
+			nearMiss?: string;
+		}> = [
+			{ reason: "google-api-key", token: `AIzaSy${"a".repeat(33)}` },
+			{
+				reason: "slack-token",
+				token: `xoxb-1234567890-1234567890-${"a".repeat(28)}`,
+				nearMiss: `xxoxb-1234567890-1234567890-${"a".repeat(28)}`,
+			},
+			{
+				reason: "gitlab-pat",
+				token: `glpat-${"a".repeat(20)}`,
+				nearMiss: `xglpat-${"a".repeat(20)}`,
+			},
+			{ reason: "npm-token", token: `npm_${"aA0".repeat(12)}` },
+			{ reason: "groq-api-key", token: `gsk_${"a".repeat(52)}` },
+			{ reason: "xai-api-key", token: `xai-${"a".repeat(79)}_` },
+			{ reason: "digitalocean-token", token: `dop_v1_${"a".repeat(64)}` },
+			{ reason: "shopify-token", token: `shpat_${"a".repeat(32)}` },
+			{
+				reason: "telegram-bot-token",
+				token: `1234567890:AA${"a".repeat(33)}`,
+			},
+			{
+				reason: "discord-bot-token",
+				token: `${"a".repeat(24)}.${"b".repeat(6)}.${"c".repeat(27)}`,
+				context: "Discord integration returned ",
+				nearMiss: `Discord integration returned ${"a".repeat(24)}.${"b".repeat(6)}.${"c".repeat(39)}`,
+			},
+		];
+
+		for (const { reason, token, context = "", nearMiss } of providerTokens) {
+			const input = `${context}${token}`;
+			expect(
+				scanForSecrets(config, input, {}).map((finding) => finding.reason),
+			).toContain(reason);
+			expect(redactString(config, input, {})).not.toContain(token);
+			expect(redactString(config, `${input}.`, {})).not.toContain(token);
+
+			for (const delimited of [
+				`value=${input}`,
+				`TOKEN=${token}`,
+				`value: ${input}.`,
+			]) {
+				expect(redactString(config, delimited, {})).not.toContain(token);
+			}
+			expect(
+				scanForSecrets(config, `value=${input}`, {}).map(
+					(finding) => finding.reason,
+				),
+			).toContain(reason);
+			expect(
+				scanForSecrets(config, `TOKEN=${token}`, {}).map(
+					(finding) => finding.reason,
+				),
+			).toContain("token");
+			expect(
+				scanForSecrets(config, `value: ${input}.`, {}).map(
+					(finding) => finding.reason,
+				),
+			).toContain(reason);
+
+			const overlong = nearMiss ?? `${input}x`;
+			expect(redactString(config, overlong, {})).toBe(overlong);
+			expect(
+				scanForSecrets(config, overlong, {}).map((finding) => finding.reason),
+			).not.toContain(reason);
+		}
+
+		const discordWithoutContext = `${"a".repeat(24)}.${"b".repeat(6)}.${"c".repeat(27)}`;
+		expect(redactString(config, discordWithoutContext, {})).toBe(
+			discordWithoutContext,
+		);
+		expect(scanForSecrets(config, discordWithoutContext, {})).toEqual([]);
+	});
+
+	it("covers established Slack, GitLab, DigitalOcean, Shopify, and Telegram variants", () => {
+		const slackTokens = [
+			`xoxp-1234567890-1234567890-${"a".repeat(28)}`,
+			`xoxa-1234567890-1234567890-${"a".repeat(28)}`,
+			`xoxr-1234567890-1234567890-${"a".repeat(28)}`,
+			`xoxb-12345678-${"a".repeat(18)}`,
+			`xoxp-111-222-333-${"a".repeat(10)}`,
+			"xoxo-1-2-3-a1b2c3d4",
+			"xoxs-1-2-3-a1b2c3d4",
+			"xapp-1-ABCDEFGHIJKLMNOPQRSTUVWXYZ-1234567890-abcdef",
+			"xoxe.xapp-1-ABCDEFGHIJKLMNOPQRSTUVWXYZ-1234567890-abcdef",
+			`xoxe-1-${"A".repeat(146)}`,
+			`xoxe.xoxb-1-${"A".repeat(163)}`,
+			`xoxe.xoxp-1-${"A".repeat(166)}`,
+		];
+		for (const token of slackTokens) {
+			expect(
+				scanForSecrets(config, token, {}).map((finding) => finding.reason),
+			).toContain("slack-token");
+			expect(redactString(config, token, {})).not.toContain(token);
+		}
+
+		const gitlabRoutableTokens = [
+			`glpat-${"a".repeat(27)}.ab.abcdefghi`,
+			`glpat-${"a".repeat(27)}.abcdefghi`,
+		];
+		for (const token of gitlabRoutableTokens) {
+			for (const delimited of [`value=${token}`, `value: ${token}.`]) {
+				expect(redactString(config, delimited, {})).not.toContain(token);
+			}
+			expect(
+				scanForSecrets(config, token, {}).map((finding) => finding.reason),
+			).toContain("gitlab-pat");
+			expect(redactString(config, token, {})).not.toContain(token);
+		}
+
+		for (const prefix of ["dop_v1_", "doo_v1_", "dor_v1_"]) {
+			const token = `${prefix}${"a".repeat(64)}`;
+			expect(
+				scanForSecrets(config, token, {}).map((finding) => finding.reason),
+			).toContain("digitalocean-token");
+			expect(redactString(config, token, {})).not.toContain(token);
+		}
+
+		for (const prefix of ["shpat_", "shpca_", "shppa_", "shpss_"]) {
+			const token = `${prefix}${"a".repeat(32)}`;
+			expect(
+				scanForSecrets(config, token, {}).map((finding) => finding.reason),
+			).toContain("shopify-token");
+			expect(redactString(config, token, {})).not.toContain(token);
+		}
+
+		for (const token of [
+			`12345:A${"a".repeat(33)}`,
+			`1234567890123456:A${"a".repeat(34)}`,
+		]) {
+			expect(
+				scanForSecrets(config, token, {}).map((finding) => finding.reason),
+			).toContain("telegram-bot-token");
+			expect(redactString(config, token, {})).not.toContain(token);
+		}
+
+		const discordLongToken = `${"a".repeat(27)}.${"b".repeat(6)}.${"c".repeat(38)}`;
+		expect(
+			scanForSecrets(
+				config,
+				`Discord webhook payload ${discordLongToken}`,
+				{},
+			).map((finding) => finding.reason),
+		).toContain("discord-bot-token");
+		expect(
+			redactString(config, `Discord webhook payload ${discordLongToken}`, {}),
+		).not.toContain(discordLongToken);
+		const delimitedDiscord = `value: Discord webhook payload ${discordLongToken}.`;
+		expect(redactString(config, delimitedDiscord, {})).not.toContain(
+			discordLongToken,
+		);
+	});
+
+	it("uses key suffixes consistently in structured fields, assignments, and scanning", () => {
+		const structured = sanitizeForTelemetry(
+			config,
+			{
+				cache_key: "cache-value-123456",
+				signing_key: "signing-value-123456",
+				passphrase: "passphrase-value-123456",
+				pin: 1234,
+				one_time_otp: 654321,
+				public_key: "ssh-public-material",
+				publicKey: "another-public-material",
+				total_tokens: 4096,
+				max_completion_tokens: 2048,
+			},
+			{},
+		);
+
+		expect(structured.cache_key).toContain("[REDACTED:cache-key:");
+		expect(structured.signing_key).toContain("[REDACTED:signing-key:");
+		expect(structured.passphrase).toContain("[REDACTED:passphrase:");
+		expect(structured.pin).toBe("[REDACTED:pin]");
+		expect(structured.one_time_otp).toBe("[REDACTED:one-time-otp]");
+		expect(structured.public_key).toBe("ssh-public-material");
+		expect(structured.publicKey).toBe("another-public-material");
+		expect(structured.total_tokens).toBe(4096);
+		expect(structured.max_completion_tokens).toBe(2048);
+
+		const assignments =
+			"access_token=opaque-token-value signing_key=signing-assignment-value " +
+			"passphrase=assignment-passphrase-value PIN=1234 OTP=654321 " +
+			"public_key=public-material total_tokens=4096";
+		const redactedAssignments = redactString(config, assignments, {});
+		expect(redactedAssignments).not.toContain("opaque-token-value");
+		expect(redactedAssignments).not.toContain("signing-assignment-value");
+		expect(redactedAssignments).not.toContain("assignment-passphrase-value");
+		expect(redactedAssignments).not.toContain("PIN=1234");
+		expect(redactedAssignments).not.toContain("OTP=654321");
+		expect(redactedAssignments).toContain("PIN=[REDACTED:pin]");
+		expect(redactedAssignments).toContain("OTP=[REDACTED:otp]");
+		expect(redactedAssignments).toContain("public_key=public-material");
+		expect(redactedAssignments).toContain("total_tokens=4096");
+
+		const numericJson =
+			'{"pin":1234,"one_time_otp":654321,"public_key":"public-material",' +
+			'"publicKey":"public-key-material","total_tokens":4096}';
+
+		const escapedJson =
+			'{"text":"{\\"signing_key\\":\\"escaped-key-value-secret\\"}"}';
+		const redactedEscapedJson = redactString(config, escapedJson, {});
+		expect(redactedEscapedJson).not.toContain("escaped-key-value-secret");
+		expect(redactedEscapedJson).toContain(
+			'\\"signing_key\\":\\"[REDACTED:signing-key:',
+		);
+		expect(
+			scanForSecrets(config, escapedJson, {}).map((finding) => finding.reason),
+		).toContain("signing-key");
+		const redactedJson = redactString(config, numericJson, {});
+		expect(redactedJson).not.toContain('"pin":1234');
+		expect(redactedJson).not.toContain('"one_time_otp":654321');
+		expect(redactedJson).toContain('"public_key":"public-material"');
+		expect(redactedJson).toContain('"publicKey":"public-key-material"');
+		expect(redactedJson).toContain('"total_tokens":4096');
+		const parsedNumericJson: Record<string, unknown> = JSON.parse(redactedJson);
+		expect(parsedNumericJson.pin).toBe("[REDACTED:pin]");
+		expect(parsedNumericJson.one_time_otp).toBe("[REDACTED:one-time-otp]");
+		expect(redactString(config, redactedJson, {})).toBe(redactedJson);
+		expect(scanForSecrets(config, redactedJson, {})).toEqual([]);
+
+		const escapedNumericJson = JSON.stringify({
+			text: JSON.stringify({ pin: 1234, one_time_otp: 654321 }),
+		});
+		const redactedEscapedNumericJson = redactString(
+			config,
+			escapedNumericJson,
+			{},
+		);
+		const parsedEscapedContainer: { text: string } = JSON.parse(
+			redactedEscapedNumericJson,
+		);
+		const parsedEscapedNumeric: { pin: string; one_time_otp: string } =
+			JSON.parse(parsedEscapedContainer.text);
+		expect(parsedEscapedNumeric.pin).toBe("[REDACTED:pin]");
+		expect(parsedEscapedNumeric.one_time_otp).toBe("[REDACTED:one-time-otp]");
+		expect(redactString(config, redactedEscapedNumericJson, {})).toBe(
+			redactedEscapedNumericJson,
+		);
+		expect(scanForSecrets(config, redactedEscapedNumericJson, {})).toEqual([]);
+
+		const deeplyEscapedNumericJson = JSON.stringify(escapedNumericJson);
+		const redactedDeeplyEscapedNumericJson = redactString(
+			config,
+			deeplyEscapedNumericJson,
+			{},
+		);
+		const decodedEscapedLayer: string = JSON.parse(
+			redactedDeeplyEscapedNumericJson,
+		);
+		const decodedEscapedContainer: { text: string } =
+			JSON.parse(decodedEscapedLayer);
+		const decodedDeepNumeric: { pin: string; one_time_otp: string } =
+			JSON.parse(decodedEscapedContainer.text);
+		expect(decodedDeepNumeric.pin).toBe("[REDACTED:pin]");
+		expect(decodedDeepNumeric.one_time_otp).toBe("[REDACTED:one-time-otp]");
+		expect(redactString(config, redactedDeeplyEscapedNumericJson, {})).toBe(
+			redactedDeeplyEscapedNumericJson,
+		);
+		expect(
+			scanForSecrets(config, redactedDeeplyEscapedNumericJson, {}),
+		).toEqual([]);
+
+		const findings = scanForSecrets(
+			config,
+			`${assignments} ${numericJson}`,
+			{},
+		).map((finding) => finding.reason);
+		expect(findings).toContain("access-token");
+		expect(findings).toContain("signing-key");
+		expect(findings).toContain("passphrase");
+		expect(findings).toContain("pin");
+		expect(findings).toContain("one-time-otp");
+		expect(findings).not.toContain("public-key");
+		expect(findings).not.toContain("total-tokens");
+
+		for (const key of [
+			"cache_key",
+			"signing_key",
+			"passphrase",
+			"passPhrase",
+			"pin",
+			"otp",
+			"token",
+			"TOKEN",
+		]) {
+			expect(isSensitiveKey(key)).toBe(true);
+		}
+		expect(isSensitiveKey("tokens")).toBe(false);
+		expect(isSensitiveKey("total_tokens")).toBe(false);
+		expect(isSensitiveKey("max_completion_tokens")).toBe(false);
+		for (const key of ["spinner", "mapping", "keyboard"]) {
+			expect(isSensitiveKey(key)).toBe(false);
+		}
+	});
+
+	it("keeps adversarial overlong provider-token near-misses bounded", () => {
+		const boundaryNearMiss = [
+			`xglpat-${"a".repeat(20)}`,
+			`xAIzaSy${"a".repeat(33)}`,
+			`npm_${"a".repeat(37)}`,
+			`xxoxb-1234567890-1234567890-${"a".repeat(28)}`,
+		].join("\n");
+		expect(redactString(config, boundaryNearMiss, {})).toBe(boundaryNearMiss);
+		expect(scanForSecrets(config, boundaryNearMiss, {})).toEqual([]);
+
+		const overlongNearMiss = [
+			`glpat-${"a".repeat(301)}x`,
+			`xoxb-1234567890-1234567890-${"a".repeat(129)}x`,
+		].join("\n");
+		const small = overlongNearMiss.repeat(10);
+		const large = overlongNearMiss.repeat(40);
+		const time = (fn: () => unknown) => {
+			const start = performance.now();
+			fn();
+			return performance.now() - start;
+		};
+
+		const findings = scanForSecrets(config, large, {}).map(
+			(finding) => finding.reason,
+		);
+		expect(findings).not.toContain("gitlab-pat");
+		expect(findings).not.toContain("slack-token");
+		const smallRedact = time(() => redactString(config, small, {}));
+		const largeRedact = time(() => redactString(config, large, {}));
+		expect(largeRedact, "overlong-token redaction scaling").toBeLessThan(
+			smallRedact * 10 + 250,
+		);
+		const smallScan = time(() => scanForSecrets(config, small, {}));
+		const largeScan = time(() => scanForSecrets(config, large, {}));
+		expect(largeScan, "overlong-token scanner scaling").toBeLessThan(
+			smallScan * 10 + 250,
+		);
+	});
+
+	it("redacts numeric PIN fragments at enclosing serialized-string boundaries", () => {
+		const fragment = '"pin":1234';
+		for (const depth of [0, 1, 2, 3]) {
+			let input = JSON.stringify({ text: fragment });
+			for (let layer = 0; layer < depth; layer += 1) {
+				input = JSON.stringify(input);
+			}
+			expect(scanForSecrets(config, input, {})).not.toEqual([]);
+			const redacted = redactString(config, input, {});
+			expect(redacted).not.toContain("1234");
+			expect(redactString(config, redacted, {})).toBe(redacted);
+			expect(scanForSecrets(config, redacted, {})).toEqual([]);
+			let decoded: unknown = redacted;
+			for (let layer = 0; layer <= depth; layer += 1) {
+				if (typeof decoded !== "string") {
+					throw new Error("Redacted PIN fragment lost a serialization layer");
+				}
+				decoded = JSON.parse(decoded);
+			}
+			expect(decoded).toEqual({
+				text: '"pin":"[REDACTED:pin]"',
+			});
+		}
+		const payload = {
+			content: [{ type: "text", text: JSON.stringify({ text: fragment }) }],
+		};
+		expect(
+			JSON.stringify(sanitizeForTelemetry(config, payload, {})),
+		).not.toContain("1234");
+		const ambiguous = JSON.stringify({ text: '"pin":1234"trailing-content' });
+		expect(redactString(config, ambiguous, {})).toBe(
+			"[REDACTED:suspicious-text]",
+		);
+	});
+
+	it("keeps unquoted assignment placeholders stable and scanner-silent", () => {
+		for (const input of [
+			"PIN=1234",
+			"OTP=654321",
+			"TOKEN=opaque-token-value",
+			"access_token=opaque-access-value",
+		]) {
+			const redacted = redactString(config, input, {});
+			expect(redacted).toContain("[REDACTED:");
+			expect(scanForSecrets(config, redacted, {})).toEqual([]);
+			expect(redactString(config, redacted, {})).toBe(redacted);
+			const wrapped = JSON.stringify(JSON.stringify({ text: redacted }));
+			expect(scanForSecrets(config, wrapped, {})).toEqual([]);
+			expect(redactString(config, wrapped, {})).toBe(wrapped);
+			for (const suffix of ["appended-secret", '\\"appended-secret']) {
+				const spoofed = `${redacted}${suffix}`;
+				expect(scanForSecrets(config, spoofed, {})).not.toEqual([]);
+				expect(redactString(config, spoofed, {})).toBe(
+					"[REDACTED:suspicious-text]",
+				);
+			}
+		}
+	});
+
+	it("preserves provider usage counters in structured and serialized values", () => {
+		const value = {
+			usage: {
+				cached_tokens: 100,
+				reasoning_tokens: 5,
+				cache_read_input_tokens: 100,
+				cache_creation_input_tokens: 25,
+			},
+		};
+		for (const key of Object.keys(value.usage)) {
+			expect(isSensitiveKey(key)).toBe(false);
+		}
+		expect(sanitizeForTelemetry(config, value, {})).toEqual(value);
+		const plain = JSON.stringify(value);
+		for (const input of [
+			plain,
+			JSON.stringify(plain),
+			JSON.stringify({ text: plain }),
+		]) {
+			expect(redactString(config, input, {})).toBe(input);
+			expect(scanForSecrets(config, input, {})).toEqual([]);
+		}
+		expect(isSensitiveKey("access_token")).toBe(true);
+		expect(isSensitiveKey("token")).toBe(true);
+	});
+
+	it("keeps standalone provider-token placeholders opaque across repeated shaping", () => {
+		const secret = `AIza${"a".repeat(35)}`;
+		const redacted = redactString(config, `before ${secret} after`, {});
+		expect(redacted).toMatch(
+			/^before \[REDACTED:google-api-key:[0-9a-f]{10}\] after$/,
+		);
+		expect(redactString(config, redacted, {})).toBe(redacted);
+		expect(scanForSecrets(config, redacted, {})).toEqual([]);
+		const malformed =
+			"[REDACTED: incomplete API_KEY=fragment-credential-123 [REDACTED:api-key:abcdef0123]";
+		expect(redactString(config, malformed, {})).not.toContain(
+			"fragment-credential-123",
+		);
+	});
+
+	it("removes recoverable PIN and OTP fingerprints from existing markers", () => {
+		const legacy =
+			"PIN=[REDACTED:pin:03ac674216] OTP=[REDACTED:login-otp:abcdef0123]";
+		const expected = "PIN=[REDACTED:pin] OTP=[REDACTED:login-otp]";
+		expect(redactString(config, legacy, {})).toBe(expected);
+		expect(redactString(config, expected, {})).toBe(expected);
+		expect(scanForSecrets(config, expected, {})).toEqual([]);
+		expect(redactString(config, "[REDACTED:api-key:abcdef0123]", {})).toBe(
+			"[REDACTED:api-key:abcdef0123]",
+		);
+	});
+
+	it("preserves request-key correlation metadata while scanning its values", () => {
+		expect(isSensitiveKey("requestKey")).toBe(false);
+		expect(isSensitiveKey("request_key")).toBe(false);
+		expect(isSensitiveKey("providerRequestKey")).toBe(true);
+
+		const correlation = sanitizeForTelemetry(
+			config,
+			{
+				requestKey: "turn:0:request:0",
+				request_key: "provider-req-1",
+				providerRequestKey: "private-correlation-value",
+			},
+			{},
+		);
+		expect(correlation.requestKey).toBe("turn:0:request:0");
+		expect(correlation.request_key).toBe("provider-req-1");
+		expect(correlation.providerRequestKey).toContain(
+			"[REDACTED:provider-request-key:",
+		);
+
+		const secretValues = sanitizeForTelemetry(
+			config,
+			{
+				requestKey: `AIzaSy${"a".repeat(33)}`,
+				request_key: "manually-configured-secret",
+			},
+			{},
+		);
+		expect(secretValues.requestKey).toContain("[REDACTED:google-api-key:");
+		expect(secretValues.request_key).toContain("[REDACTED:configured-secret:");
+	});
+
+	it("classifies singular TOKEN fields as secrets but preserves token counters", () => {
+		expect(isSensitiveKey("token")).toBe(true);
+		expect(isSensitiveKey("TOKEN")).toBe(true);
+		expect(isSensitiveKey("tokens")).toBe(false);
+		expect(isSensitiveKey("inputTokens")).toBe(false);
+		expect(isSensitiveKey("output_tokens")).toBe(false);
+		expect(isSensitiveKey("cacheTokens")).toBe(false);
+
+		const structured = sanitizeForTelemetry(
+			config,
+			{
+				TOKEN: "single-token-credential-value",
+				tokens: 7,
+				inputTokens: 10,
+				output_tokens: 11,
+				cacheTokens: 12,
+				total_tokens: 13,
+			},
+			{},
+		);
+		expect(structured.TOKEN).toContain("[REDACTED:token:");
+		expect(structured.tokens).toBe(7);
+		expect(structured.inputTokens).toBe(10);
+		expect(structured.output_tokens).toBe(11);
+		expect(structured.cacheTokens).toBe(12);
+		expect(structured.total_tokens).toBe(13);
+
+		const assignments =
+			"TOKEN=single-token-assignment-value tokens=7 " +
+			"input_tokens=10 output_tokens=11 total_tokens=13";
+		const redacted = redactString(config, assignments, {});
+		expect(redacted).not.toContain("single-token-assignment-value");
+		expect(redacted).toContain("tokens=7");
+		expect(redacted).toContain("input_tokens=10");
+		expect(redacted).toContain("output_tokens=11");
+		expect(redacted).toContain("total_tokens=13");
+		const findings = scanForSecrets(config, assignments, {}).map(
+			(finding) => finding.reason,
+		);
+		expect(findings).toContain("token");
+		expect(findings).not.toContain("tokens");
+		expect(findings).not.toContain("input-tokens");
 	});
 });

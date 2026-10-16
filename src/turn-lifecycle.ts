@@ -16,11 +16,11 @@ import { recordRuntimeError } from "./runtime-diagnostics.js";
 import type { SessionContextLike, SessionState } from "./session-state.js";
 import type {
 	costDetailsFromUsage,
-	extractTextFromContent,
 	standardUsageFromUsage,
 	telemetryText,
 	usageDetailsFromUsage,
 } from "./telemetry-helpers.js";
+import { projectAssistantOutput } from "./telemetry-helpers.js";
 
 export interface TurnLifecycleDependencies {
 	getConfig: () => Config;
@@ -31,7 +31,6 @@ export interface TurnLifecycleDependencies {
 	getRuntime: typeof getRuntime;
 	telemetryText: typeof telemetryText;
 	redactionMetadata: typeof redactionMetadata;
-	extractTextFromContent: typeof extractTextFromContent;
 	standardUsageFromUsage: typeof standardUsageFromUsage;
 	usageDetailsFromUsage: typeof usageDetailsFromUsage;
 	costDetailsFromUsage: typeof costDetailsFromUsage;
@@ -66,6 +65,8 @@ export function createTurnLifecycleHandlers(
 			generations: new Map(),
 			generationOrder: [],
 			nextGenerationIndex: 0,
+			inputMessages: [],
+			inputAttached: false,
 		};
 		prompt.activeTurns.set(event.turnIndex, turnState);
 		if (!deps.canTrace(config) || !prompt.trace) return;
@@ -99,18 +100,55 @@ export function createTurnLifecycleHandlers(
 		await turnState.spanStartPromise;
 	};
 
+	/**
+	 * The last tool result comes from the turn's finalized result list, which
+	 * Pi orders like the transcript, not from the order concurrent tools
+	 * finished in. A turn without tool results leaves the earlier one in place.
+	 */
+	const recordLastToolResult = (prompt: PromptState, event: TurnEndEvent) => {
+		const last = event.toolResults?.at(-1);
+		if (!last) return;
+		prompt.lastToolResult = {
+			toolCallId: last.toolCallId,
+			isError: last.isError === true,
+		};
+	};
+
+	/** A turn that was never tracked ends once; its tool result counts only the first time. */
+	const recordUntrackedTurnEnd = (prompt: PromptState, event: TurnEndEvent) => {
+		if (!prompt.completedTurnIndexes.has(event.turnIndex)) {
+			recordLastToolResult(prompt, event);
+		}
+		prompt.completedTurnIndexes.add(event.turnIndex);
+	};
+
+	const abandonUnfinishedGenerations = async (
+		prompt: PromptState,
+		turnState: TurnState,
+	) => {
+		const unfinished = Array.from(turnState.generations.values()).filter(
+			(generation) => !generation.ended,
+		);
+		if (unfinished.length === 0) return;
+		if (unfinished.some((generation) => !generation.finishPromise)) {
+			prompt.abandonmentReason ??= "turn ended before generation completion";
+		}
+		await deps.abandonTurnGenerations(turnState);
+	};
+
 	const turnEnd = async (event: TurnEndEvent, ctx: ExtensionContext) => {
 		const state = deps.getSessionState(ctx);
 		const prompt = state?.promptState;
 		if (!state || !prompt || prompt.finalizing) return;
 		const turnState = prompt.activeTurns.get(event.turnIndex);
 		if (!turnState) {
-			prompt.completedTurnIndexes.add(event.turnIndex);
+			recordUntrackedTurnEnd(prompt, event);
 			return;
 		}
 		if (turnState.ended) return;
 		turnState.ended = true;
 		prompt.completedTurnIndexes.add(event.turnIndex);
+		recordLastToolResult(prompt, event);
 		const message = event.message as {
 			role?: string;
 			content?: Array<{ type: string; text?: string }>;
@@ -123,21 +161,19 @@ export function createTurnLifecycleHandlers(
 			turnState.failure = failure;
 			prompt.failure ??= failure;
 		}
-		const unfinishedGenerations = Array.from(
-			turnState.generations.values(),
-		).some((generation) => !generation.ended);
-		const needsGenerationAbandonment = Array.from(
-			turnState.generations.values(),
-		).some((generation) => !generation.ended && !generation.finishPromise);
-		if (unfinishedGenerations) {
-			if (needsGenerationAbandonment) {
-				prompt.abandonmentReason ??= "turn ended before generation completion";
-			}
-			await deps.abandonTurnGenerations(turnState);
-		}
+		await abandonUnfinishedGenerations(prompt, turnState);
 		if (turnState.spanStartPromise) await turnState.spanStartPromise;
 		const config = deps.getConfig();
-		const outputText = deps.extractTextFromContent(message.content).trim();
+		const rawOutput =
+			turnState.assistantOutput ?? projectAssistantOutput(message.content);
+		const output = {
+			...rawOutput,
+			text: deps.telemetryText(
+				config,
+				rawOutput.text,
+				config.traceOutputMaxChars,
+			),
+		};
 
 		const usage = message.usage;
 		const standardUsage = deps.standardUsageFromUsage(usage);
@@ -146,9 +182,8 @@ export function createTurnLifecycleHandlers(
 
 		if (deps.canTrace(config)) {
 			turnState.span?.end({
-				output: outputText
-					? deps.telemetryText(config, outputText, config.traceOutputMaxChars)
-					: undefined,
+				input: turnState.inputMessages,
+				output,
 				usage: standardUsage,
 				usageDetails,
 				costDetails,

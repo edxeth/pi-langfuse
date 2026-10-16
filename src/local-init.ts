@@ -338,10 +338,11 @@ function dockerComposeFile(webPort: number) {
       - 127.0.0.1:19000:9000
     healthcheck:
       test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
-      interval: 5s
+      interval: 30s
+      start_interval: 2s
       timeout: 5s
-      retries: 10
-      start_period: 1s
+      retries: 3
+      start_period: 120s
 
   minio:
     image: cgr.dev/chainguard/minio
@@ -358,10 +359,11 @@ function dockerComposeFile(webPort: number) {
       - langfuse_minio_data:/data
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
-      interval: 1s
+      interval: 30s
+      start_interval: 2s
       timeout: 5s
-      retries: 5
-      start_period: 1s
+      retries: 3
+      start_period: 60s
 
   redis:
     image: docker.io/redis:7
@@ -375,18 +377,22 @@ function dockerComposeFile(webPort: number) {
       - langfuse_redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 3s
+      interval: 30s
+      start_interval: 2s
       timeout: 10s
-      retries: 10
+      retries: 3
+      start_period: 60s
 
   postgres:
     image: docker.io/postgres:17
     restart: always
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 3s
+      interval: 30s
+      start_interval: 2s
       timeout: 3s
-      retries: 10
+      retries: 3
+      start_period: 60s
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}

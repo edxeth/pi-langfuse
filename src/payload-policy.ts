@@ -1,4 +1,5 @@
 import {
+	allCaptureFieldsEnabled,
 	CAPTURE_POLICIES,
 	type CaptureField,
 	type CapturePolicy,
@@ -69,6 +70,16 @@ function sanitizeLimits(limits: PayloadLimits, field: CaptureField) {
 	};
 }
 
+const OPAQUE_REPLAY_SIGNATURE_KEYS = new Set([
+	"thoughtSignature",
+	"textSignature",
+	"thinkingSignature",
+]);
+
+function isOpaqueReplaySignatureKey(key: string) {
+	return OPAQUE_REPLAY_SIGNATURE_KEYS.has(key);
+}
+
 const STRUCTURAL_KEYS = new Set([
 	"type",
 	"timestamp",
@@ -90,10 +101,14 @@ const STRUCTURAL_KEYS = new Set([
 	"modelParameters",
 	"completionStartTime",
 	"messageCount",
+	"messagesSummaryOmitted",
 	"estimatedBytes",
 	"payloadCaptured",
 	"captureMode",
 	"fullMessagesOmitted",
+	// Names of stored-context references; training export needs them whatever
+	// the capture policy drops.
+	"serverSideContext",
 	"contentTruncated",
 	"resultTruncated",
 	"imgBlocks",
@@ -138,6 +153,13 @@ function boundedString(value: string, maxChars: number) {
 		: value;
 }
 
+/** Tool content has its own character budget. */
+function maxCharsFor(field: CaptureField, limits: PayloadLimits) {
+	return field === "toolInput" || field === "toolOutput"
+		? limits.maxToolChars
+		: limits.maxStringChars;
+}
+
 function boundValue(
 	value: unknown,
 	field: CaptureField,
@@ -149,12 +171,7 @@ function boundValue(
 	state.nodes += 1;
 
 	if (typeof value === "string") {
-		return boundedString(
-			value,
-			field === "toolInput" || field === "toolOutput"
-				? limits.maxToolChars
-				: limits.maxStringChars,
-		);
+		return boundedString(value, maxCharsFor(field, limits));
 	}
 	if (!value || typeof value !== "object") return value;
 	if (depth >= limits.maxDepth) return "[TRUNCATED:depth]";
@@ -179,7 +196,7 @@ function boundValue(
 		for (let index = 0; index < keyLimit; index += 1) {
 			if (state.nodes >= limits.maxNodes) break;
 			const key = keys[index];
-			if (!key) continue;
+			if (!key || isOpaqueReplaySignatureKey(key)) continue;
 			const item = boundValue(
 				(value as Record<string, unknown>)[key],
 				field,
@@ -195,6 +212,10 @@ function boundValue(
 	}
 }
 
+/**
+ * `key` names the field that holds `value` when the caller knows it, so the
+ * identity policy can recognize user and repository fields at any depth.
+ */
 function shapeValueWithState<T>(
 	config: PayloadPolicyConfig,
 	field: CaptureField,
@@ -202,6 +223,7 @@ function shapeValueWithState<T>(
 	options: ShapeOptions,
 	limits: PayloadLimits,
 	state: ShapeState,
+	key?: string,
 ): T | undefined {
 	if (value === undefined) return undefined;
 	if (!options.forceCapture && !isCaptureEnabled(config, field))
@@ -212,6 +234,7 @@ function shapeValueWithState<T>(
 		process.env,
 		new WeakSet<object>(),
 		sanitizeLimits(limits, field),
+		key,
 	);
 	return boundValue(sanitized, field, limits, state, 0) as T | undefined;
 }
@@ -241,6 +264,7 @@ function shapeValueForKey<T>(
 	limits: PayloadLimits,
 	state: ShapeState,
 ): T | undefined {
+	if (isOpaqueReplaySignatureKey(key)) return undefined;
 	if (
 		(isSensitiveKey(key) || isBinaryKey(key)) &&
 		(options.forceCapture || isCaptureEnabled(config, field))
@@ -252,30 +276,83 @@ function shapeValueForKey<T>(
 			new WeakSet<object>(),
 			sanitizeLimits(limits, field),
 		) as Record<string, unknown>;
-		return boundValue(sanitizedRecord[key], field, limits, state, 0) as
-			| T
-			| undefined;
+		// Identity normalization can rewrite the single key, so read by position.
+		return boundValue(
+			Object.values(sanitizedRecord)[0],
+			field,
+			limits,
+			state,
+			0,
+		) as T | undefined;
 	}
-	return shapeValueWithState(config, field, value, options, limits, state);
+	return shapeValueWithState(config, field, value, options, limits, state, key);
 }
+
+/**
+ * Message keys that describe the message or its correlation, not content the
+ * role owns. They stay independent of the role's content policy (metadata
+ * field); every other key of a role-bearing message is wrapper data.
+ */
+const MESSAGE_STRUCTURAL_KEYS = new Set([
+	...STRUCTURAL_KEYS,
+	"toolName",
+	"customType",
+	"display",
+	"excludeFromContext",
+	"exitCode",
+	"cancelled",
+	"truncated",
+	"fromId",
+	"tokensBefore",
+	"api",
+	"responseId",
+	"errorMessage",
+]);
+
+/** Roles whose wrapper data is tool data (Pi `toolResult` and wire variants). */
+function isToolResultRole(role: string) {
+	return role === "tool" || role === "tool_result" || role === "toolResult";
+}
+
+const WRAPPER_OWNING_ROLES = new Set([
+	"system",
+	"user",
+	"assistant",
+	"model",
+	"custom",
+	"branchSummary",
+	"compactionSummary",
+	"bashExecution",
+]);
+
+/**
+ * Field that owns a role's content-bearing wrapper data such as tool-result
+ * `details`: the role's content field. Unroled items and unknown roles have no
+ * owner and keep the metadata mapping.
+ */
+function wrapperDataField(role: string, key: string): CaptureField {
+	if (isToolResultRole(role)) return "toolOutput";
+	if (role === "bashExecution") {
+		return key === "command" ? "toolInput" : "toolOutput";
+	}
+	if (WRAPPER_OWNING_ROLES.has(role)) return messageField(role, "content");
+	return "metadata";
+}
+
+/** Capture field of a message's content by role; other roles are provider input. */
+const CONTENT_FIELD_BY_ROLE: ReadonlyMap<string, CaptureField> = new Map([
+	["system", "systemPrompt"],
+	["user", "prompt"],
+	["assistant", "assistantOutput"],
+	["model", "assistantOutput"],
+	["tool", "toolOutput"],
+	["tool_result", "toolOutput"],
+	["toolResult", "toolOutput"],
+]);
 
 function messageField(role: string, key: string): CaptureField {
 	if (key === "content" || key === "parts") {
-		switch (role) {
-			case "system":
-				return "systemPrompt";
-			case "user":
-				return "prompt";
-			case "assistant":
-			case "model":
-				return "assistantOutput";
-			case "tool":
-			case "tool_result":
-			case "toolResult":
-				return "toolOutput";
-			default:
-				return "providerInput";
-		}
+		return CONTENT_FIELD_BY_ROLE.get(role) ?? "providerInput";
 	}
 	// Pi system messages carry the prompt text in named sections; the
 	// sections are system-prompt content, not metadata.
@@ -283,15 +360,15 @@ function messageField(role: string, key: string): CaptureField {
 		return role === "system" ? "systemPrompt" : "metadata";
 	}
 	if (key === "tool_calls" || key === "arguments") return "toolInput";
-	return "metadata";
+	if (MESSAGE_STRUCTURAL_KEYS.has(key)) return "metadata";
+	return wrapperDataField(role, key);
 }
 
 /**
  * Field classification for unroled Responses input items. Role-bearing
- * messages keep the role-based mapping. Tool fields on these items follow
- * tool capture policy, and reasoning contents are excluded from capture
- * entirely — summaries and encrypted reasoning blobs are never persisted,
- * regardless of policy or overrides.
+ * messages keep the role-based mapping. Tool fields follow tool capture
+ * policy; reasoning summaries follow assistant-output policy, while opaque
+ * reasoning payloads remain excluded regardless of policy or overrides.
  */
 function responsesItemField(
 	itemType: string,
@@ -345,11 +422,10 @@ function isRoleContentField(field: CaptureField): boolean {
 	);
 }
 
-/** Reasoning contents are never captured; id/type stay for correlation. */
+/** Opaque reasoning payloads are excluded; item identity stays for correlation. */
 function reasoningItemField(key: string): CaptureField | "exclude" | undefined {
-	if (key === "summary" || key === "content" || key === "encrypted_content") {
-		return "exclude";
-	}
+	if (key === "summary") return "assistantOutput";
+	if (key === "content" || key === "encrypted_content") return "exclude";
 	return undefined;
 }
 
@@ -696,6 +772,57 @@ function shapeProviderInputValue<T>(
 	return output as T;
 }
 
+/** Assistant output keys, in shaping order, with the capture field each follows. */
+const ASSISTANT_OUTPUT_FIELDS: ReadonlyArray<readonly [string, CaptureField]> =
+	[
+		["text", "assistantOutput"],
+		["thinking", "assistantOutput"],
+		["tool_calls", "toolInput"],
+	];
+
+/** A shaped object, kept when it has content or capture is forced. */
+function presentOrForced(
+	output: Record<string, unknown>,
+	options: ShapeOptions,
+) {
+	return Object.keys(output).length > 0 || options.forceCapture
+		? output
+		: undefined;
+}
+
+function shapeAssistantOutput(
+	config: PayloadPolicyConfig,
+	value: Record<string, unknown>,
+	options: ShapeOptions,
+	limits: PayloadLimits,
+	state: ShapeState,
+): Record<string, unknown> | undefined {
+	const output: Record<string, unknown> = {};
+	for (const [key, field] of ASSISTANT_OUTPUT_FIELDS) {
+		if (!(key in value)) continue;
+		const shaped = shapeValueForKey(
+			config,
+			key,
+			field,
+			value[key],
+			options,
+			limits,
+			state,
+		);
+		if (shaped !== undefined) output[key] = shaped;
+	}
+	return presentOrForced(output, options);
+}
+
+/** A record that holds any key `shapeAssistantOutput` shapes. */
+function isAssistantOutputRecord(
+	value: unknown,
+): value is Record<string, unknown> {
+	return (
+		isRecord(value) && ASSISTANT_OUTPUT_FIELDS.some(([key]) => key in value)
+	);
+}
+
 function shapeFieldValue<T>(
 	config: PayloadPolicyConfig,
 	key: string,
@@ -705,6 +832,11 @@ function shapeFieldValue<T>(
 	limits: PayloadLimits,
 	state: ShapeState,
 ): T | undefined {
+	if (field === "assistantOutput" && isAssistantOutputRecord(value)) {
+		return shapeAssistantOutput(config, value, options, limits, state) as
+			| T
+			| undefined;
+	}
 	return field === "providerInput"
 		? shapeProviderInputValue(config, value, options, limits, state)
 		: shapeValueForKey(config, key, field, value, options, limits, state);
@@ -732,6 +864,7 @@ function metadataField(key: string): CaptureField {
 
 function shapeMetadata(
 	config: PayloadPolicyConfig,
+	key: string,
 	value: unknown,
 	options: ShapeOptions,
 	limits: PayloadLimits,
@@ -745,6 +878,7 @@ function shapeMetadata(
 			options,
 			limits,
 			state,
+			key,
 		);
 	}
 
@@ -768,9 +902,33 @@ function shapeMetadata(
 			contentKeys += 1;
 		}
 	}
-	return Object.keys(output).length > 0 || options.forceCapture
-		? output
-		: undefined;
+	return presentOrForced(output, options);
+}
+
+/** Shape one record entry by its capture field; no field means plain sanitization. */
+function shapeRecordEntry(
+	config: PayloadPolicyConfig,
+	key: string,
+	item: unknown,
+	field: CaptureField | undefined,
+	options: ShapeOptions,
+	limits: PayloadLimits,
+	state: ShapeState,
+): unknown {
+	if (field === "metadata") {
+		return shapeMetadata(config, key, item, options, limits, state);
+	}
+	if (field) {
+		return shapeFieldValue(config, key, field, item, options, limits, state);
+	}
+	return sanitizeForTelemetry(
+		config,
+		item,
+		process.env,
+		new WeakSet<object>(),
+		undefined,
+		key,
+	);
 }
 
 function shapeRecord(
@@ -778,23 +936,27 @@ function shapeRecord(
 	value: Record<string, unknown>,
 	fieldForKey: (key: string) => CaptureField | undefined,
 	options: ShapeOptions,
+	limits: PayloadLimits = getPayloadLimits(config),
 ) {
-	const limits = getPayloadLimits(config);
 	const state: ShapeState = { nodes: 0, active: new WeakSet<object>() };
 	const output: Record<string, unknown> = {};
 	let contentKeys = 0;
 	for (const [key, item] of Object.entries(value)) {
+		if (isOpaqueReplaySignatureKey(key)) continue;
 		const field = fieldForKey(key);
 		if (field !== undefined) {
 			if (state.nodes >= limits.maxNodes) continue;
 			if (contentKeys >= limits.maxObjectKeys) continue;
 		}
-		const shaped =
-			field === "metadata"
-				? shapeMetadata(config, item, options, limits, state)
-				: field
-					? shapeFieldValue(config, key, field, item, options, limits, state)
-					: sanitizeForTelemetry(config, item);
+		const shaped = shapeRecordEntry(
+			config,
+			key,
+			item,
+			field,
+			options,
+			limits,
+			state,
+		);
 		if (shaped !== undefined) {
 			output[key] = shaped;
 			if (field !== undefined) contentKeys += 1;
@@ -821,17 +983,18 @@ export function shapeLangfuseTraceBody<T extends Record<string, unknown>>(
 	) as T;
 }
 
+function observationInputField(name: string): CaptureField {
+	if (name.startsWith("tool:")) return "toolInput";
+	if (name === "llm-response" || name === "agent.turn") return "providerInput";
+	if (name === "agent.prompt") return "prompt";
+	return "metadata";
+}
+
 function observationField(name: string, key: string): CaptureField | undefined {
 	if (key === "metadata") return "metadata";
-	if (key === "input") {
-		if (name.startsWith("tool:")) return "toolInput";
-		if (name === "llm-response") return "providerInput";
-		if (name === "agent.prompt") return "prompt";
-		return "metadata";
-	}
+	if (key === "input") return observationInputField(name);
 	if (key === "output") {
-		if (name.startsWith("tool:")) return "toolOutput";
-		return "assistantOutput";
+		return name.startsWith("tool:") ? "toolOutput" : "assistantOutput";
 	}
 	if (key === "statusMessage") return "metadata";
 	if (STRUCTURAL_KEYS.has(key)) return undefined;
@@ -851,39 +1014,173 @@ export function shapeLangfuseObservationBody<T extends Record<string, unknown>>(
 	) as T;
 }
 
+/** Raw-record keys whose capture field does not depend on the record type. */
+const RAW_FIELD_BY_KEY: ReadonlyMap<string, CaptureField> = new Map([
+	["prompt", "prompt"],
+	["systemPrompt", "systemPrompt"],
+	["messages", "providerInput"],
+	["messagesSummary", "providerInput"],
+	["payloadSummary", "providerInput"],
+	["inputSummary", "toolInput"],
+	["text", "assistantOutput"],
+	["thinking", "assistantOutput"],
+	["contentSummary", "toolOutput"],
+	["resultSummary", "toolOutput"],
+]);
+
 function rawField(type: string, key: string): CaptureField | undefined {
-	if (key === "prompt") return "prompt";
-	if (key === "systemPrompt") return "systemPrompt";
-	if (
-		key === "messages" ||
-		key === "messagesSummary" ||
-		key === "payloadSummary"
-	)
-		return "providerInput";
-	if (key === "args" || key === "input" || key === "argsSummary")
+	if (key === "args" || key === "input" || key === "argsSummary") {
 		return type.startsWith("tool_") || type === "tool_call"
 			? "toolInput"
 			: "providerInput";
-	if (key === "inputSummary") return "toolInput";
-	if (key === "text") return "assistantOutput";
-	if (key === "thinking") return "assistantOutput";
-	if (key === "contentSummary" || key === "resultSummary") return "toolOutput";
-	return undefined;
+	}
+	return RAW_FIELD_BY_KEY.get(key);
+}
+
+/** Raw record types that carry the content a training sample is built from. */
+const RAW_PROVENANCE_RECORD_TYPES: ReadonlySet<string> = new Set([
+	"provider_request",
+	"assistant_output",
+]);
+
+/** Key under which shaped raw records report their capture provenance. */
+export const RAW_CAPTURE_PROVENANCE_KEY = "captureProvenance";
+
+/**
+ * Why a content field of a raw record was not captured completely:
+ * `policy-omitted` when capture-policy fields dropped content, otherwise
+ * `budget-truncated` when only the payload limits cut it.
+ */
+export type RawFieldDegradation = "policy-omitted" | "budget-truncated";
+
+/**
+ * Measured, not configured: what shaping did to each content field of one
+ * raw record. A field is `verified` only when its emitted value equals the
+ * value of the same shaping run with every capture field forced on and every
+ * payload limit lifted, so neither the policy nor a budget removed content.
+ * Redaction, identity normalization, and the unconditional removal of opaque
+ * reasoning payloads apply to both runs and are not degradations.
+ */
+export interface RawCaptureProvenance {
+	schema: 1;
+	/** Top-level content fields emitted completely. */
+	verified: string[];
+	/** Top-level content fields present in the source but emitted degraded. */
+	degraded: Record<string, RawFieldDegradation>;
+}
+
+const UNLIMITED_PAYLOAD_LIMITS: PayloadLimits = {
+	maxStringChars: Infinity,
+	maxToolChars: Infinity,
+	maxDepth: Infinity,
+	maxArrayItems: Infinity,
+	maxObjectKeys: Infinity,
+	maxNodes: Infinity,
+};
+
+function sameShapedValue(left: unknown, right: unknown) {
+	return JSON.stringify(left) === JSON.stringify(right);
+}
+
+/** The shaping runs one raw record's provenance is judged against. */
+interface ProvenanceRuns {
+	/** What was emitted. */
+	actual: Record<string, unknown>;
+	/** The same policy with every payload limit lifted. */
+	unbounded: Record<string, unknown>;
+	/** Every capture field forced on and every payload limit lifted. */
+	reference: Record<string, unknown>;
+}
+
+function provenanceRuns(
+	config: PayloadPolicyConfig,
+	record: Record<string, unknown>,
+	fieldForKey: (key: string) => CaptureField | undefined,
+	actual: Record<string, unknown>,
+): ProvenanceRuns {
+	const limits = getPayloadLimits(config);
+	const unlimited = Object.entries(limits).every(
+		([, limit]) => limit === Infinity,
+	);
+	// Without a finite limit the actual run already is the unbounded one, and
+	// with every capture field also enabled it is the reference too; any other
+	// config needs the comparison runs.
+	const unbounded = unlimited
+		? actual
+		: shapeRecord(config, record, fieldForKey, {}, UNLIMITED_PAYLOAD_LIMITS);
+	const reference =
+		unlimited && allCaptureFieldsEnabled(config)
+			? actual
+			: shapeRecord(
+					config,
+					record,
+					fieldForKey,
+					{ forceCapture: true },
+					UNLIMITED_PAYLOAD_LIMITS,
+				);
+	return { actual, unbounded, reference };
+}
+
+/** Why one content field was degraded; undefined when it is verified. */
+function fieldDegradation(
+	key: string,
+	{ actual, unbounded, reference }: ProvenanceRuns,
+): RawFieldDegradation | undefined {
+	if (reference === actual || sameShapedValue(actual[key], reference[key])) {
+		return undefined;
+	}
+	return sameShapedValue(unbounded[key], reference[key])
+		? "budget-truncated"
+		: "policy-omitted";
+}
+
+function rawCaptureProvenance(
+	config: PayloadPolicyConfig,
+	record: Record<string, unknown>,
+	fieldForKey: (key: string) => CaptureField | undefined,
+	actual: Record<string, unknown>,
+): RawCaptureProvenance {
+	const runs = provenanceRuns(config, record, fieldForKey, actual);
+	const provenance: RawCaptureProvenance = {
+		schema: 1,
+		verified: [],
+		degraded: {},
+	};
+	for (const [key, item] of Object.entries(record)) {
+		const field = fieldForKey(key);
+		if (item === undefined || field === undefined || field === "metadata")
+			continue;
+		const degradation = fieldDegradation(key, runs);
+		if (degradation) provenance.degraded[key] = degradation;
+		else provenance.verified.push(key);
+	}
+	return provenance;
 }
 
 export function shapeRawTraceRecord<T extends Record<string, unknown>>(
 	config: PayloadPolicyConfig,
 	record: T,
 ): T {
-	return shapeRecord(
-		config,
-		record,
-		(key) => {
-			if (STRUCTURAL_KEYS.has(key)) return undefined;
-			return rawField(String(record.type ?? ""), key) ?? "metadata";
-		},
-		{},
-	) as T;
+	const type = String(record.type ?? "");
+	const fieldForKey = (key: string) => {
+		// Assistant output uses this name for argument-bearing calls; other
+		// records keep the legacy structural call-count field.
+		if (type === "assistant_output" && key === "toolCalls") return "toolInput";
+		if (STRUCTURAL_KEYS.has(key)) return undefined;
+		return rawField(type, key) ?? "metadata";
+	};
+	const shaped = shapeRecord(config, record, fieldForKey, {});
+	if (!RAW_PROVENANCE_RECORD_TYPES.has(type)) return shaped as T;
+	const withProvenance: Record<string, unknown> = {
+		...shaped,
+		[RAW_CAPTURE_PROVENANCE_KEY]: rawCaptureProvenance(
+			config,
+			record,
+			fieldForKey,
+			shaped,
+		),
+	};
+	return withProvenance as T;
 }
 
 export function shapeExportValue<T>(config: PayloadPolicyConfig, value: T): T {

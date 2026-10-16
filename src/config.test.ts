@@ -1,5 +1,5 @@
 import * as fs from "node:fs";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getConfigFilePath, resolveConfig } from "./config.js";
 import { DEFAULT_SETTINGS } from "./settings.js";
 
@@ -25,6 +25,8 @@ describe("resolveConfig", () => {
 		delete process.env.PI_LANGFUSE_REDACTION_SECRETS;
 		delete process.env.PI_LANGFUSE_RAW_PROVIDER_REQUEST;
 		delete process.env.PI_LANGFUSE_CAPTURE_POLICY;
+		delete process.env.PI_LANGFUSE_RAW_TRACE;
+		delete process.env.PI_LANGFUSE_RAW_TRACE_DIR;
 		delete process.env.PI_LANGFUSE_CAPTURE_PROMPT;
 		delete process.env.PI_LANGFUSE_CAPTURE_SYSTEM_PROMPT;
 		delete process.env.PI_LANGFUSE_CAPTURE_PROVIDER_INPUT;
@@ -40,6 +42,8 @@ describe("resolveConfig", () => {
 		delete process.env.PI_LANGFUSE_PAYLOAD_MAX_NODES;
 		delete process.env.PI_CODING_AGENT_DIR;
 		delete process.env.PI_LANGFUSE_CONFIG;
+		delete process.env.PI_LANGFUSE_EXPORT_LICENSE;
+		delete process.env.PI_LANGFUSE_EXPORT_CONSENT;
 	});
 	it("loads the config file from PI_LANGFUSE_CONFIG when set", () => {
 		process.env.PI_CODING_AGENT_DIR = "/tmp/agent-default";
@@ -160,6 +164,141 @@ describe("resolveConfig", () => {
 		expect(resolveConfig({}).rawTraceProviderRequestMode).toBe("full");
 	});
 
+	it("keeps tracing of unpersisted sessions off by default, switchable by file or environment", () => {
+		try {
+			expect(resolveConfig({}).skipUnpersistedSessions).toBe(true);
+
+			process.env.PI_LANGFUSE_SKIP_UNPERSISTED = "0";
+			expect(resolveConfig({}).skipUnpersistedSessions).toBe(false);
+
+			vi.mocked(fs.existsSync).mockReturnValue(true);
+			vi.mocked(fs.readFileSync).mockReturnValue(
+				JSON.stringify({ skipUnpersistedSessions: true }),
+			);
+			expect(resolveConfig({}).skipUnpersistedSessions).toBe(true);
+		} finally {
+			delete process.env.PI_LANGFUSE_SKIP_UNPERSISTED;
+		}
+	});
+
+	it("writes no raw traces unless a source enables them", () => {
+		try {
+			expect(resolveConfig({}).rawTraceEnabled).toBe(false);
+
+			process.env.PI_LANGFUSE_RAW_TRACE = "1";
+			expect(resolveConfig({}).rawTraceEnabled).toBe(true);
+		} finally {
+			delete process.env.PI_LANGFUSE_RAW_TRACE;
+		}
+	});
+
+	it("takes default tags from settings, then the config file, then the environment", () => {
+		try {
+			expect(resolveConfig({}).defaultTags).toEqual([]);
+			process.env.PI_LANGFUSE_TAGS = "env-a, env-b";
+			expect(resolveConfig({}).defaultTags).toEqual(["env-a", "env-b"]);
+
+			vi.mocked(fs.existsSync).mockReturnValue(true);
+			vi.mocked(fs.readFileSync).mockReturnValue(
+				JSON.stringify({ defaultTags: "file-a" }),
+			);
+			expect(resolveConfig({}).defaultTags).toEqual(["file-a"]);
+			expect(
+				resolveConfig({ "default-tags": "set-a, set-b" }).defaultTags,
+			).toEqual(["set-a", "set-b"]);
+		} finally {
+			delete process.env.PI_LANGFUSE_TAGS;
+		}
+	});
+
+	it("declares no export license and unknown consent by default", () => {
+		const config = resolveConfig({});
+
+		expect(config.exportLicense).toBe("");
+		expect(config.exportConsent).toBe("unknown");
+	});
+
+	it("reads export declarations from the config file before the environment", () => {
+		process.env.PI_LANGFUSE_EXPORT_LICENSE = "env-license";
+		process.env.PI_LANGFUSE_EXPORT_CONSENT = "denied";
+		expect(resolveConfig({})).toMatchObject({
+			exportLicense: "env-license",
+			exportConsent: "denied",
+		});
+
+		vi.mocked(fs.existsSync).mockReturnValue(true);
+		vi.mocked(fs.readFileSync).mockReturnValue(
+			JSON.stringify({
+				exportLicense: "file-license",
+				exportConsent: "granted",
+			}),
+		);
+		expect(resolveConfig({})).toMatchObject({
+			exportLicense: "file-license",
+			exportConsent: "granted",
+		});
+	});
+
+	it.each([
+		[
+			"a consent array",
+			{ exportConsent: ["granted"] },
+			"exportConsentError",
+			"an array",
+		],
+		[
+			"an empty consent array",
+			{ exportConsent: [] },
+			"exportConsentError",
+			"an array",
+		],
+		["a null consent", { exportConsent: null }, "exportConsentError", "null"],
+		["a numeric consent", { exportConsent: 1 }, "exportConsentError", "number"],
+		["a license object", { exportLicense: {} }, "exportLicenseError", "object"],
+		["a null license", { exportLicense: null }, "exportLicenseError", "null"],
+	])(
+		"reports %s instead of coercing it",
+		(_name, file, errorKey, described) => {
+			process.env.PI_LANGFUSE_EXPORT_CONSENT = "granted";
+			process.env.PI_LANGFUSE_EXPORT_LICENSE = "env-license";
+			vi.mocked(fs.existsSync).mockReturnValue(true);
+			vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify(file));
+
+			const config = resolveConfig({});
+
+			// A present wrong-typed file value outranks the environment and is
+			// never turned into "granted", "[object Object]", or a default.
+			expect(config[errorKey as "exportConsentError"]).toContain(
+				"must be a string",
+			);
+			expect(config[errorKey as "exportConsentError"]).toMatch(
+				new RegExp(`, not ${described}$`),
+			);
+			expect(config.exportConsent).not.toBe("[object Object]");
+			expect(config.exportLicense).not.toBe("[object Object]");
+			if (errorKey === "exportConsentError") {
+				expect(config.exportConsent).toBe("unknown");
+			} else {
+				expect(config.exportLicense).toBe("");
+			}
+			// Unrelated live configuration still resolves.
+			expect(config.identityError).toBeUndefined();
+			expect(config.enabled).toBeDefined();
+		},
+	);
+
+	it("reports no declaration error for missing, blank, or string values", () => {
+		expect(resolveConfig({})).not.toHaveProperty("exportConsentError");
+		vi.mocked(fs.existsSync).mockReturnValue(true);
+		vi.mocked(fs.readFileSync).mockReturnValue(
+			JSON.stringify({ exportConsent: "  ", exportLicense: "" }),
+		);
+		const config = resolveConfig({});
+		expect(config).not.toHaveProperty("exportConsentError");
+		expect(config).not.toHaveProperty("exportLicenseError");
+		expect(config.exportConsent).toBe("unknown");
+	});
+
 	it("resolves capture policies, overrides, and bounded payload budgets by precedence", () => {
 		vi.mocked(fs.existsSync).mockReturnValue(true);
 		vi.mocked(fs.readFileSync).mockReturnValue(
@@ -198,5 +337,55 @@ describe("resolveConfig", () => {
 		const malformedConfig = resolveConfig({});
 		expect(malformedConfig.capturePolicy).toBe("metadata-only");
 		expect(malformedConfig.payloadMaxNodes).toBe(0);
+	});
+});
+
+describe("local autostart precedence", () => {
+	const originalAutostart = process.env.PI_LANGFUSE_AUTOSTART;
+
+	function configFile(content: Record<string, unknown> | undefined) {
+		vi.mocked(fs.existsSync).mockReturnValue(content !== undefined);
+		vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify(content ?? {}));
+	}
+
+	function autostart(
+		env: string | undefined,
+		file: Record<string, unknown> | undefined,
+	) {
+		if (env === undefined) delete process.env.PI_LANGFUSE_AUTOSTART;
+		else process.env.PI_LANGFUSE_AUTOSTART = env;
+		configFile(file);
+		return resolveConfig({}).localAutostart;
+	}
+
+	afterEach(() => {
+		if (originalAutostart === undefined) {
+			delete process.env.PI_LANGFUSE_AUTOSTART;
+		} else {
+			process.env.PI_LANGFUSE_AUTOSTART = originalAutostart;
+		}
+	});
+
+	it.each([
+		["0 over a file that enables it", "0", { localAutostart: true }, false],
+		["1 over a file that disables it", "1", { localAutostart: false }, true],
+		["1 with no file", "1", undefined, true],
+		[
+			"a file value when the variable is unset",
+			undefined,
+			{ localAutostart: true },
+			true,
+		],
+		["a file that disables it", undefined, { localAutostart: false }, false],
+		["a file that does not mention it", undefined, {}, false],
+		["off when nothing configures it", undefined, undefined, false],
+		[
+			"a file value when the variable is neither 0 nor 1",
+			"yes",
+			{ localAutostart: true },
+			true,
+		],
+	])("resolves %s", (_name, env, file, expected) => {
+		expect(autostart(env, file)).toBe(expected);
 	});
 });
