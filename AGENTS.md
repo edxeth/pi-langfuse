@@ -34,3 +34,7 @@ When modifying tracing logic, you MUST maintain the following hierarchy:
 - **Client Persistence**: Do NOT shut down the Langfuse client on every prompt.
 - **Flushing**: Use `flushClient()` to ensure data is sent before the process exits.
 - **Clean Finalization**: Use `finalizePrompt()` to cleanly close any abandoned or open spans (especially during interruptions or config reloads).
+
+## Committed Examples
+
+- **Real identities**: When writing docs, plans, or test fixtures from real traces or sessions, replace home paths, user names, and private repository names with placeholders (`/home/<user>`, `<owner>/<repo>`). `package.json` keeps `docs/plans/` out of the npm package, but a push publishes it on GitHub.
