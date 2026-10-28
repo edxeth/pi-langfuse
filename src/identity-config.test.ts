@@ -25,6 +25,12 @@ import type { SettingsValues } from "./settings.js";
 const SALT_PATTERN = /^[0-9a-f]{64}$/;
 const IDENTITY_ENV = ["PI_LANGFUSE_IDENTITY", "PI_LANGFUSE_IDENTITY_KEEP_REPO"];
 const pinnedConfigPath = process.env.PI_LANGFUSE_CONFIG;
+// Tests that assert `canTrace` pass their own keys: `RUN_LANGFUSE_E2E=1`
+// without credentials leaves the Langfuse key variables unset.
+const KEYS = {
+	"public-key": "pk-lf-test",
+	"secret-key": "sk-lf-test",
+} as const;
 
 let dir = "";
 let configPath = "";
@@ -70,7 +76,7 @@ afterEach(() => {
 
 describe("identity configuration resolution", () => {
 	it("defaults to raw, keeps repository identity off, and writes nothing", () => {
-		const config = resolveConfig({});
+		const config = resolveConfig(KEYS);
 		expect(config.identityMode).toBe("raw");
 		expect(config.identityKeepRepo).toBe(false);
 		expect(config.identitySalt).toBeUndefined();
@@ -504,14 +510,14 @@ process.stdout.write(loadOrCreateIdentitySalt(process.argv[2]));
 describe("identity reload safety", () => {
 	it("stops raw traces, tracing, and export when a reload turns invalid", () => {
 		process.env.PI_LANGFUSE_IDENTITY = "pseudonymous";
-		const valid = resolveConfig({});
+		const valid = resolveConfig(KEYS);
 		expect(canTrace(valid)).toBe(true);
 		expect(valid.identityError).toBeUndefined();
 		const salt = valid.identitySalt;
 
 		// The same settings reload after the salt was corrupted by hand.
 		writeConfig({ ...readConfig(), identitySalt: "corrupted" });
-		const reloaded = resolveConfig({});
+		const reloaded = resolveConfig(KEYS);
 		expect(reloaded.identityError).toMatch(/identitySalt/);
 		expect(reloaded.identityMode).toBe("pseudonymous");
 		expect(reloaded.identitySalt).toBeUndefined();
