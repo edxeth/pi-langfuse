@@ -439,7 +439,6 @@ export function createAgentLifecycleHandlers(
 				state.provider = ctx.model.provider || "";
 			}
 
-			const sourceMetadata = deps.collectSourceMetadata(cwd);
 			const prompt: PromptState = {
 				userPrompt: event.prompt,
 				systemPrompt: event.systemPrompt || "",
@@ -465,12 +464,20 @@ export function createAgentLifecycleHandlers(
 				startSignature: signature,
 				pendingTurnInput: [],
 				recoveredFailureCount: 0,
-				sourceMetadata,
+				sourceMetadata: {},
 				activeTurns: new Map(),
 				activeTools: new Map(),
 				completedTurnIndexes: new Set(),
 			};
+			// Publish before git answers: a shutdown or configuration refresh in
+			// the meantime then finalizes this prompt, and the start stops below.
+			// Finalization clears the prompt only when it ends, and shutdown has
+			// written session_end before it begins, so a finalizing prompt stops
+			// here too.
 			state.promptState = prompt;
+			const sourceMetadata = await deps.collectSourceMetadata(cwd);
+			if (state.promptState !== prompt || prompt.finalizing) return;
+			prompt.sourceMetadata = sourceMetadata;
 
 			deps.writeRawTrace(config, state, {
 				type: "agent_prompt_start",
@@ -573,7 +580,6 @@ export function createAgentLifecycleHandlers(
 		const signature = `unannounced-agent-run:${Date.now()}`;
 		const promptStart = (async () => {
 			const systemPrompt = ctx.getSystemPrompt?.() ?? "";
-			const sourceMetadata = deps.collectSourceMetadata(cwd);
 			const prompt: PromptState = {
 				userPrompt: "",
 				systemPrompt,
@@ -599,12 +605,16 @@ export function createAgentLifecycleHandlers(
 				startSignature: signature,
 				pendingTurnInput: [],
 				recoveredFailureCount: 0,
-				sourceMetadata,
+				sourceMetadata: {},
 				activeTurns: new Map(),
 				activeTools: new Map(),
 				completedTurnIndexes: new Set(),
 			};
+			// Publish before git answers, and stop as an announced prompt does.
 			state.promptState = prompt;
+			const sourceMetadata = await deps.collectSourceMetadata(cwd);
+			if (state.promptState !== prompt || prompt.finalizing) return;
+			prompt.sourceMetadata = sourceMetadata;
 
 			deps.writeRawTrace(config, state, {
 				type: "agent_prompt_start",
@@ -781,8 +791,11 @@ export function createAgentLifecycleHandlers(
 		if (!state || !prompt || prompt.finalizing) return;
 		// Pi emits agent_settled only after retry, compaction, and queued
 		// continuations are done: the first boundary that may end the trace.
+		// Pi stays busy until this handler returns, so it does not wait for
+		// delivery: the ended spans and scores are already on their way, and
+		// session shutdown awaits them before the process exits.
 		markAbortedSettle(prompt, event);
-		await finalizePrompt(state, deps.getConfig(), true);
+		await finalizePrompt(state, deps.getConfig(), false);
 	};
 
 	return {

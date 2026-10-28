@@ -2,8 +2,11 @@ import type {
 	ExtensionAPI,
 	InlineExtension,
 } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it } from "vitest";
-import { setRuntimeTimeoutsForTest } from "../../src/langfuse-client.js";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import {
+	flushClient,
+	setRuntimeTimeoutsForTest,
+} from "../../src/langfuse-client.js";
 import { drainRawTraceQueue } from "../../src/raw-trace.js";
 import {
 	captureSessionEvents,
@@ -12,6 +15,7 @@ import {
 	type RuntimeCase,
 	readRawTraceRecords,
 	readSessionEntries,
+	warmRuntimeCase,
 } from "./isolated-pi.js";
 import {
 	type DecodedSpan,
@@ -55,6 +59,8 @@ const UNLIMITED_PAYLOAD = {
 let activeCase: RuntimeCase | undefined;
 let restoreTimeouts: (() => void) | undefined;
 const activeProviderServers: PiMessagesServer[] = [];
+
+beforeAll(warmRuntimeCase);
 
 afterEach(async () => {
 	restoreTimeouts?.();
@@ -216,6 +222,8 @@ describe("pi runtime scenarios (real Pi SDK sessions)", () => {
 		const events = captureSessionEvents(runtimeCase.session);
 		await runtimeCase.session.prompt(userPrompt);
 		await runtimeCase.session.waitForIdle();
+		// Settling does not wait for delivery; wait for it before reading.
+		await flushClient();
 		runtimeCase.session.dispose();
 		drainRawTraceQueue();
 
@@ -391,6 +399,8 @@ describe("pi runtime scenarios (real Pi SDK sessions)", () => {
 			() => provider.requests.length >= 2,
 		);
 		await runtimeCase.session.waitForIdle();
+		// Settling does not wait for delivery; wait for it before reading.
+		await flushClient();
 		runtimeCase.session.dispose();
 		drainRawTraceQueue();
 
@@ -576,6 +586,8 @@ describe("pi runtime scenarios (real Pi SDK sessions)", () => {
 		]);
 		await runtimeCase.session.prompt(`prompt four padded: ${pad}`);
 		await runtimeCase.session.waitForIdle();
+		// Settling does not wait for delivery; wait for it before reading.
+		await flushClient();
 		runtimeCase.session.dispose();
 		drainRawTraceQueue();
 
@@ -715,6 +727,8 @@ describe("pi runtime scenarios (real Pi SDK sessions)", () => {
 
 		await runtimeCase.session.prompt(userPrompt);
 		await runtimeCase.session.waitForIdle();
+		// Settling does not wait for delivery; wait for it before reading.
+		await flushClient();
 		runtimeCase.session.dispose();
 		drainRawTraceQueue();
 
@@ -868,6 +882,8 @@ describe("pi runtime scenarios (real Pi SDK sessions)", () => {
 		const events = captureSessionEvents(session);
 		await session.prompt("initial synthetic user request");
 		await session.waitForIdle();
+		// Settling does not wait for delivery; wait for it before reading.
+		await flushClient();
 		session.dispose();
 		drainRawTraceQueue();
 		expect(provider.requests).toHaveLength(2);

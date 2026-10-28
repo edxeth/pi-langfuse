@@ -10,7 +10,7 @@ import {
 	startLangfuseRecorder,
 } from "../test/pi-runtime/recorder.js";
 import registerExtension from "./index.js";
-import { shutdownClient } from "./langfuse-client.js";
+import { flushClient, shutdownClient } from "./langfuse-client.js";
 import { drainRawTraceQueue } from "./raw-trace.js";
 
 type EventHandler = (event?: unknown, ctx?: unknown) => Promise<void> | void;
@@ -618,28 +618,15 @@ describe("registered Langfuse v5 runtime path", () => {
 			for (const score of scoreBodies) {
 				expect(score.environment).toBe("extension-test");
 			}
-			expect(scoreBodies).toEqual(
-				expect.arrayContaining([
-					expect.objectContaining({
-						name: "input_tokens",
-						value: 4,
-						traceId: promptSpan.traceId,
-						observationId: firstGeneration.spanId,
-					}),
-					expect.objectContaining({
-						name: "output_tokens",
-						value: 6,
-						traceId: promptSpan.traceId,
-						observationId: firstGeneration.spanId,
-					}),
-					expect.objectContaining({
-						name: "total_cost",
-						value: 0.1,
-						traceId: promptSpan.traceId,
-						observationId: firstGeneration.spanId,
-					}),
-				]),
-			);
+			// Tokens and cost travel on the generation (checked above), not as
+			// duplicate score objects.
+			expect(
+				scoreBodies.filter((score) =>
+					["input_tokens", "output_tokens", "total_cost"].includes(
+						String(score.name),
+					),
+				),
+			).toEqual([]);
 			expect(exported).not.toContain(secret);
 
 			const rawPath = join(
@@ -877,6 +864,9 @@ async function finishPrompt(
 	await harness.emit(target, "agent_settled", settled);
 	if (options.settledTwice)
 		await harness.emit(target, "agent_settled", settled);
+	// Settling does not wait for delivery; wait for it here, as session
+	// shutdown does, so the recorder holds the finished prompt.
+	await flushClient();
 }
 
 function scoreBodies(recorder: LangfuseRecorder): RecordedScore[] {

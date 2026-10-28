@@ -1,10 +1,11 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { Config } from "./config.js";
 import {
 	flushClient,
 	getLastRuntimeError,
 	getRuntime,
 	getRuntimeRegistrySizeForTest,
+	setRuntimeTimeoutsForTest,
 	shutdownClient,
 } from "./langfuse-client.js";
 import { recordRuntimeError } from "./runtime-diagnostics.js";
@@ -507,6 +508,13 @@ describe("langfuse v5 runtime facade", () => {
 	});
 
 	it("reports a rejected score without its response body, with or without an HTTP status", async () => {
+		// Transient failures retry inside the score deadline; a deadline
+		// shorter than the first backoff makes each rejection final.
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			exportMs: 10_000,
+			scoreMs: 100,
+		});
+		onTestFinished(restoreTimeouts);
 		const lf = await getRuntime(config);
 
 		mocks.scoresCreate.mockRejectedValueOnce(

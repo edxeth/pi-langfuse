@@ -57,6 +57,7 @@ interface SetupOptions {
 	getRuntime?: () => Promise<unknown>;
 	score?: () => void;
 	redactToolContent?: (config: Config, value: unknown) => unknown;
+	summarizeToolResult?: (config: Config, result: unknown) => string;
 }
 
 function setup(options: SetupOptions = {}) {
@@ -78,12 +79,14 @@ function setup(options: SetupOptions = {}) {
 			options.redactToolContent ?? ((_config: Config, value: unknown) => value),
 		summarizeToolArgs: (_config: Config, name: string, args: unknown) =>
 			`${name}(${JSON.stringify(args)})`,
-		summarizeToolResult: (_config: Config, result: unknown) =>
-			result === null ||
-			(result as { content?: Array<{ type?: string }> })?.content?.[0]?.type ===
-				"empty"
-				? ""
-				: JSON.stringify(result),
+		summarizeToolResult:
+			options.summarizeToolResult ??
+			((_config: Config, result: unknown) =>
+				result === null ||
+				(result as { content?: Array<{ type?: string }> })?.content?.[0]
+					?.type === "empty"
+					? ""
+					: JSON.stringify(result)),
 		standardUsageFromUsage: () => undefined,
 		usageDetailsFromUsage: () => undefined,
 		costDetailsFromUsage: () => undefined,
@@ -360,23 +363,49 @@ describe("a tool span that is requested while the runtime starts", () => {
 });
 
 describe("tool progress and results", () => {
-	it("updates the span with partial output while progress capture is on", async () => {
-		const { span, handlers, ctx } = setup();
+	const progress = (partialResult: unknown) =>
+		({
+			toolCallId: "a",
+			toolName: "bash",
+			args: {},
+			partialResult,
+		}) as never;
 
-		await handlers.toolExecutionUpdate(
-			{
-				toolCallId: "a",
-				toolName: "bash",
-				args: {},
-				partialResult: "half",
-			} as never,
-			ctx,
-		);
-
-		expect(span.update).toHaveBeenCalledWith({
-			output: '"half"',
-			metadata: { partial: true, tool: "bash" },
+	it("keeps progress off the span and summarizes only the latest partial output when it is needed", async () => {
+		// A span is exported once, when it ends, so progress updates cannot
+		// reach Langfuse; summarizing each one only burned CPU on every update.
+		const summarized: unknown[] = [];
+		const { span, handlers, ctx } = setup({
+			summarizeToolResult: (_config, result) => {
+				summarized.push(result);
+				// An empty final result summarizes to nothing, like the default fake.
+				return result === null ? "" : JSON.stringify(result);
+			},
 		});
+		for (const partial of ["first", "second", "latest"]) {
+			await handlers.toolExecutionUpdate(progress(partial), ctx);
+		}
+		expect(span.update).not.toHaveBeenCalled();
+		expect(summarized).toEqual([]);
+
+		await handlers.toolExecutionEnd(execEnd("a", false, null), ctx);
+
+		expect(summarized).toEqual([null, "latest"]);
+		expect(span.end.mock.calls[0]?.[0]).toMatchObject({
+			output: '"latest"',
+			metadata: expect.objectContaining({ partial: true }),
+		});
+	});
+
+	it("exports a completed tool's final output without a partial marker", async () => {
+		const { span, handlers, ctx } = setup();
+		await handlers.toolExecutionUpdate(progress("half"), ctx);
+
+		await handlers.toolExecutionEnd(execEnd("a", false, { ok: true }), ctx);
+
+		const body = span.end.mock.calls[0]?.[0];
+		expect(body).toMatchObject({ output: JSON.stringify({ ok: true }) });
+		expect(body?.metadata).not.toHaveProperty("partial");
 	});
 
 	it("ignores progress when capture is off or the span already ended", async () => {

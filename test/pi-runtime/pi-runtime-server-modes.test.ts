@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+	flushClient,
 	getLastRuntimeError,
 	getRuntimeRegistrySizeForTest,
 	setRuntimeTimeoutsForTest,
@@ -11,6 +12,7 @@ import {
 	createRuntimeCase,
 	type RuntimeCase,
 } from "./isolated-pi.js";
+import { spansFromBody } from "./recorder.js";
 
 /**
  * Server-mode regressions under the single-export pipeline.
@@ -61,6 +63,13 @@ function captureConsole() {
 	};
 }
 
+/** Spans carried by every OTLP post the recorder received. */
+function postedSpanCount(recorder: RuntimeCase["recorder"]): number {
+	return recorder.records
+		.filter((record) => record.path.includes("/otel/v1/traces"))
+		.reduce((count, record) => count + spansFromBody(record.body).length, 0);
+}
+
 function langfuseConsoleOutput(output: string[]): string[] {
 	return output.filter((line) => /langfuse/i.test(line));
 }
@@ -107,6 +116,8 @@ describe("pi runtime delivery across server read-surface modes", () => {
 			await runtimeCase.session.waitForIdle();
 			await runtimeCase.session.prompt("mode prompt two");
 			await runtimeCase.session.waitForIdle();
+			// Settling does not wait for delivery; wait for it before reading.
+			await flushClient();
 			runtimeCase.session.dispose();
 			await shutdownClient();
 		} finally {
@@ -117,8 +128,12 @@ describe("pi runtime delivery across server read-surface modes", () => {
 		const recorder = runtimeCase.recorder;
 
 		// --- delivery: three observations per prompt, each exported once ---
-		expect(recorder.postsTotal).toBe(6);
-		expect(recorder.postsAccepted).toBe(6);
+		// Each observation is exported once. The turn end sends the generation
+		// with its turn and the prompt end sends the root: two requests per
+		// prompt instead of one per span.
+		expect(postedSpanCount(recorder)).toBe(6);
+		expect(recorder.postsTotal).toBe(4);
+		expect(recorder.postsAccepted).toBe(4);
 		expect(recorder.index.size).toBe(2);
 		for (const spans of recorder.index.values()) {
 			expect(spans.size).toBeGreaterThanOrEqual(3);
@@ -163,6 +178,8 @@ describe("pi runtime delivery across server read-surface modes", () => {
 			await runtimeCase.session.waitForIdle();
 			await runtimeCase.session.prompt("mode prompt two");
 			await runtimeCase.session.waitForIdle();
+			// Settling does not wait for delivery; wait for it before reading.
+			await flushClient();
 			runtimeCase.session.dispose();
 			await shutdownClient();
 		} finally {
@@ -172,8 +189,12 @@ describe("pi runtime delivery across server read-surface modes", () => {
 
 		const recorder = runtimeCase.recorder;
 
-		expect(recorder.postsTotal).toBe(6);
-		expect(recorder.postsAccepted).toBe(6);
+		// Each observation is exported once. The turn end sends the generation
+		// with its turn and the prompt end sends the root: two requests per
+		// prompt instead of one per span.
+		expect(postedSpanCount(recorder)).toBe(6);
+		expect(recorder.postsTotal).toBe(4);
+		expect(recorder.postsAccepted).toBe(4);
 		expect(recorder.index.size).toBe(2);
 		// The offered read was never used: no v1 hits, no v2 probes.
 		expect(recorder.v1Hits).toBe(0);
@@ -205,8 +226,13 @@ describe("pi runtime delivery across server read-surface modes", () => {
 			await runtimeCase.session.waitForIdle();
 			await runtimeCase.session.prompt("mode prompt two");
 			await runtimeCase.session.waitForIdle();
-			// The final prompt's export is flushed by the prompt itself: no
-			// read index exists to wait for, so nothing is left for shutdown.
+			// The prompt end sends its export at once (no linger, no wait for
+			// shutdown) but does not wait for it: Pi stays responsive. It
+			// arrives well before the 2 s linger window would have ended.
+			await vi.waitFor(
+				() => expect(runtimeCase.recorder.postsAccepted).toBe(4),
+				{ timeout: 1_000, interval: 10 },
+			);
 			postsAfterSecondPrompt = runtimeCase.recorder.postsAccepted;
 			runtimeCase.session.dispose();
 			const shutdownStartedAt = Date.now();
@@ -219,8 +245,9 @@ describe("pi runtime delivery across server read-surface modes", () => {
 
 		const recorder = runtimeCase.recorder;
 
-		expect(postsAfterSecondPrompt).toBe(6);
-		expect(recorder.postsTotal).toBe(6);
+		expect(postsAfterSecondPrompt).toBe(4);
+		expect(postedSpanCount(recorder)).toBe(6);
+		expect(recorder.postsTotal).toBe(4);
 		expect(recorder.records.filter((r) => r.method === "GET")).toEqual([]);
 		// Shutdown drains an already-empty pipeline, well inside the bounded
 		// per-step window (4 steps x 1500 ms worst case).

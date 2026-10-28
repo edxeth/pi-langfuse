@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, dirname, join, posix, resolve, win32 } from "node:path";
 
@@ -21,21 +21,56 @@ function nonGitMetadata(): SourceMetadata {
 	};
 }
 
-function runGit(cwd: string, args: string[]): string {
-	return execFileSync("git", args, {
-		cwd,
-		encoding: "utf8",
-		stdio: ["ignore", "pipe", "ignore"],
-		timeout: 2_000,
-	}).trim();
+const GIT_TIMEOUT_MS = 2_000;
+
+/** Trimmed stdout of one git command, or undefined when it fails. */
+function optionalGit(cwd: string, args: string[]): Promise<string | undefined> {
+	return new Promise((resolveOutput) => {
+		const child = execFile(
+			"git",
+			args,
+			{ cwd, encoding: "utf8", timeout: GIT_TIMEOUT_MS },
+			(error, stdout) => {
+				resolveOutput(error ? undefined : stdout.trim());
+			},
+		);
+		child.stdin?.end();
+	});
 }
 
-function optionalGit(cwd: string, args: string[]) {
-	try {
-		return runGit(cwd, args);
-	} catch {
-		return undefined;
+interface GitIdentity {
+	gitRoot: string;
+	commit?: string;
+	branch?: string;
+}
+
+/**
+ * Work-tree root, commit, and branch. One rev-parse answers all three in a
+ * repository with commits; a repository without commits makes it fail on
+ * `HEAD`, so the separate queries run then.
+ */
+async function gitIdentity(cwd: string): Promise<GitIdentity | undefined> {
+	const combined = await optionalGit(cwd, [
+		"rev-parse",
+		"--is-inside-work-tree",
+		"--show-toplevel",
+		"HEAD",
+		"--abbrev-ref",
+		"HEAD",
+	]);
+	const lines = combined?.split(/\r?\n/) ?? [];
+	if (lines.length === 4 && lines[0] === "true" && lines[1]) {
+		// `--abbrev-ref HEAD` prints HEAD itself for a detached HEAD.
+		const branch = lines[3] && lines[3] !== "HEAD" ? lines[3] : undefined;
+		return { gitRoot: lines[1], commit: lines[2], branch };
 	}
+	const [inside, gitRoot, branch] = await Promise.all([
+		optionalGit(cwd, ["rev-parse", "--is-inside-work-tree"]),
+		optionalGit(cwd, ["rev-parse", "--show-toplevel"]),
+		optionalGit(cwd, ["branch", "--show-current"]),
+	]);
+	if (inside !== "true" || !gitRoot) return undefined;
+	return { gitRoot, branch: branch || undefined };
 }
 
 function firstLine(value: string) {
@@ -167,16 +202,20 @@ function readWhitelistedOverrides(
 	}
 }
 
-export function collectSourceMetadata(cwd: string): SourceMetadata {
+/**
+ * Repository metadata for a prompt's trace. The git queries run in parallel
+ * child processes, so Pi's event loop keeps running while they answer.
+ */
+export async function collectSourceMetadata(
+	cwd: string,
+): Promise<SourceMetadata> {
 	try {
-		if (runGit(cwd, ["rev-parse", "--is-inside-work-tree"]) !== "true") {
-			return nonGitMetadata();
-		}
-
-		const gitRoot = runGit(cwd, ["rev-parse", "--show-toplevel"]);
-		const commit = optionalGit(cwd, ["rev-parse", "HEAD"]);
-		const branch = optionalGit(cwd, ["branch", "--show-current"]);
-		const remote = optionalGit(cwd, ["config", "--get", "remote.origin.url"]);
+		const [identity, remote] = await Promise.all([
+			gitIdentity(cwd),
+			optionalGit(cwd, ["config", "--get", "remote.origin.url"]),
+		]);
+		if (!identity) return nonGitMetadata();
+		const { gitRoot, commit, branch } = identity;
 		const remoteMetadata = sanitizeGitRemote(remote || "");
 		const overrides = readWhitelistedOverrides(cwd, gitRoot);
 		const derivedIdentity = deriveIdentity(remoteMetadata.git_remote_path);

@@ -1307,6 +1307,32 @@ describe("generation runtime faults and races", () => {
 		);
 	});
 
+	it("records token usage and cost on the generation without duplicate scores", async () => {
+		const { handlers, endCalls, scores, ctx } = await openRequest({});
+		await handlers.messageStart({ message: { role: "assistant" } }, ctx);
+
+		await handlers.messageEnd(
+			assistantMessage({
+				usage: {
+					input: 7,
+					output: 3,
+					cacheRead: 2,
+					totalTokens: 12,
+					cost: { input: 0.07, output: 0.03, total: 0.1 },
+				},
+			}),
+			ctx,
+		);
+
+		expect(endCalls[0]).toMatchObject({
+			usageDetails: { input: 7, output: 3, input_cached_read: 2, total: 12 },
+			costDetails: { input: 0.07, output: 0.03, total: 0.1 },
+		});
+		// Langfuse reads tokens and cost from the generation; a score copy of
+		// the same numbers cost one request and one stored object each.
+		expect(scores).toEqual([]);
+	});
+
 	it("ends a generation once when the message end follows a provider stream error", async () => {
 		const { handlers, endCalls, scores, ctx } = await openRequest({});
 		await handlers.messageStart({ message: { role: "assistant" } }, ctx);

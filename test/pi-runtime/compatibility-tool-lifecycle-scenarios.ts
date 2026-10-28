@@ -203,30 +203,29 @@ export function registerToolLifecycleScenarios({
 				metadata: { durationMs: expect.any(Number) },
 			});
 		}
-		expect(
-			latestRecord(telemetry.state.observations, "tool:bash").lastUpdate,
-		).toMatchObject({
-			output: "partial a",
-			metadata: { partial: true, tool: "bash" },
-		});
-		expect(
-			latestRecord(telemetry.state.observations, "tool:bash").end,
-		).toMatchObject({
+		// Progress never reaches a span on its own (spans export once, at
+		// end); a tool that completes exports its final output unmarked.
+		const bashEnd = latestRecord(telemetry.state.observations, "tool:bash")
+			.end as Record<string, unknown>;
+		expect(bashEnd).toMatchObject({
 			isError: false,
 			output: "result a",
 		});
+		expect(bashEnd.metadata).not.toHaveProperty("partial");
 		expect(
 			latestRecord(telemetry.state.observations, "tool:read").end,
 		).toMatchObject({
 			isError: true,
 			output: "read failed",
 		});
+		// The abandoned edit keeps its own latest progress, marked partial.
 		expect(
 			latestRecord(telemetry.state.observations, "tool:edit").end,
 		).toMatchObject({
 			isError: true,
+			output: "partial c",
 			statusMessage: "tool ended without completion event",
-			metadata: { abandoned: true },
+			metadata: { abandoned: true, partial: true },
 		});
 		const resultOnlyEnd = latestRecord(
 			telemetry.state.observations,

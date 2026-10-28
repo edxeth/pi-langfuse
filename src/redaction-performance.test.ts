@@ -93,4 +93,29 @@ describe("redaction performance", () => {
 		expect(time(() => redactString(config, benign72, {}))).toBeLessThan(500);
 		expect(time(() => scanForSecrets(config, benign72, {}))).toBeLessThan(500);
 	});
+
+	it("keeps short-string redaction cheap in a large environment", () => {
+		// Pi processes carry 150 to 270 environment variables, and every
+		// redacted string checks the environment for exact secrets. Checking
+		// a key must not repeat its name analysis on every call.
+		const environment = (size: number) =>
+			Object.fromEntries(
+				Array.from({ length: size }, (_, index) => [
+					`PROJECT_SETTING_${index}_VALUE`,
+					`value-${index}`,
+				]),
+			);
+		const small = environment(4);
+		const large = environment(400);
+		const redactMany = (env: NodeJS.ProcessEnv) => {
+			const start = performance.now();
+			for (let index = 0; index < 500; index += 1) {
+				redactString(config, `tool output line ${index}`, env);
+			}
+			return performance.now() - start;
+		};
+		redactMany(large);
+		redactMany(small);
+		expect(redactMany(large)).toBeLessThan(redactMany(small) * 5 + 50);
+	});
 });

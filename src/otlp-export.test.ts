@@ -6,7 +6,11 @@ import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
 import type { ReadableSpan, SpanExporter } from "@opentelemetry/sdk-trace-base";
 import { BasicTracerProvider } from "@opentelemetry/sdk-trace-base";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createOtlpExporter, MAX_CONCURRENT_EXPORTS } from "./otlp-export.js";
+import {
+	createOtlpExporter,
+	MAX_CONCURRENT_EXPORTS,
+	type OtlpSpanExporter,
+} from "./otlp-export.js";
 
 interface RecordedRequest {
 	method: string;
@@ -1025,4 +1029,185 @@ describe("createOtlpExporter response and request limits", () => {
 		expect(rig.errors[0]).toContain("(request 1/2)");
 		expect(rig.errors[0]).toContain("(request 2/2)");
 	});
+});
+
+describe("createOtlpExporter linger", () => {
+	const LONG_LINGER_MS = 60_000;
+
+	async function lingerRig(lingerMs: number) {
+		const rig = await startRig();
+		const exporter = createOtlpExporter({
+			host: rig.fixture.host,
+			publicKey: "pk-test",
+			secretKey: "sk-test",
+			timeoutMs: 5_000,
+			lingerMs,
+			dispatchSpanNames: new Set(["agent.turn"]),
+			onError: (message) => rig.errors.push(message),
+		});
+		openExporters.push(exporter);
+		return { rig, exporter };
+	}
+
+	/** Real spans with explicit names, ended through a live tracer pipeline. */
+	function namedSpans(names: string[]): ReadableSpan[] {
+		const captured: ReadableSpan[] = [];
+		const provider = new BasicTracerProvider({
+			spanProcessors: [
+				{
+					onStart() {},
+					onEnd(span) {
+						captured.push(span);
+					},
+					shutdown: () => Promise.resolve(),
+					forceFlush: () => Promise.resolve(),
+				},
+			],
+		});
+		const tracer = provider.getTracer("otlp-export.linger.test");
+		for (const name of names) tracer.startSpan(name).end();
+		return captured;
+	}
+
+	it("sends spans that end within the linger window as one request", async () => {
+		const { rig, exporter } = await lingerRig(150);
+		const spans = createRealSpans(5);
+
+		const results = await Promise.all(
+			spans.map((span) => exportAndWait(exporter, [span])),
+		);
+
+		expect(results.every((r) => r.code === ExportResultCode.SUCCESS)).toBe(
+			true,
+		);
+		expect(rig.fixture.requests).toHaveLength(1);
+		expect(sentSpanIds(rig)).toEqual(expectedSpanIds(spans));
+		expect(rig.errors).toEqual([]);
+	});
+
+	it("sends at once when the waiting spans reach the queue bound", async () => {
+		const { rig, exporter } = await lingerRig(LONG_LINGER_MS);
+		const spans = createRealSpans(256);
+
+		const results = await Promise.all(
+			spans.map((span) => exportAndWait(exporter, [span])),
+		);
+
+		expect(results.every((r) => r.code === ExportResultCode.SUCCESS)).toBe(
+			true,
+		);
+		expect(sentSpanIds(rig)).toEqual(expectedSpanIds(spans));
+	});
+
+	it("sends at once when a span that closes a unit of work ends", async () => {
+		const { rig, exporter } = await lingerRig(LONG_LINGER_MS);
+		const spans = namedSpans(["tool:bash", "llm-response", "agent.turn"]);
+
+		const results = await Promise.all(
+			spans.map((span) => exportAndWait(exporter, [span])),
+		);
+
+		expect(results.every((r) => r.code === ExportResultCode.SUCCESS)).toBe(
+			true,
+		);
+		expect(rig.fixture.requests).toHaveLength(1);
+		expect(sentSpanIds(rig)).toEqual(expectedSpanIds(spans));
+	});
+
+	it("sends spans that end during an immediate hold at once, and batches again after its release", async () => {
+		// A flush holds immediate sending for its whole duration: the span
+		// processor waits for every pending export callback before it asks
+		// the exporter to flush, so a span that ends mid-flush must not wait.
+		const { rig, exporter } = await lingerRig(LONG_LINGER_MS);
+		const [held, afterRelease] = createRealSpans(2);
+		const release = exporter.sendImmediately();
+
+		// The exporter was idle when the hold began; the span ends later.
+		const heldResult = await exportAndWait(exporter, [held]);
+		expect(heldResult.code).toBe(ExportResultCode.SUCCESS);
+		expect(sentSpanIds(rig)).toEqual(expectedSpanIds([held]));
+
+		release();
+		release(); // A second release is a no-op, not a second decrement.
+		const later = exportAndWait(exporter, [afterRelease]);
+		await sleep(SETTLE_MS);
+		expect(rig.fixture.requests).toHaveLength(1);
+		await exporter.forceFlush?.();
+		expect((await later).code).toBe(ExportResultCode.SUCCESS);
+		expect(rig.fixture.requests).toHaveLength(2);
+	});
+
+	it.each([
+		["forceFlush", (exporter: OtlpSpanExporter) => exporter.forceFlush?.()],
+		["shutdown", (exporter: OtlpSpanExporter) => exporter.shutdown()],
+		[
+			"sendImmediately",
+			async (exporter: OtlpSpanExporter) => {
+				exporter.sendImmediately()();
+			},
+		],
+	])(
+		"%s sends lingering spans without waiting for the window",
+		async (_name, release) => {
+			const { rig, exporter } = await lingerRig(LONG_LINGER_MS);
+			const spans = createRealSpans(2);
+			const results = spans.map((span) => exportAndWait(exporter, [span]));
+			await sleep(SETTLE_MS);
+			expect(rig.fixture.requests).toHaveLength(0);
+
+			await release(exporter);
+			const settled = await Promise.all(results);
+
+			expect(settled.every((r) => r.code === ExportResultCode.SUCCESS)).toBe(
+				true,
+			);
+			expect(sentSpanIds(rig)).toEqual(expectedSpanIds(spans));
+		},
+	);
+});
+
+describe("createOtlpExporter transient retries", () => {
+	it("waits at least the base backoff when the server advises no wait", async () => {
+		// Retries now run until the deadline, so a Retry-After of 0 (or a
+		// past date) must not turn them into a burst against a busy server.
+		const rig = await startRig((_request, res) => {
+			res.writeHead(503, { "retry-after": "0" });
+			res.end();
+		});
+
+		const result = await exportAndWait(
+			rig.createExporter(1_200),
+			createRealSpans(1),
+		);
+
+		expect(result.code).toBe(ExportResultCode.FAILED);
+		// 0, 250, 500, 750, 1,000 ms at most: five attempts, not hundreds.
+		expect(rig.fixture.requests.length).toBeGreaterThanOrEqual(2);
+		expect(rig.fixture.requests.length).toBeLessThanOrEqual(5);
+		expect(rig.errors).toHaveLength(1);
+	});
+
+	it("keeps retrying a transient failure until the deadline instead of stopping after a fixed count", async () => {
+		// A Postgres restart behind Langfuse answers 503 for several seconds.
+		// Five failures take 0.25 + 0.5 + 1 + 2 s of backoff, inside 6 s.
+		let answered = 0;
+		const rig = await startRig((request, res) => {
+			answered += 1;
+			if (answered <= 5) {
+				res.writeHead(503);
+				res.end();
+				return;
+			}
+			acceptAll(request, res);
+		});
+
+		const result = await exportAndWait(
+			rig.createExporter(6_000),
+			createRealSpans(1),
+		);
+
+		expect(result).toEqual({ code: ExportResultCode.SUCCESS });
+		expect(rig.fixture.requests).toHaveLength(6);
+		expect(rig.errors).toEqual([]);
+	}, 15_000);
 });

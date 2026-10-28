@@ -5,6 +5,7 @@ import {
 	redactString,
 	sanitizeForTelemetry,
 	scanForSecrets,
+	withRedactionSnapshot,
 } from "./redaction.js";
 
 const config = {
@@ -498,9 +499,10 @@ describe("redaction", () => {
 		expect(JSON.stringify(sanitized)).not.toContain(
 			"sk-proj-thisisaverylongopenaitestkey",
 		);
-		// Exactly one env scan (2 entries) for the whole payload regardless of
-		// the number of non-empty strings.
-		expect(reads()).toBe(2);
+		// Exactly one env scan for the whole payload regardless of the number
+		// of non-empty strings. A scan reads only the values of sensitive keys
+		// (here OPENAI_API_KEY), so one read; a scan per string would read 4.
+		expect(reads()).toBe(1);
 	});
 
 	it("skips exact-secret collection for payloads without redactable strings", () => {
@@ -557,6 +559,41 @@ describe("redaction", () => {
 		expect(second).toContain("[REDACTED:configured-secret:");
 		// The removed configured secret is no longer collected.
 		expect(second).toContain("qrstuvwxyz56789012");
+	});
+
+	it("collects exact secrets once per synchronous snapshot scope", () => {
+		const { env, reads } = envWithReadCounter({
+			OPENAI_API_KEY: "sk-proj-thisisaverylongopenaitestkey",
+		});
+		const other = {
+			redactionEnabled: true,
+			redactionAdditionalSecrets: ["second-configured-secret"],
+		};
+
+		const outputs = withRedactionSnapshot(() => [
+			redactString(config, "a sk-proj-thisisaverylongopenaitestkey", env),
+			redactString(config, "b sk-proj-thisisaverylongopenaitestkey", env),
+			JSON.stringify(
+				sanitizeForTelemetry(
+					config,
+					{ text: "c sk-proj-thisisaverylongopenaitestkey" },
+					env,
+				),
+			),
+			// Another configuration in the same scope gets its own collection.
+			redactString(other, "d second-configured-secret", env),
+		]);
+
+		for (const output of outputs) {
+			expect(output).not.toContain("sk-proj-thisisaverylongopenaitestkey");
+			expect(output).not.toContain("second-configured-secret");
+		}
+		// One read for `config`, one for `other`.
+		expect(reads()).toBe(2);
+
+		// After the scope, every call collects again.
+		redactString(config, "e sk-proj-thisisaverylongopenaitestkey", env);
+		expect(reads()).toBe(3);
 	});
 
 	it("keeps direct redactString calls fresh against env changes", () => {

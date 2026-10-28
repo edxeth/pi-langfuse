@@ -228,7 +228,8 @@ export function registerRunLifecycleScenarios({
 		);
 		await handler("agent_settled")({}, context);
 
-		expect(telemetry.state.flushes).toBe(1);
+		// Settling finalizes the trace once and does not wait for delivery.
+		expect(telemetry.state.flushes).toBe(0);
 		expect(telemetry.state.traces).toHaveLength(1);
 		const trace = telemetry.state.traces[0];
 		if (!trace) throw new Error("recovered trace was not created");
@@ -428,7 +429,8 @@ export function registerRunLifecycleScenarios({
 			output: assistantOutput("custom-trigger answer"),
 			usage: { input: 2, output: 3, total: 5 },
 		});
-		expect(telemetry.state.flushes).toBe(2);
+		// Neither settlement waits for delivery.
+		expect(telemetry.state.flushes).toBe(0);
 
 		drainRawTraceQueue();
 		const records = readFileSync(

@@ -25,6 +25,7 @@
 		"prepare": "node scripts/prepare-husky.mjs",
 		"prepack": "npm run build",
 		"audit:production": "npm audit --omit=dev --omit=peer --audit-level=high",
+		"bench": "node scripts/bench-overhead.mjs",
 		"package:smoke": "node scripts/package-smoke.mjs",
 		"git-install:smoke": "node scripts/git-install-smoke.mjs",
 		"release": "release-it",

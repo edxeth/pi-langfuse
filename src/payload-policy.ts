@@ -13,6 +13,7 @@ import {
 	isSensitiveKey,
 	type RedactionConfig,
 	sanitizeForTelemetry,
+	withRedactionSnapshot,
 } from "./redaction.js";
 import {
 	RESPONSES_TOOL_CALL_ITEM_TYPES,
@@ -245,13 +246,15 @@ export function shapeTelemetryValue<T>(
 	value: T,
 	options: ShapeOptions = {},
 ): T | undefined {
-	return shapeValueWithState(
-		config,
-		field,
-		value,
-		options,
-		getPayloadLimits(config),
-		{ nodes: 0, active: new WeakSet<object>() },
+	return withRedactionSnapshot(() =>
+		shapeValueWithState(
+			config,
+			field,
+			value,
+			options,
+			getPayloadLimits(config),
+			{ nodes: 0, active: new WeakSet<object>() },
+		),
 	);
 }
 
@@ -931,12 +934,25 @@ function shapeRecordEntry(
 	);
 }
 
+/** Shape a record field by field, with one exact-secret collection per record. */
 function shapeRecord(
 	config: PayloadPolicyConfig,
 	value: Record<string, unknown>,
 	fieldForKey: (key: string) => CaptureField | undefined,
 	options: ShapeOptions,
 	limits: PayloadLimits = getPayloadLimits(config),
+) {
+	return withRedactionSnapshot(() =>
+		shapeRecordFields(config, value, fieldForKey, options, limits),
+	);
+}
+
+function shapeRecordFields(
+	config: PayloadPolicyConfig,
+	value: Record<string, unknown>,
+	fieldForKey: (key: string) => CaptureField | undefined,
+	options: ShapeOptions,
+	limits: PayloadLimits,
 ) {
 	const state: ShapeState = { nodes: 0, active: new WeakSet<object>() };
 	const output: Record<string, unknown> = {};

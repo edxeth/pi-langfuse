@@ -9,7 +9,9 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
 const execFileAsync = promisify(execFile);
 
-const DEFAULT_LOCAL_HOST = "http://localhost:3100";
+// The generated stack publishes 127.0.0.1 only. `localhost` often resolves to
+// ::1 first, so each new connection would wait for the IPv6 attempt to fail.
+const DEFAULT_LOCAL_HOST = "http://127.0.0.1:3100";
 const DEFAULT_REMOTE_HOST = "https://cloud.langfuse.com";
 const DEFAULT_EMAIL = "local@example.test";
 const DEFAULT_NAME = "Local User";

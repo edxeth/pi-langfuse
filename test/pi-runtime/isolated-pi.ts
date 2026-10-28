@@ -547,6 +547,30 @@ export async function closeOpenRuntimeCases() {
 
 afterEach(closeOpenRuntimeCases);
 
+/**
+ * Start and close one case, so the cold Pi SDK import and first session
+ * (about 2 s alone, more than 5 s while the whole suite runs in parallel) are
+ * not charged to the first test of a file. Use as `beforeAll(warmRuntimeCase)`.
+ * Fails when that first case leaves the environment changed, so warming up
+ * cannot hide an import-time leak from the tests that follow.
+ */
+export async function warmRuntimeCase() {
+	const before = { ...process.env };
+	const runtimeCase = await createRuntimeCase({
+		name: "warm-up",
+		provider: { kind: "faux" },
+	});
+	await runtimeCase.teardown();
+	const changed = [
+		...new Set([...Object.keys(before), ...Object.keys(process.env)]),
+	].filter((key) => before[key] !== process.env[key]);
+	if (changed.length > 0) {
+		throw new Error(
+			`warm-up runtime case left the environment changed: ${changed.join(", ")}`,
+		);
+	}
+}
+
 export async function createRuntimeCase(
 	options: RuntimeCaseOptions,
 ): Promise<RuntimeCase> {

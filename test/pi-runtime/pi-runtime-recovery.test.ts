@@ -303,9 +303,9 @@ describe("pi runtime transport recovery (single OTLP export pipeline)", () => {
 	}, 30_000);
 
 	it("reports a permanent HTTP failure through the diagnostics subscription while prompt and bounded shutdown complete console-silently", async () => {
-		// The full bounded retry chain (initial + 3 retries with backoff) must
-		// fit the export deadline so the failure is "all attempts rejected",
-		// not a deadline cut.
+		// Transient statuses retry with capped backoff (250, 500, 1,000, then
+		// 2,000 ms) until the export deadline, so a 5 s budget fits five
+		// attempts before the next wait no longer fits.
 		restoreTimeouts = setRuntimeTimeoutsForTest({ exportMs: 5_000 });
 		const { runtimeCase, userPrompt, secret, marker } =
 			await createRecoveryCase("PR-DEAD");
@@ -333,16 +333,21 @@ describe("pi runtime transport recovery (single OTLP export pipeline)", () => {
 
 		const recorder = runtimeCase.recorder;
 
-		// --- bounded transport behavior: initial attempt plus three retries ---
-		// Spans that wait for a free exporter slot leave as one coalesced
-		// export, so the export count varies from one to six; each failed
-		// export makes exactly four attempts and reports once.
+		// --- bounded transport behavior: retries until the deadline ---
+		// Spans that end together leave as one export, so the export count
+		// varies from one to six; each failed export retries until its
+		// deadline and reports once.
 		const failedExports = diagnostics.messages.length;
 		expect(failedExports).toBeGreaterThanOrEqual(1);
 		expect(failedExports).toBeLessThanOrEqual(6);
-		expect(recorder.postsTotal).toBe(4 * failedExports);
-		// Coalescing changes how spans share requests, not who is sent: each of
-		// the six ended observations is posted in exactly four attempts.
+		const attemptsPerExport = recorder.postsTotal / failedExports;
+		expect(Number.isInteger(attemptsPerExport)).toBe(true);
+		// More than the old fixed four attempts, and no more than the deadline
+		// allows (five on a responsive server).
+		expect(attemptsPerExport).toBeGreaterThanOrEqual(5);
+		expect(attemptsPerExport).toBeLessThanOrEqual(6);
+		// Batching changes how spans share requests, not who is sent: every
+		// one of the six ended observations is posted in every attempt.
 		const attemptsBySpan = new Map<string, number>();
 		for (const record of recorder.records) {
 			if (!record.path.includes("/otel/v1/traces")) continue;
@@ -353,7 +358,9 @@ describe("pi runtime transport recovery (single OTLP export pipeline)", () => {
 				);
 			}
 		}
-		expect([...attemptsBySpan.values()]).toEqual([4, 4, 4, 4, 4, 4]);
+		expect([...attemptsBySpan.values()]).toEqual(
+			Array.from({ length: 6 }, () => attemptsPerExport),
+		);
 		expect(recorder.postsAccepted).toBe(0);
 		expect(recorder.index.size).toBe(0);
 		expect(getReadRequests(recorder)).toEqual([]);
@@ -365,7 +372,9 @@ describe("pi runtime transport recovery (single OTLP export pipeline)", () => {
 		const message = diagnostics.messages[0] ?? "";
 		expect(message).toContain("Langfuse OTLP export failed");
 		expect(message).toContain("HTTP 503");
-		expect(message).toContain("4 attempts");
+		expect(message).toMatch(
+			/next retry needs \d+ms but only \d+ms of the 5000ms deadline remain|deadline/,
+		);
 		// Sanitized: no credentials, endpoints, or user content ride the summary.
 		for (const forbidden of [
 			secret,

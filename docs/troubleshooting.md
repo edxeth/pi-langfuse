@@ -42,7 +42,7 @@ The extension closes unfinished prompt, turn, generation, and tool observations 
 
 Langfuse may index accepted exports asynchronously. Normal tracing does not query observation APIs or warn about indexing delay. Check the Langfuse UI when inspecting completeness; a successful export response is not a completeness or durability guarantee.
 
-Export errors appear through Pi's notification UI rather than writing over the editor. Headless runs write diagnostics to stderr, leaving stdout unchanged. `/langfuse-status` shows the last historical error, not an active retry queue. Transient export errors retry within the current bounded send; they do not require another user message. Partial rejection and exhausted attempts are reported without keeping a recovery copy for later prompts.
+Export errors appear through Pi's notification UI rather than writing over the editor. Headless runs write diagnostics to stderr, leaving stdout unchanged. Each distinct cause is shown at most once every 15 minutes, and every occurrence is appended to `$PI_CODING_AGENT_DIR/langfuse/diagnostics.jsonl` with its time and process id. `/langfuse-status` shows the last historical error and the log path, not an active retry queue. Transient export and score errors retry until the ten-second deadline; they do not require another user message. Partial rejection and an exhausted deadline are reported without keeping a recovery copy for later prompts.
 
 ## Export deadline warnings
 
@@ -50,7 +50,9 @@ An OTLP deadline warning means the endpoint did not confirm acceptance within th
 
 Older versions used the two-second shutdown-step budget for HTTP exports as well. A successful response taking slightly over two seconds could therefore trigger both an export warning and an OTel flush warning. Export now owns a ten-second request deadline. Flush and shutdown await actual completion or cancellation instead of racing a second lifecycle timer.
 
-If warnings continue, check endpoint latency, server load, and connectivity. A successful health request confirms reachability but does not measure OTLP ingestion latency. The session JSONL and raw trace do not contain these UI warnings or HTTP timing details, so retain the warning and its time when investigating server logs.
+If warnings continue, check endpoint latency, server load, and connectivity. A successful health request confirms reachability but does not measure OTLP ingestion latency. The session JSONL and raw trace do not contain these warnings; `diagnostics.jsonl` does, with the time and process id to match against server logs.
+
+For the local stack, use `http://127.0.0.1:3100` rather than `http://localhost:3100`. The stack listens on IPv4 only, and where `localhost` resolves to IPv6 first, every new connection waits about 250 ms for the IPv6 attempt to fail.
 
 ## Media attachments
 

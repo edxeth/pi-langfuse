@@ -18,6 +18,7 @@ import {
 	boundRawRequestSummaryRecord,
 	isRawRequestSummaryRecord,
 } from "./raw-request-summary.js";
+import { withRedactionSnapshot } from "./redaction.js";
 import { recordRuntimeError } from "./runtime-diagnostics.js";
 
 // Raw traces hold private prompt/tool data, so new files are owner-only and
@@ -94,6 +95,10 @@ function shapeFinalRecord(config: RawTraceConfig, record: RawTraceRecord) {
 }
 
 function flushQueue() {
+	withRedactionSnapshot(flushQueuedRecords);
+}
+
+function flushQueuedRecords() {
 	for (let item = writeQueue.shift(); item; item = writeQueue.shift()) {
 		const { path, config, record } = item;
 		try {

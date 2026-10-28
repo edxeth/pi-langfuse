@@ -6,6 +6,7 @@ Notes for v2.1.2 and earlier are on the [GitHub releases page](https://github.co
 
 ### Breaking Changes
 
+- Removed the per-response `input_tokens`, `output_tokens`, and `total_cost` scores. Token usage and cost stay on each `llm-response` generation (`usageDetails`, `costDetails`), where Langfuse's usage and cost views read them. Each copy cost one HTTP request and one stored server object; together they were 87% of all score traffic. Dashboards and queries that read these score names must read the generation's usage and cost instead. A total cost of exactly zero was kept as a score; an all-zero cost is not recorded on the generation.
 - Langfuse `llm-response` generation and `agent.turn` span outputs are now objects of the form `{ text, tool_calls, thinking? }` instead of plain strings, and `text` holds only the answer, without reasoning. Dashboards, evaluators, and scripts that read these outputs as strings must read `text` and handle `tool_calls`, because a tool-only response can have empty `text`. See [Structured assistant output](docs/migration.md#structured-assistant-output).
 
 ### Added
@@ -29,6 +30,15 @@ Added `pi-langfuse-export --format openai-chat|anthropic-messages|sharegpt`. Bes
 
 ### Changed
 
+- Changed span export to batches. An ended span waits up to two seconds for others; the end of a turn or prompt, a flush, and shutdown send at once. On the self-hosted v3 server every request that carries a trace stores one more file that each later merge of that trace rereads, so fewer requests cut server load sharply (about 65% fewer requests per trace in local data).
+- Changed prompt completion (`agent_settled`) to stop waiting for delivery. Pi stays busy until settlement handlers return, so a slow Langfuse delayed every prompt end. Session shutdown still waits for every send.
+- Changed transient export failures (network errors, HTTP 429/502/503/504) to retry until the ten-second deadline instead of stopping after four attempts, so a server that restarts its database loses nothing. Scores now use the same deadline and retries instead of one two-second attempt, and each score keeps one id across retries, so a retry cannot add a second score.
+- Changed tool progress handling. `tool_execution_update` no longer summarizes, redacts, and applies each partial result to the span, which never reached Langfuse because a span is exported once, at its end. The latest progress output is recorded only when a tool ends without a final result, marked `metadata.partial`. Completed tool spans no longer keep a stale `metadata.partial = true`.
+- Changed configuration reads: `pi-langfuse.json` and the environment are read when a session or prompt starts, not on every event. A file edit applies from the next prompt.
+- Changed diagnostics. Pi shows each distinct cause at most once every 15 minutes, and every occurrence is appended to `$PI_CODING_AGENT_DIR/langfuse/diagnostics.jsonl` (owner-only, capped at 1 MB). `/langfuse-status` shows the log path.
+- Changed `/langfuse-init` to write `http://127.0.0.1:3100` as the local host. The stack listens on IPv4 only, and `localhost` often resolves to IPv6 first, which adds about 250 ms to every new connection.
+- Changed git source metadata collection to two parallel, non-blocking git calls instead of five synchronous ones at every prompt start.
+- Reduced the extension's CPU use: environment-secret collection no longer reruns its key analysis for every redacted string, and a record is shaped with one secret collection. In a synthetic streaming benchmark (10 turns, 20,000 text deltas, 30 tool calls), extension CPU dropped from about 9.3 s to 2.1 s, and `message_update` from about 0.11 ms to 0.02 ms per event.
 - Changed the export's TruffleHog scan to detection only (`--no-verification --no-update`), so it no longer sends candidate credentials to their vendors to check them.
 - Changed the OpenTelemetry resource to report `service.name=pi-langfuse` and the package's `service.version` instead of the SDK default `unknown_service:<node binary path>`, which exposed a local install path.
 - Changed raw `provider_request` summaries (the default `summary` mode) to keep at most 20 message previews of 200 characters each, with the system prompt and message summary together within 4,096 bytes.
@@ -38,6 +48,7 @@ Added `pi-langfuse-export --format openai-chat|anthropic-messages|sharegpt`. Bes
 
 ### Fixed
 
+- Fixed local autostart recreating running Langfuse containers. The health check gave up after 200 ms, which a healthy stack misses where `localhost` resolves to IPv6 first, so the first prompt of every Pi process ran `docker compose up -d` with that process's environment. A project environment that sets variables such as `POSTGRES_USER` changed the stack's configuration, and Compose recreated Postgres, which interrupted ingestion for every session. Autostart now checks in the background with a 2,000 ms deadline (`localAutostartTimeoutMs`), runs `docker compose up -d --no-recreate`, and passes only the variables the Docker client needs.
 - Fixed `agent.turn` spans recording no input. Each turn now records the messages newly delivered at its provider request, shaped by the capture policy.
 
 #### Runs started by extension messages are traced on Pi 1.2 and later

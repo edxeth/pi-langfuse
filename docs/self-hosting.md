@@ -34,7 +34,9 @@ docker compose up -d
 
 ## Autostart
 
-Local init enables autostart in `pi-langfuse.json`. When a session starts, the extension checks the configured health endpoint and runs `docker compose up -d` if the stack is unavailable.
+Local init enables autostart in `pi-langfuse.json`. On the first prompt of each Pi process, the extension checks the configured health endpoint in the background and runs `docker compose up -d --no-recreate` if the stack does not answer within `localAutostartTimeoutMs` (default 2,000 ms). The prompt does not wait for this check.
+
+Autostart only starts stopped containers. It never recreates running ones, and it passes Docker Compose only the variables the Docker client needs (`PATH`, `HOME`, `TMPDIR`, `DOCKER_*`, `SSH_AUTH_SOCK`, and proxy settings). The stack's own `.env` file therefore decides every value that `docker-compose.yml` interpolates, even when Pi runs inside a project environment that sets variables such as `POSTGRES_USER` or `DATABASE_URL`. To apply a changed `docker-compose.yml` or `.env`, run `docker compose up -d` yourself.
 
 Disable autostart for one process:
 
@@ -42,7 +44,7 @@ Disable autostart for one process:
 PI_LANGFUSE_AUTOSTART=0 pi
 ```
 
-Set `PI_LANGFUSE_AUTOSTART=1` to force autostart when the configuration does not enable it. The health request uses the configured timeout. Docker Compose starts in detached mode; inspect `docker compose ps` or logs to confirm service readiness.
+Set `PI_LANGFUSE_AUTOSTART=1` to force autostart when the configuration does not enable it. Docker Compose starts in detached mode; inspect `docker compose ps` or logs to confirm service readiness.
 
 ## Remote instances
 

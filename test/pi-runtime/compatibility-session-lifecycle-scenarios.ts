@@ -297,7 +297,9 @@ export function registerSessionLifecycleScenarios({
 		});
 		await eventHandler(pi, "agent_settled")({});
 
-		expect(telemetry.state.flushes).toBe(1);
+		// Settling sends the finished prompt without waiting for delivery;
+		// session shutdown owns the flush.
+		expect(telemetry.state.flushes).toBe(0);
 		expect(telemetry.state.shutdowns).toBe(0);
 		expect(telemetry.LangfuseClient).toHaveBeenCalledWith(
 			expect.objectContaining({
@@ -388,13 +390,15 @@ export function registerSessionLifecycleScenarios({
 			output: "tool result",
 			metadata: expect.objectContaining({ tool: "bash" }),
 		});
-		expect(telemetry.state.scores).toEqual(
-			expect.arrayContaining([
-				expect.objectContaining({ name: "input_tokens", value: 3 }),
-				expect.objectContaining({ name: "output_tokens", value: 2 }),
-				expect.objectContaining({ name: "total_cost", value: 0.09 }),
-			]),
-		);
+		// Tokens and cost travel on the generation (checked above), not as
+		// duplicate scores.
+		expect(
+			telemetry.state.scores.filter((score) =>
+				["input_tokens", "output_tokens", "total_cost"].includes(
+					String(score.name),
+				),
+			),
+		).toEqual([]);
 
 		await eventHandler(pi, "session_shutdown")();
 		expect(telemetry.state.shutdowns).toBe(1);

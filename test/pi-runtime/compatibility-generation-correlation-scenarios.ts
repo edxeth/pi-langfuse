@@ -372,25 +372,14 @@ export function registerGenerationCorrelationScenarios({
 			output: assistantOutput("answer-4"),
 			model: "generation-model-final-4",
 		});
-		expect(telemetry.state.scores).toEqual(
-			expect.arrayContaining([
-				expect.objectContaining({
-					name: "input_tokens",
-					value: 4,
-					observationId: generation0.id,
-				}),
-				expect.objectContaining({
-					name: "output_tokens",
-					value: 5,
-					observationId: generation0.id,
-				}),
-				expect.objectContaining({
-					name: "total_cost",
-					value: 0.09,
-					observationId: generation0.id,
-				}),
-			]),
-		);
+		// Tokens and cost travel on each generation, not as duplicate scores.
+		expect(
+			telemetry.state.scores.filter((score) =>
+				["input_tokens", "output_tokens", "total_cost"].includes(
+					String(score.name),
+				),
+			),
+		).toEqual([]);
 
 		await handler("session_shutdown")({}, context);
 	});

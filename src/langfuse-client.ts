@@ -17,7 +17,11 @@ import {
 import { BasicTracerProvider } from "@opentelemetry/sdk-trace-base";
 import type { Config } from "./config.js";
 import { identityTransformFor } from "./identity.js";
-import { createOtlpExporter, OtlpExportError } from "./otlp-export.js";
+import {
+	createOtlpExporter,
+	OtlpExportError,
+	type OtlpSpanExporter,
+} from "./otlp-export.js";
 import { readPackageVersion } from "./package-version.js";
 import {
 	type PayloadPolicyConfig,
@@ -173,6 +177,8 @@ interface RuntimeState {
 	readonly idGenerator: RuntimeIdGenerator;
 	readonly tracerProvider: BasicTracerProvider;
 	readonly processor: LangfuseSpanProcessor;
+	/** The processor's exporter, kept to end its linger window on flush. */
+	readonly exporter: OtlpSpanExporter;
 	readonly scoreClient: LangfuseClient;
 	readonly observations: Map<string, VendorObservation>;
 	readonly traces: Map<string, RuntimeTrace>;
@@ -203,23 +209,42 @@ class RuntimeIdGenerator {
 let runtime: RuntimeState | null = null;
 let runtimeTransition: Promise<void> = Promise.resolve();
 let registeredContextManager: AsyncHooksContextManager | undefined;
-// Deadlines belong to HTTP requests, not the operations awaiting them.
+// Deadlines belong to HTTP requests, not the operations awaiting them. A
+// score gets the export budget: both retry transient failures inside it.
 const DEFAULT_EXPORT_TIMEOUT_MS = 10_000;
-const DEFAULT_SCORE_REQUEST_TIMEOUT_MS = 2_000;
+const DEFAULT_SCORE_REQUEST_TIMEOUT_MS = DEFAULT_EXPORT_TIMEOUT_MS;
+/**
+ * How long an ended span waits for others before its request leaves. Turn
+ * and prompt ends, flushes, and shutdown send at once. On the self-hosted v3
+ * server every request that carries a trace adds a stored file that each
+ * later merge of that trace rereads, so batching cuts server work sharply.
+ */
+const DEFAULT_EXPORT_LINGER_MS = 2_000;
+const EXPORT_DISPATCH_SPAN_NAMES: ReadonlySet<string> = new Set([
+	"agent.turn",
+	"agent.prompt",
+]);
+const RETRYABLE_SCORE_STATUS_CODES = new Set([429, 502, 503, 504]);
+const SCORE_RETRY_BASE_DELAY_MS = 250;
+const SCORE_RETRY_MAX_DELAY_MS = 2_000;
 let exportTimeoutMs = DEFAULT_EXPORT_TIMEOUT_MS;
 let scoreRequestTimeoutMs = DEFAULT_SCORE_REQUEST_TIMEOUT_MS;
+let exportLingerMs = DEFAULT_EXPORT_LINGER_MS;
 
 /** Override HTTP request deadlines in isolated tests; return their restoration. */
 export function setRuntimeTimeoutsForTest(timeouts: {
 	exportMs: number;
 	scoreMs?: number;
+	lingerMs?: number;
 }) {
-	const previous = { exportTimeoutMs, scoreRequestTimeoutMs };
+	const previous = { exportTimeoutMs, scoreRequestTimeoutMs, exportLingerMs };
 	exportTimeoutMs = timeouts.exportMs;
 	scoreRequestTimeoutMs = timeouts.scoreMs ?? timeouts.exportMs;
+	exportLingerMs = timeouts.lingerMs ?? exportLingerMs;
 	return () => {
 		exportTimeoutMs = previous.exportTimeoutMs;
 		scoreRequestTimeoutMs = previous.scoreRequestTimeoutMs;
+		exportLingerMs = previous.exportLingerMs;
 	};
 }
 
@@ -242,10 +267,7 @@ function recordRuntimeFailure(label: string, error: unknown) {
 function recordScoreFailure(error: unknown) {
 	// Langfuse API exception messages embed response bodies, which may echo
 	// private score content. Report only the HTTP status, never that message.
-	const status =
-		error && typeof error === "object" && "statusCode" in error
-			? error.statusCode
-			: undefined;
+	const status = scoreFailureStatus(error);
 	// A template nested in a template makes Lizard misjudge where this function
 	// ends, so the suffix is built first.
 	const detail =
@@ -253,29 +275,72 @@ function recordScoreFailure(error: unknown) {
 	recordRuntimeError(`Failed to send Langfuse score${detail}`);
 }
 
-/** Resolves true when the scores endpoint accepted the score; false after a recorded failure. */
+function scoreFailureStatus(error: unknown) {
+	return error && typeof error === "object" && "statusCode" in error
+		? error.statusCode
+		: undefined;
+}
+
+/** Waits for the next attempt; the deadline's abort ends the wait early. */
+function waitForRetry(ms: number, signal: AbortSignal): Promise<void> {
+	return new Promise((resolve) => {
+		const finish = () => {
+			clearTimeout(timer);
+			signal.removeEventListener("abort", finish);
+			resolve();
+		};
+		const timer = setTimeout(finish, ms);
+		signal.addEventListener("abort", finish, { once: true });
+	});
+}
+
+/**
+ * Resolves true when the scores endpoint accepted the score; false after a
+ * recorded failure. Network failures and HTTP 429/502/503/504 retry with
+ * capped backoff inside one total deadline. The body carries a stable id, so
+ * a retry of a request that the server did persist updates the same score.
+ */
 async function sendScore(
 	scoresApi: LangfuseClient["api"]["scores"],
 	body: Parameters<LangfuseClient["api"]["scores"]["create"]>[0],
 ): Promise<boolean> {
 	const controller = new AbortController();
+	const deadline = Date.now() + scoreRequestTimeoutMs;
 	const timer = setTimeout(() => controller.abort(), scoreRequestTimeoutMs);
 	// The result is returned after `finally`: V8 coverage reports returns
 	// inside try/catch as a never-taken `finally` branch.
 	let delivered = false;
 	try {
-		await scoresApi.create(body, {
-			// SDK 5.11.1 clears its own timer at response headers. The caller
-			// signal stays active through the body read. Keep the SDK header
-			// budget equal: it cannot be disabled via public options and its
-			// timer can survive a rejected fetch until the deadline expires.
-			timeoutInSeconds: Math.max(scoreRequestTimeoutMs / 1000, 0.001),
-			maxRetries: 0,
-			abortSignal: controller.signal,
-		});
-		delivered = true;
-	} catch (error) {
-		recordScoreFailure(error);
+		for (let attempt = 1; !delivered; attempt += 1) {
+			try {
+				await scoresApi.create(body, {
+					// SDK 5.11.1 clears its own timer at response headers. The
+					// caller signal stays active through the body read. Keep the
+					// SDK header budget equal to the time left: it cannot be
+					// disabled via public options and its timer can survive a
+					// rejected fetch until the deadline expires.
+					timeoutInSeconds: Math.max((deadline - Date.now()) / 1000, 0.001),
+					maxRetries: 0,
+					abortSignal: controller.signal,
+				});
+				delivered = true;
+			} catch (error) {
+				const status = scoreFailureStatus(error);
+				const transient =
+					status === undefined
+						? !controller.signal.aborted
+						: RETRYABLE_SCORE_STATUS_CODES.has(status as number);
+				const waitMs = Math.min(
+					SCORE_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1),
+					SCORE_RETRY_MAX_DELAY_MS,
+				);
+				if (!transient || Date.now() + waitMs >= deadline) {
+					recordScoreFailure(error);
+					break;
+				}
+				await waitForRetry(waitMs, controller.signal);
+			}
+		}
 	} finally {
 		clearTimeout(timer);
 	}
@@ -755,6 +820,8 @@ function wrapRuntime(rt: RuntimeState, config: Config): LangfuseRuntime {
 						undefined,
 					...body,
 				}) as Parameters<typeof scoresApi.create>[0];
+				// One id for every attempt keeps retries idempotent.
+				shaped.id ??= randomUUID();
 				const delivery = sendScore(scoresApi, shaped);
 				rt.pendingScores.add(delivery);
 				void delivery.finally(() => {
@@ -785,6 +852,8 @@ function createRuntime(config: Config): RuntimeState {
 		publicKey: config.publicKey,
 		secretKey: config.secretKey,
 		timeoutMs: exportTimeoutMs,
+		lingerMs: exportLingerMs,
+		dispatchSpanNames: EXPORT_DISPATCH_SPAN_NAMES,
 		onError: (message) => recordRuntimeError(message),
 	});
 	// The processor stamps release and environment on every span outside the
@@ -824,6 +893,7 @@ function createRuntime(config: Config): RuntimeState {
 		idGenerator,
 		tracerProvider,
 		processor,
+		exporter,
 		scoreClient: new LangfuseClient({
 			publicKey: config.publicKey,
 			secretKey: config.secretKey,
@@ -837,12 +907,18 @@ function createRuntime(config: Config): RuntimeState {
 
 /** Drain the owned processor directly, without the provider's generic timer. */
 async function flushRuntime(rt: RuntimeState) {
+	// The span processor hands ended spans to the exporter asynchronously and
+	// waits for their export callbacks before it asks the exporter to flush,
+	// so spans skip the batching window for the whole flush.
+	const release = rt.exporter.sendImmediately();
 	try {
 		// No media uploads, async masks, or async resource attributes are
 		// configured. The remaining I/O is owned by the bounded exporter.
 		await rt.processor.forceFlush();
 	} catch (error) {
 		recordRuntimeFailure("Failed to flush OpenTelemetry spans", error);
+	} finally {
+		release();
 	}
 	await Promise.all(rt.pendingScores);
 }

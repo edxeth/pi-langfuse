@@ -11,6 +11,12 @@ import {
 	getConfigWarnings,
 	resolveConfig,
 } from "./config.js";
+import {
+	appendDiagnostic,
+	createNotificationGate,
+	defaultDiagnosticsLogPath,
+	diagnosticCause,
+} from "./diagnostics-log.js";
 import { exportRedactedData } from "./export.js";
 import { createGenerationLifecycleHandlers } from "./generation-lifecycle.js";
 import {
@@ -76,6 +82,12 @@ import { createTurnLifecycleHandlers } from "./turn-lifecycle.js";
 
 const LANGFUSE_STATUS_KEY = "pi-langfuse:status";
 const LANGFUSE_TEST_TIMEOUT_MS = 3_000;
+/**
+ * A diagnostic cause is shown to the operator at most once per window; every
+ * occurrence still reaches the diagnostics log. A cause that hits every span
+ * of a prompt (for example a configuration conflict) is one warning.
+ */
+const DIAGNOSTIC_REPEAT_WINDOW_MS = 15 * 60_000;
 const FEEDBACK_SCORE_NAME = "user_feedback";
 const FEEDBACK_USAGE = "Usage: /langfuse-score <good|bad> [comment]";
 /** Stored comment length; Langfuse score comments are short free text. */
@@ -438,11 +450,26 @@ export default async function (pi: ExtensionAPI) {
 		}
 	>();
 	let detachDiagnostics: (() => void) | undefined;
+	const showDiagnostic = createNotificationGate(DIAGNOSTIC_REPEAT_WINDOW_MS);
+	// Set when the diagnostics log cannot be written; /langfuse-status shows
+	// it, because reporting it as a diagnostic would recurse.
+	let diagnosticsLogError: string | undefined;
+	/**
+	 * The resolved configuration, reused between lifecycle boundaries.
+	 * Resolving reads the config file (and, in pseudonymous mode, the identity
+	 * salt), so it runs at session start, at the start of each agent run, and
+	 * on settings changes rather than on every streamed event. A config-file
+	 * edit therefore applies at the next prompt. Commands resolve afresh.
+	 */
+	let cachedConfig: Config | undefined;
+	const currentConfig = () => {
+		cachedConfig ??= resolveConfig(settings);
+		return cachedConfig;
+	};
 	const bindDiagnostics = (ctx: LangfuseUiContext, config: Config) => {
 		const state = sessionOwner.get(ctx);
 		if (state) diagnosticContexts.set(state, { ctx, config });
 		detachDiagnostics?.();
-		let lastMessage: string | undefined;
 		detachDiagnostics = subscribeRuntimeErrors((error) => {
 			// Capture configuration here: resolving it inside the callback could
 			// recurse if reading that configuration itself produces a diagnostic.
@@ -450,8 +477,13 @@ export default async function (pi: ExtensionAPI) {
 				/\p{Cc}/gu,
 				" ",
 			);
-			if (safe === lastMessage) return;
-			lastMessage = safe;
+			try {
+				appendDiagnostic(defaultDiagnosticsLogPath(), { message: safe });
+				diagnosticsLogError = undefined;
+			} catch (logError) {
+				diagnosticsLogError = operatorSafeText(config, errorMessage(logError));
+			}
+			if (!showDiagnostic(diagnosticCause(safe))) return;
 			const message = safe.startsWith("Langfuse") ? safe : `Langfuse: ${safe}`;
 			if (ctx.hasUI) {
 				ctx.ui?.notify?.(message, "warning");
@@ -470,6 +502,7 @@ export default async function (pi: ExtensionAPI) {
 		};
 		registerSettings(pi, getLiveSettingsView(settings));
 		const config = resolveConfig(settings);
+		cachedConfig = config;
 		if (lastUiContext) bindDiagnostics(lastUiContext, config);
 		for (const state of sessionOwner.values()) {
 			await agentLifecycle.finalizePrompt(
@@ -495,7 +528,7 @@ export default async function (pi: ExtensionAPI) {
 		getSessionState(ctx);
 
 	const generationLifecycle = createGenerationLifecycleHandlers({
-		getConfig: () => resolveConfig(settings),
+		getConfig: currentConfig,
 		getSessionState,
 		canTrace,
 		getRuntime,
@@ -513,7 +546,7 @@ export default async function (pi: ExtensionAPI) {
 	});
 
 	const toolLifecycle = createToolLifecycleHandlers({
-		getConfig: () => resolveConfig(settings),
+		getConfig: currentConfig,
 		getSessionState,
 		listSessionStates: () => sessionOwner.values(),
 		canTrace,
@@ -528,7 +561,7 @@ export default async function (pi: ExtensionAPI) {
 	});
 
 	const agentLifecycle = createAgentLifecycleHandlers({
-		getConfig: () => resolveConfig(settings),
+		getConfig: currentConfig,
 		updateStatus: (ctx, config) => {
 			lastUiContext = ctx;
 			bindDiagnostics(ctx, config);
@@ -553,7 +586,7 @@ export default async function (pi: ExtensionAPI) {
 		abandonTools: toolLifecycle.abandon,
 	});
 	const turnLifecycle = createTurnLifecycleHandlers({
-		getConfig: () => resolveConfig(settings),
+		getConfig: currentConfig,
 		getSessionState,
 		canTrace,
 		getRuntime,
@@ -645,6 +678,7 @@ export default async function (pi: ExtensionAPI) {
 				`config path: ${getConfigFilePath()}`,
 				`runtime mode: ${runtimeMode(config)}`,
 				`last runtime error: ${lastError}`,
+				`diagnostics log: ${defaultDiagnosticsLogPath()}${diagnosticsLogError ? ` (unavailable: ${diagnosticsLogError})` : ""}`,
 			].join("\n");
 			ctx.ui.notify(report, "info");
 		},
@@ -729,8 +763,9 @@ export default async function (pi: ExtensionAPI) {
 		const state = getSessionState(ctx, true);
 		if (!state) return;
 		lastUiContext = ctx;
-		updateLangfuseStatusLine(ctx, resolveConfig(settings));
-		const config = resolveConfig(settings);
+		cachedConfig = undefined;
+		const config = currentConfig();
+		updateLangfuseStatusLine(ctx, config);
 		bindDiagnostics(ctx, config);
 		announceConfigState(settings);
 		await agentLifecycle.finalizePrompt(
@@ -767,7 +802,7 @@ export default async function (pi: ExtensionAPI) {
 		state.provider = event.model?.provider || "";
 		const prompt = state.promptState;
 		if (prompt && !prompt.finalizing) {
-			const config = resolveConfig(settings);
+			const config = currentConfig();
 			prompt.trace?.update({
 				metadata: {
 					model: state.model,
@@ -778,9 +813,17 @@ export default async function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("before_agent_start", agentLifecycle.beforeAgentStart);
+	pi.on("before_agent_start", (event, ctx) => {
+		cachedConfig = undefined;
+		return agentLifecycle.beforeAgentStart(event, ctx);
+	});
 
-	pi.on("agent_start", agentLifecycle.agentStart);
+	pi.on("agent_start", (event, ctx) => {
+		// A run that no before_agent_start announced starts a prompt here;
+		// continuations of the current prompt keep its configuration.
+		if (!getSessionState(ctx)?.promptState) cachedConfig = undefined;
+		return agentLifecycle.agentStart(event, ctx);
+	});
 
 	pi.on("turn_start", turnLifecycle.turnStart);
 
@@ -829,7 +872,7 @@ export default async function (pi: ExtensionAPI) {
 				addIndirectUsage(prompt, compactionEntry.usage);
 			}
 		}
-		writeRawTrace(resolveConfig(settings), state, {
+		writeRawTrace(currentConfig(), state, {
 			type: "session_compact",
 			compactCount: state.compactCount,
 		});
@@ -856,7 +899,7 @@ export default async function (pi: ExtensionAPI) {
 		}
 		if (!state.shutdownPromise) {
 			state.shutdownPromise = (async () => {
-				const config = resolveConfig(settings);
+				const config = currentConfig();
 				writeRawTrace(config, state, {
 					type: "session_end",
 					reason: "shutdown",

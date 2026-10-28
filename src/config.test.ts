@@ -388,4 +388,11 @@ describe("local autostart precedence", () => {
 	])("resolves %s", (_name, env, file, expected) => {
 		expect(autostart(env, file)).toBe(expected);
 	});
+
+	it("gives the health check a 2,000 ms default deadline", () => {
+		// The self-hosted health endpoint answers in a steady ~205 ms; a deadline
+		// below that would start Docker Compose against a healthy stack.
+		configFile({ localAutostart: true });
+		expect(resolveConfig({}).localAutostartTimeoutMs).toBe(2_000);
+	});
 });

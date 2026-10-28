@@ -398,12 +398,25 @@ export function createToolLifecycleHandlers(
 			: undefined;
 	};
 
+	/** The latest progress output, summarized once, when it is needed. */
+	const partialOutputOf = (config: Config, tool: ToolState) =>
+		tool.partialResult
+			? deps.summarizeToolResult(config, tool.partialResult.value) || undefined
+			: undefined;
+
+	/** The final result, or the latest progress output when there is none. */
+	const completedOutput = (config: Config, tool: ToolState) => {
+		if (tool.resultOutput) return { output: tool.resultOutput, partial: false };
+		const output = partialOutputOf(config, tool);
+		return { output, partial: output !== undefined };
+	};
+
 	const endBody = (
 		prompt: PromptState,
 		toolCallId: string,
 		tool: ToolState,
 		isError: boolean,
-		output: string | undefined,
+		{ output, partial }: { output: string | undefined; partial: boolean },
 	): ToolEndBody => ({
 		isError,
 		output: output || undefined,
@@ -416,6 +429,7 @@ export function createToolLifecycleHandlers(
 			argsSummary: tool.argsSummary,
 			durationMs: Date.now() - tool.startedAt,
 			askUserWait: askWaitMetadata(prompt, toolCallId),
+			...(partial ? { partial: true } : {}),
 		},
 	});
 
@@ -515,16 +529,11 @@ export function createToolLifecycleHandlers(
 			config,
 			deps.summarizeToolArgs,
 		);
-		tool.partialOutput = deps.summarizeToolResult(config, event.partialResult);
+		// A span is exported once, when it ends, so a progress update never
+		// reaches Langfuse by itself. Keep only the latest result; it becomes
+		// the output if the tool ends without a final result.
+		if (!tool.spanEnded) tool.partialResult = { value: event.partialResult };
 		await ensureToolSpan(state, prompt, event.toolCallId, tool, config);
-		if (!tool.span || tool.spanEnded) return;
-		tool.span.update?.({
-			output: tool.partialOutput,
-			metadata: {
-				partial: true,
-				tool: tool.toolName,
-			},
-		});
 	};
 
 	const toolResult = async (event: ToolResultEvent, ctx: ExtensionContext) => {
@@ -622,7 +631,7 @@ export function createToolLifecycleHandlers(
 				event.toolCallId,
 				tool,
 				event.isError,
-				tool.resultOutput || tool.partialOutput,
+				completedOutput(config, tool),
 			),
 		);
 	};
@@ -647,6 +656,10 @@ export function createToolLifecycleHandlers(
 			}
 			countToolUsage(prompt, tool);
 			tool.completionSeen = true;
+			// A tool with a result is handled first, so only partial output exists otherwise.
+			const partialOutput = isResultOnly
+				? undefined
+				: partialOutputOf(config, tool);
 			tool.finishPromise = finishTool(
 				state,
 				prompt,
@@ -659,12 +672,11 @@ export function createToolLifecycleHandlers(
 							toolCallId,
 							tool,
 							isError,
-							tool.resultOutput || tool.partialOutput,
+							completedOutput(config, tool),
 						)
 					: {
 							isError,
-							// A tool with a result is handled above, so only partial output exists.
-							output: tool.partialOutput,
+							output: partialOutput,
 							statusMessage: tool.isError
 								? "tool error"
 								: "tool ended without completion event",
@@ -674,6 +686,7 @@ export function createToolLifecycleHandlers(
 								durationMs: Date.now() - tool.startedAt,
 								abandoned: true,
 								askUserWait: askWaitMetadata(prompt, toolCallId),
+								...(partialOutput !== undefined ? { partial: true } : {}),
 							},
 						},
 			);

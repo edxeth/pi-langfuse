@@ -1,4 +1,10 @@
-import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -147,6 +153,91 @@ describe("index (extension entry)", () => {
 		await (stop[1] as EventHandler)({}, ctx);
 		recordRuntimeError("failure after this UI closed");
 		expect(messages).toHaveLength(1);
+	});
+
+	it("logs every diagnostic and shows each cause once while it repeats", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "pi-langfuse-diag-log-"));
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		mockPi.events.emit.mockImplementation((event, probe) => {
+			if (event === "extension:settings:get") {
+				probe.values = { enabled: false, "secret-key": "sk-ui-private" };
+			}
+		});
+		await registerExtension(mockPi as unknown as ExtensionArg);
+		const start = mockPi.on.mock.calls.find(
+			(call) => call[0] === "session_start",
+		);
+		if (!start) throw new Error("session lifecycle not registered");
+		const messages: string[] = [];
+		await (start[1] as EventHandler)(
+			{},
+			{
+				hasUI: true,
+				ui: { notify: (message: string) => messages.push(message) },
+				sessionManager: { getSessionFile: () => "/tmp/diag-log/session.jsonl" },
+			},
+		);
+		const conflict = new Error(
+			"Langfuse: a runtime with a different configuration is still active",
+		);
+
+		// One cause reached through several operations, as when a config
+		// change rejects every span of an open prompt.
+		recordRuntimeError("Failed to start generation", conflict);
+		recordRuntimeError("Failed to create tool span", conflict);
+		recordRuntimeError("Failed to start generation", conflict);
+		recordRuntimeError("export failed for sk-ui-private");
+
+		expect(messages).toHaveLength(2);
+		expect(messages[0]).toContain("a runtime with a different configuration");
+		expect(messages[1]).toContain("export failed");
+		const logPath = join(agentDir, "langfuse", "diagnostics.jsonl");
+		const logged = readFileSync(logPath, "utf-8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line).message as string);
+		expect(logged).toHaveLength(4);
+		expect(logged[1]).toContain("Failed to create tool span");
+		expect(logged.join("\n")).not.toContain("sk-ui-private");
+	});
+
+	it("still notifies when the diagnostics log cannot be written, and reports why in the status", async () => {
+		// A file where the agent directory should be makes every log write fail.
+		const blocked = join(
+			mkdtempSync(join(tmpdir(), "pi-langfuse-diag-blocked-")),
+			"agent",
+		);
+		writeFileSync(blocked, "not a directory");
+		process.env.PI_CODING_AGENT_DIR = blocked;
+		mockPi.events.emit.mockImplementation((event, probe) => {
+			if (event === "extension:settings:get") probe.values = { enabled: false };
+		});
+		await registerExtension(mockPi as unknown as ExtensionArg);
+		const start = mockPi.on.mock.calls.find(
+			(call) => call[0] === "session_start",
+		);
+		const status = mockPi.registerCommand.mock.calls.find(
+			(call) => call[0] === "langfuse-status",
+		);
+		if (!start || !status) throw new Error("extension not registered");
+		const messages: string[] = [];
+		const ctx = {
+			hasUI: true,
+			isIdle: () => true,
+			ui: { notify: (message: string) => messages.push(message) },
+			sessionManager: {
+				getSessionFile: () => "/tmp/diag-blocked/session.jsonl",
+			},
+		};
+		await (start[1] as EventHandler)({}, ctx);
+
+		recordRuntimeError("export failed while the log is unavailable");
+		await (status[1] as { handler: EventHandler }).handler("", ctx);
+
+		expect(messages[0]).toContain("export failed while the log is unavailable");
+		expect(messages.at(-1)).toMatch(
+			/diagnostics log: .*diagnostics\.jsonl \(unavailable: /,
+		);
 	});
 
 	it("rebinds diagnostics to a surviving session and ignores unknown shutdowns", async () => {

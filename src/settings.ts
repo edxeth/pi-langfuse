@@ -187,7 +187,8 @@ function createSettingsNodes(defaults: SettingsValues) {
 		"capture-tool-progress": {
 			_tag: "boolean",
 			label: "Capture Tool Progress",
-			description: "Record partial tool_execution_update output in Langfuse.",
+			description:
+				"Keep the latest tool_execution_update output and record it when a tool ends without a final result.",
 			default: defaults["capture-tool-progress"],
 		},
 		"capture-message-updates": {

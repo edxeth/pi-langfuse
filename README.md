@@ -84,6 +84,8 @@ You can also configure keys manually via env vars or settings. Configuration pre
 
 The extension does not load an extension-local `config.json`. Use `pi-langfuse.json`, the settings panel, or environment variables.
 
+The extension reads `pi-langfuse.json` and the environment when a session starts and when each prompt starts, not on every event. An edit to the file applies from the next prompt. A change in the settings panel, `/langfuse:toggle`, or `/langfuse-privacy` applies at once.
+
 ## Configuration
 
 | Setting | Env Var | Default | Description |
@@ -92,12 +94,13 @@ The extension does not load an extension-local `config.json`. Use `pi-langfuse.j
 | **Enabled** | - | `true` | Global toggle for tracing. |
 | **Public Key** | `LANGFUSE_PUBLIC_KEY` | - | Langfuse project public key. |
 | **Secret Key** | `LANGFUSE_SECRET_KEY` | - | Langfuse project secret key. |
-| **Base URL** | `LANGFUSE_BASE_URL` / `LANGFUSE_HOST` | `https://cloud.langfuse.com` | API host. Use `http://localhost:3100` for local. |
+| **Base URL** | `LANGFUSE_BASE_URL` / `LANGFUSE_HOST` | `https://cloud.langfuse.com` | API host. Use `http://127.0.0.1:3100` for the local stack: it listens on IPv4 only, and `localhost` often resolves to IPv6 first, which adds about 250 ms to every new connection. |
 | **User ID** | `PI_LANGFUSE_USER_ID` | `$USER` | Associate traces with a specific user. |
 | **Environment** | `PI_LANGFUSE_ENV` | - | Tag traces, e.g. `local`, `staging`, `production`. |
 | **Release** | `PI_LANGFUSE_RELEASE` | - | Tag traces with a version or release ID. |
 | **Local Autostart** | `PI_LANGFUSE_AUTOSTART` | `config dependent` | `0` disables Docker autostart, `1` forces it. |
 | **Local Autostart Dir** | `PI_LANGFUSE_AUTOSTART_DIR` | `$PI_CODING_AGENT_DIR/langfuse` | Directory containing `docker-compose.yml`. |
+| **Local Autostart Health Timeout** | `PI_LANGFUSE_AUTOSTART_TIMEOUT_MS` | `2000` | Config key `localAutostartTimeoutMs` (50 to 5000). How long the health check waits before autostart treats the stack as down. |
 | **Capture Provider Payload** | `PI_LANGFUSE_CAPTURE_PROVIDER_PAYLOAD` | `false` | Optional provider payload capture inside Langfuse metadata. |
 | **Secret Redaction** | `PI_LANGFUSE_REDACTION` / `PI_LANGFUSE_UNREDACTED=1` | `true` | Redact known secrets and common token/PII-shaped patterns before Langfuse/raw-trace writes. Settings/config values take precedence over env opt-outs. |
 | **Additional Redaction Secrets** | `PI_LANGFUSE_REDACTION_SECRETS` | - | Comma-separated literal secrets to redact in addition to env/config secrets. |
@@ -168,7 +171,9 @@ With no argument, flips the current tracing state. `on` forces tracing on, `off`
 /langfuse-status
 ```
 
-Prints safe runtime and config status: the ON/OFF label, resolved config source (`settings panel`, `pi-langfuse.json`, `environment`, or `defaults`), host, masked public key, capture policy, active-run state, config path, runtime mode (`disabled`, `v5-otel`, or `unconfigured`), and the last runtime error. The public key is masked; the secret key is never printed.
+Prints safe runtime and config status: the ON/OFF label, resolved config source (`settings panel`, `pi-langfuse.json`, `environment`, or `defaults`), host, masked public key, capture policy, active-run state, config path, runtime mode (`disabled`, `v5-otel`, or `unconfigured`), the last runtime error, and the path of the diagnostics log. The public key is masked; the secret key is never printed.
+
+Every diagnostic the extension raises is appended, sanitized, to `$PI_CODING_AGENT_DIR/langfuse/diagnostics.jsonl` (owner-only, capped at 1 MB with one previous file kept as `diagnostics.jsonl.1`). Pi shows each distinct cause at most once every 15 minutes; repeats only reach the log.
 
 ### /langfuse-test
 

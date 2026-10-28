@@ -192,7 +192,11 @@ export interface ToolState {
 	parentObservationId?: string;
 	argsSummary: string;
 	argsRaw?: unknown;
-	partialOutput?: string;
+	/**
+	 * The latest tool_execution_update result. It is summarized only when the
+	 * tool ends without a usable final result.
+	 */
+	partialResult?: { value: unknown };
 	resultOutput?: string;
 	isError?: boolean;
 }

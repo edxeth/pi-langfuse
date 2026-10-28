@@ -45,6 +45,7 @@ interface SetupOptions {
 	canTrace?: boolean;
 	getRuntime?: () => Promise<unknown>;
 	ensureLocalLangfuseStarted?: () => Promise<void>;
+	collectSourceMetadata?: () => Promise<Record<string, string>>;
 }
 
 function setup(options: SetupOptions = {}) {
@@ -78,7 +79,8 @@ function setup(options: SetupOptions = {}) {
 		getRuntimeName: () => "runtime-x",
 		getSessionRoot: () => "root-1",
 		redactionMetadata: () => ({ redaction: "meta" }),
-		collectSourceMetadata: () => ({ repo: "meta" }),
+		collectSourceMetadata:
+			options.collectSourceMetadata ?? (async () => ({ repo: "meta" })),
 		truncate: (text: string, limit: number) => `truncated(${limit}):${text}`,
 		extractTextFromContent: (content: Array<{ text?: string }>) =>
 			content.map((part) => part.text ?? "").join(""),
@@ -126,6 +128,98 @@ function promptOf(state: SessionState<PromptState> | undefined) {
 	if (!prompt) throw new Error("expected an active prompt");
 	return prompt;
 }
+
+describe("a prompt finalized while git metadata is pending", () => {
+	/**
+	 * Git metadata that answers only when released. The start awaits the
+	 * answer itself, so releasing it queues the start's continuation at once.
+	 */
+	function heldMetadata() {
+		let release: () => void = () => {};
+		const answer = new Promise<{ repo: string }>((resolve) => {
+			release = () => resolve({ repo: "meta" });
+		});
+		let asked = false;
+		return {
+			collect: () => {
+				asked = true;
+				return answer;
+			},
+			asked: () => asked,
+			release: () => release(),
+		};
+	}
+
+	type Start = (
+		context: ReturnType<typeof setup>,
+		ctx: never,
+	) => Promise<unknown>;
+	const starts: Array<[string, Start]> = [
+		[
+			"an announced prompt",
+			(context, ctx) => context.handlers.beforeAgentStart(startEvent(), ctx),
+		],
+		[
+			"an unannounced run",
+			(context, ctx) => context.handlers.agentStart({} as never, ctx),
+		],
+	];
+
+	it.each(starts)(
+		"does not trace %s that session shutdown finalized meanwhile",
+		async (_name, start) => {
+			const metadata = heldMetadata();
+			const context = setup({ collectSourceMetadata: metadata.collect });
+			const pending = start(context, ctxOf("/sessions/--w--/s.jsonl"));
+			await vi.waitFor(() => expect(metadata.asked()).toBe(true));
+
+			await context.handlers.finalizePrompt(
+				context.state as never,
+				context.config,
+				true,
+				"session shutdown",
+			);
+			metadata.release();
+			await pending;
+
+			expect(context.lf.trace).not.toHaveBeenCalled();
+			expect(context.state?.promptState).toBeNull();
+			expect(
+				context.rawRecords.filter(
+					(record) => record.type === "agent_prompt_start",
+				),
+			).toEqual([]);
+		},
+	);
+
+	it.each(starts)(
+		"writes nothing after session_end for %s when git answers as shutdown begins",
+		async (_name, start) => {
+			const metadata = heldMetadata();
+			const context = setup({ collectSourceMetadata: metadata.collect });
+			const pending = start(context, ctxOf("/sessions/--w--/s.jsonl"));
+			await vi.waitFor(() => expect(metadata.asked()).toBe(true));
+
+			// Git answers; before the start resumes, shutdown records the session
+			// end and begins finalizing, in the order the shutdown handler uses.
+			metadata.release();
+			context.rawRecords.push({ type: "session_end" });
+			const finalization = context.handlers.finalizePrompt(
+				context.state as never,
+				context.config,
+				true,
+				"session shutdown",
+			);
+			await Promise.all([pending, finalization]);
+
+			expect(context.rawRecords.map((record) => record.type)).toEqual([
+				"session_end",
+			]);
+			expect(context.lf.trace).not.toHaveBeenCalled();
+			expect(context.state?.promptState).toBeNull();
+		},
+	);
+});
 
 describe("starting a prompt", () => {
 	it("creates the trace and prompt span and remembers the destination", async () => {
@@ -845,7 +939,7 @@ describe("agent end and settle", () => {
 		expect(prompt.recoveredFailureCount).toBe(0);
 	});
 
-	it("finalizes once at settle and flushes once, whatever the abort flag says", async () => {
+	it("finalizes once at settle, whatever the abort flag says", async () => {
 		const context = await started();
 		const prompt = promptOf(context.state);
 
@@ -859,8 +953,29 @@ describe("agent end and settle", () => {
 		);
 
 		expect(prompt.failure).toEqual({ stopReason: "aborted" });
-		expect(context.deps.flushClient).toHaveBeenCalledTimes(1);
+		expect(context.promptSpan.end).toHaveBeenCalledTimes(1);
 		expect(context.state?.promptState).toBeNull();
+	});
+
+	it("settles without waiting for delivery, which session shutdown owns", async () => {
+		// Pi treats the session as busy until agent_settled handlers return,
+		// so waiting for Langfuse here delayed every prompt end by the slowest
+		// export or score. The prompt's spans are already sent or queued.
+		const context = await started();
+		vi.mocked(context.deps.flushClient).mockImplementation(
+			() => new Promise<void>(() => {}),
+		);
+
+		const outcome = await Promise.race([
+			context.handlers
+				.agentSettled({} as never, context.ctx)
+				.then(() => "settled"),
+			new Promise((resolve) => setTimeout(() => resolve("waiting"), 1_000)),
+		]);
+
+		expect(outcome).toBe("settled");
+		expect(context.state?.promptState).toBeNull();
+		expect(context.deps.flushClient).not.toHaveBeenCalled();
 	});
 
 	it("keeps an existing failure when the settle reports an abort, and ignores a false flag", async () => {

@@ -41,6 +41,29 @@ export interface OtlpExporterOptions {
 	timeoutMs: number;
 	/** App-edge sink for safe, actionable, bounded failure summaries. */
 	onError: (message: string) => void;
+	/**
+	 * How long an ended span may wait for others to join its request. Zero
+	 * (the default) sends at once. Fewer requests mean fewer stored request
+	 * files and trace merges on the Langfuse server. Spans named in
+	 * `dispatchSpanNames`, `sendImmediately()`, `forceFlush()`, and
+	 * `shutdown()` send everything that waits at once.
+	 */
+	lingerMs?: number;
+	/** Span names that close a unit of work and end the linger window. */
+	dispatchSpanNames?: ReadonlySet<string>;
+}
+
+/** The exporter, plus a way to send lingering spans without waiting. */
+export interface OtlpSpanExporter extends SpanExporter {
+	/**
+	 * Send every waiting span now, and each span that ends at once, until the
+	 * returned release runs. A flush holds this for its whole duration: the
+	 * span processor hands spans over asynchronously and then waits for their
+	 * export callbacks before it calls `forceFlush`, so a span that ends
+	 * during a flush must not wait for a new window. Does not wait for
+	 * delivery.
+	 */
+	sendImmediately(): () => void;
 }
 
 /**
@@ -54,8 +77,9 @@ export const MAX_CONCURRENT_EXPORTS = 4;
 // Bound each request below Langfuse's ingestion size limit.
 const MAX_REQUEST_BYTES = 3_500_000;
 const MAX_RESPONSE_BYTES = 1_000_000;
-// One initial attempt plus three retries, all inside the total deadline.
-const MAX_HTTP_ATTEMPTS = 4;
+// Retries continue with capped backoff until the total deadline, so a
+// server that is unavailable for a few seconds (for example while its
+// database restarts) does not lose the export.
 const RETRY_BASE_DELAY_MS = 250;
 const RETRY_MAX_DELAY_MS = 2_000;
 const MAX_SUMMARY_REASONS = 3;
@@ -99,7 +123,12 @@ class ResponseTooLargeError extends Error {}
 /** Export failure already delivered to the diagnostic sink. */
 export class OtlpExportError extends Error {}
 
-export function createOtlpExporter(options: OtlpExporterOptions): SpanExporter {
+/** Lingering spans past this count leave at once, bounding the wait queue. */
+const MAX_LINGERING_SPANS = 256;
+
+export function createOtlpExporter(
+	options: OtlpExporterOptions,
+): OtlpSpanExporter {
 	const endpoint = `${options.host.replace(/\/+$/, "")}${TRACES_PATH}`;
 	const headers: Record<string, string> = {
 		Authorization: `Basic ${Buffer.from(
@@ -109,8 +138,16 @@ export function createOtlpExporter(options: OtlpExporterOptions): SpanExporter {
 		"x-langfuse-public-key": options.publicKey,
 	};
 	const timeoutMs = Math.max(1, Math.trunc(options.timeoutMs));
+	const lingerMs = Math.max(0, Math.trunc(options.lingerMs ?? 0));
+	const dispatchSpanNames = options.dispatchSpanNames ?? new Set<string>();
 	const inFlight = new Set<Promise<void>>();
 	const queue: QueuedExport[] = [];
+	let queuedSpanCount = 0;
+	let lingerTimer: ReturnType<typeof setTimeout> | undefined;
+	// Set when queued spans should leave as soon as a slot is free.
+	let dispatchRequested = false;
+	// Active sendImmediately() holds; while any is held, spans skip the window.
+	let immediateHolds = 0;
 	let shutDown = false;
 
 	/** Reports a failure to the sink once and builds the shared result. */
@@ -183,10 +220,9 @@ export function createOtlpExporter(options: OtlpExporterOptions): SpanExporter {
 		deadline: number,
 	): Promise<SendOutcome> {
 		let lastFailure: string | undefined;
-		let attempt = 1;
-		// Every pass returns, waits for the next attempt, or stops at the
-		// attempt cap.
-		for (; ; attempt += 1) {
+		// Every pass returns or waits for the next attempt; the deadline ends
+		// the loop.
+		for (let attempt = 1; ; attempt += 1) {
 			if (deadline - Date.now() <= 0) {
 				return {
 					ok: false,
@@ -221,8 +257,12 @@ export function createOtlpExporter(options: OtlpExporterOptions): SpanExporter {
 			if (result.class === "terminal")
 				return { ok: false, reason: result.reason };
 			if (result.status !== undefined) lastFailure = `HTTP ${result.status}`;
-			if (attempt >= MAX_HTTP_ATTEMPTS) break;
-			const delayMs = result.retryAfterMs ?? backoffDelayMs(attempt);
+			// An advised wait of zero (or a past date) still waits the base delay,
+			// so retrying until the deadline never becomes a burst.
+			const delayMs = Math.max(
+				result.retryAfterMs ?? backoffDelayMs(attempt),
+				RETRY_BASE_DELAY_MS,
+			);
 			const remainingMs = deadline - Date.now();
 			if (delayMs >= remainingMs) {
 				return {
@@ -236,10 +276,6 @@ export function createOtlpExporter(options: OtlpExporterOptions): SpanExporter {
 			}
 			await delay(delayMs, controller.signal);
 		}
-		return {
-			ok: false,
-			reason: `${lastFailure} persisted for all ${attempt} attempts within the ${timeoutMs}ms deadline`,
-		};
 	}
 
 	async function sendAttempt(
@@ -286,12 +322,20 @@ export function createOtlpExporter(options: OtlpExporterOptions): SpanExporter {
 	}
 
 	/**
-	 * Starts one export for everything queued when a slot is free. The slot is
-	 * released and the next batch started before `run` settles, so a waiter on
-	 * `inFlight` never observes a gap while queued work remains.
+	 * Starts one export for everything queued once a dispatch was requested
+	 * and a slot is free. The slot is released and the next batch started
+	 * before `run` settles, so a waiter on `inFlight` never observes a gap
+	 * while requested work remains.
 	 */
 	function startQueued(): void {
-		if (queue.length === 0 || inFlight.size >= MAX_CONCURRENT_EXPORTS) return;
+		if (
+			!dispatchRequested ||
+			queue.length === 0 ||
+			inFlight.size >= MAX_CONCURRENT_EXPORTS
+		)
+			return;
+		dispatchRequested = false;
+		queuedSpanCount = 0;
 		const run: Promise<void> = runBatch(queue.splice(0)).finally(() => {
 			inFlight.delete(run);
 			startQueued();
@@ -299,9 +343,33 @@ export function createOtlpExporter(options: OtlpExporterOptions): SpanExporter {
 		inFlight.add(run);
 	}
 
+	/** Ends the linger window: queued spans leave when a slot is free. */
+	function sendQueued(): void {
+		if (lingerTimer) {
+			clearTimeout(lingerTimer);
+			lingerTimer = undefined;
+		}
+		if (queue.length === 0) return;
+		dispatchRequested = true;
+		startQueued();
+	}
+
+	function sendImmediately(): () => void {
+		immediateHolds += 1;
+		sendQueued();
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			immediateHolds -= 1;
+		};
+	}
+
 	/** Resolves once no export is running and none is queued. */
 	async function drain(): Promise<void> {
-		while (inFlight.size > 0 || queue.length > 0) {
+		for (;;) {
+			sendQueued();
+			if (inFlight.size === 0) return;
 			await Promise.allSettled([...inFlight]);
 		}
 	}
@@ -319,8 +387,24 @@ export function createOtlpExporter(options: OtlpExporterOptions): SpanExporter {
 				return;
 			}
 			queue.push({ spans, resultCallback });
-			startQueued();
+			queuedSpanCount += spans.length;
+			if (
+				lingerMs === 0 ||
+				immediateHolds > 0 ||
+				queuedSpanCount >= MAX_LINGERING_SPANS ||
+				spans.some((span) => dispatchSpanNames.has(span.name))
+			) {
+				sendQueued();
+				return;
+			}
+			if (!lingerTimer) {
+				lingerTimer = setTimeout(sendQueued, lingerMs);
+				// Delivery at exit is shutdown's job; a waiting span must not
+				// keep the process alive.
+				lingerTimer.unref?.();
+			}
 		},
+		sendImmediately,
 		forceFlush: drain,
 		async shutdown() {
 			shutDown = true;

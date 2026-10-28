@@ -2,12 +2,13 @@ import { existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { flushClient } from "../../src/langfuse-client.js";
 import {
 	closeOpenRuntimeCases,
 	createRuntimeCase,
 	type RuntimeCase,
+	warmRuntimeCase,
 } from "./isolated-pi.js";
 
 /**
@@ -18,6 +19,8 @@ import {
  */
 
 let activeCase: RuntimeCase | undefined;
+
+beforeAll(warmRuntimeCase);
 
 afterEach(async () => {
 	const current = activeCase;

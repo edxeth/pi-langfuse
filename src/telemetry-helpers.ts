@@ -15,7 +15,11 @@ import {
 	rawSummaryItems,
 } from "./raw-request-summary.js";
 import { appendRawTrace } from "./raw-trace.js";
-import { redactionMetadata, redactString } from "./redaction.js";
+import {
+	redactionMetadata,
+	redactString,
+	withRedactionSnapshot,
+} from "./redaction.js";
 import type { SessionState } from "./session-state.js";
 
 export function truncate(text: string, max = 1200) {
@@ -224,6 +228,13 @@ function summarizeMessageForRole(
 }
 
 export function summarizeMessages(
+	config: Config,
+	messages: Array<{ role?: string; content?: unknown; sections?: unknown }>,
+) {
+	return withRedactionSnapshot(() => summarizeMessageList(config, messages));
+}
+
+function summarizeMessageList(
 	config: Config,
 	messages: Array<{ role?: string; content?: unknown; sections?: unknown }>,
 ) {

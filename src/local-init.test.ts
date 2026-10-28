@@ -48,9 +48,12 @@ describe("/langfuse-init", () => {
 		const config = JSON.parse(
 			await readFile(join(agentDir, "langfuse", "pi-langfuse.json"), "utf-8"),
 		);
+		// The stack publishes IPv4 loopback only. `localhost` resolves to ::1
+		// first on many hosts, and every new connection then waits about 250 ms
+		// for the IPv6 attempt to give up.
 		expect(config).toMatchObject({
 			enabled: true,
-			host: "http://localhost:3100",
+			host: "http://127.0.0.1:3100",
 			localAutostart: true,
 		});
 		expect(config.publicKey).toMatch(/^pk-lf-local-/);

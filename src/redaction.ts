@@ -1007,7 +1007,34 @@ function normalizeKey(key: string) {
 		.toLowerCase();
 }
 
+/**
+ * Key names repeat across calls (environment variable names, payload field
+ * names), and every redacted string checks the whole environment, so key
+ * analysis is memoized. The result depends only on the name. The bound keeps
+ * arbitrary payload keys from growing the caches without limit.
+ */
+const KEY_ANALYSIS_CACHE_LIMIT = 4_096;
+const sensitiveKeyCache = new Map<string, boolean>();
+const binaryKeyCache = new Map<string, boolean>();
+
+function memoizedKeyTest(
+	cache: Map<string, boolean>,
+	key: string,
+	test: (key: string) => boolean,
+) {
+	const cached = cache.get(key);
+	if (cached !== undefined) return cached;
+	const result = test(key);
+	if (cache.size >= KEY_ANALYSIS_CACHE_LIMIT) cache.clear();
+	cache.set(key, result);
+	return result;
+}
+
 export function isSensitiveKey(key: string) {
+	return memoizedKeyTest(sensitiveKeyCache, key, analyzeSensitiveKey);
+}
+
+function analyzeSensitiveKey(key: string) {
 	const normalized = normalizeKey(key);
 	if (
 		PUBLIC_KEY_PATTERN.test(normalized) ||
@@ -1027,7 +1054,9 @@ export function isSensitiveKey(key: string) {
 }
 
 export function isBinaryKey(key: string) {
-	return BINARY_KEY_PATTERN.test(normalizeKey(key));
+	return memoizedKeyTest(binaryKeyCache, key, (name) =>
+		BINARY_KEY_PATTERN.test(normalizeKey(name)),
+	);
 }
 
 function collectExactSecrets(
@@ -1052,9 +1081,14 @@ function collectExactSecrets(
 	for (const secret of config.redactionAdditionalSecrets ?? []) {
 		add(secret, "configured-secret");
 	}
-	for (const [key, value] of Object.entries(env)) {
-		if (key === "PI_LANGFUSE_REDACTION_SECRETS") continue;
-		if (isSensitiveKey(key)) add(value, key);
+	// Reading process.env values crosses into native code, so only the
+	// values of sensitive keys are read; every call still sees the current
+	// environment.
+	for (const key of Object.keys(env)) {
+		if (key === "PI_LANGFUSE_REDACTION_SECRETS" || !isSensitiveKey(key)) {
+			continue;
+		}
+		add(env[key], key);
 	}
 
 	return Array.from(secrets, ([value, reason]) => ({ value, reason })).sort(
@@ -1075,6 +1109,50 @@ function collectRedactionSecrets(
 	return config.identityMode === "pseudonymous"
 		? secrets.filter((secret) => secret.reason !== "identity-salt")
 		: secrets;
+}
+
+interface ExactSecretSnapshot {
+	config: RedactionConfig;
+	env: NodeJS.ProcessEnv;
+	secrets: ExactSecret[];
+}
+
+let snapshotDepth = 0;
+let exactSecretSnapshot: ExactSecretSnapshot | undefined;
+
+/**
+ * Run synchronous work that redacts many strings with one exact-secret
+ * collection per config and environment object. No other code runs during a
+ * synchronous call, so the result equals collecting per string, provided
+ * `fn` itself changes neither. Collection reads the whole environment and
+ * dominated the cost of shaping a record field by field. Async work started
+ * inside `fn` collects afresh once the scope has returned.
+ */
+export function withRedactionSnapshot<T>(fn: () => T): T {
+	snapshotDepth += 1;
+	try {
+		return fn();
+	} finally {
+		snapshotDepth -= 1;
+		if (snapshotDepth === 0) exactSecretSnapshot = undefined;
+	}
+}
+
+/** Exact secrets for one config/env pair, reused inside a snapshot scope. */
+function redactionSecretsFor(
+	config: RedactionConfig,
+	env: NodeJS.ProcessEnv,
+): ExactSecret[] {
+	if (snapshotDepth === 0) return collectRedactionSecrets(config, env);
+	if (
+		exactSecretSnapshot?.config === config &&
+		exactSecretSnapshot.env === env
+	) {
+		return exactSecretSnapshot.secrets;
+	}
+	const secrets = collectRedactionSecrets(config, env);
+	exactSecretSnapshot = { config, env, secrets };
+	return secrets;
 }
 
 /**
@@ -1154,14 +1232,15 @@ export function redactString(
 	env: NodeJS.ProcessEnv = process.env,
 ) {
 	// Direct calls collect exact secrets fresh per string, so env/config
-	// changes are always visible at one-string granularity.
+	// changes are always visible at one-string granularity; inside a
+	// synchronous withRedactionSnapshot scope nothing can change between them.
 	const identity = identityTransformFor(config);
 	// Secret literals are matched against the original text: identity
 	// normalization rewrites paths such as a configured secret that contains
 	// the home directory, so it must run on the redacted result.
 	const redacted =
 		config.redactionEnabled && input
-			? redactStringWithSecrets(input, collectRedactionSecrets(config, env))
+			? redactStringWithSecrets(input, redactionSecretsFor(config, env))
 			: input;
 	return identity ? identity.string(redacted) : redacted;
 }
@@ -1228,7 +1307,7 @@ export function sanitizeForTelemetry<T>(
 	// granularity snapshot).
 	let exactSecrets: ExactSecret[] | undefined;
 	const exactSecretsForPayload = (): ExactSecret[] => {
-		exactSecrets ??= collectRedactionSecrets(config, env);
+		exactSecrets ??= redactionSecretsFor(config, env);
 		return exactSecrets;
 	};
 

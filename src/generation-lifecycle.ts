@@ -535,7 +535,6 @@ export function createGenerationLifecycleHandlers(
 		generationState: GenerationState,
 		config: Config,
 		body: Parameters<LangfuseGeneration["end"]>[0],
-		usage?: PiUsage,
 	) => {
 		// An ended generation always has its finish promise.
 		if (generationState.finishPromise) return generationState.finishPromise;
@@ -551,41 +550,10 @@ export function createGenerationLifecycleHandlers(
 			if (generationState.ended || !generationState.generation) return;
 
 			generationState.ended = true;
+			// Token usage and cost travel on the generation itself
+			// (usageDetails, costDetails), where Langfuse aggregates them.
 			try {
 				generationState.generation.end(body);
-				if (
-					usage &&
-					state.promptState === prompt &&
-					prompt.trace?.id &&
-					generationState.generation
-				) {
-					const lf = await deps.getRuntime(config);
-					const scoreTarget = {
-						traceId: prompt.trace.id,
-						observationId: generationState.generation.id,
-					};
-					if (usage.input) {
-						lf.score({
-							name: "input_tokens",
-							value: usage.input,
-							...scoreTarget,
-						});
-					}
-					if (usage.output) {
-						lf.score({
-							name: "output_tokens",
-							value: usage.output,
-							...scoreTarget,
-						});
-					}
-					if (typeof usage.cost?.total === "number") {
-						lf.score({
-							name: "total_cost",
-							value: usage.cost.total,
-							...scoreTarget,
-						});
-					}
-				}
 			} catch (error) {
 				recordRuntimeError("Failed to end generation", error);
 			}
@@ -1032,7 +1000,6 @@ export function createGenerationLifecycleHandlers(
 							? "provider response aborted"
 							: undefined),
 			},
-			usage,
 		);
 	};
 

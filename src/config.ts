@@ -91,6 +91,14 @@ interface ConfigFileState {
 	unreadable: boolean;
 }
 
+/**
+ * Health-probe deadline for local autostart. The self-hosted health endpoint
+ * answers in about 205 ms on a busy machine; a shorter deadline makes every
+ * Pi process start Docker Compose against a healthy stack. The probe runs in
+ * the background, so the deadline never delays a prompt.
+ */
+const DEFAULT_AUTOSTART_HEALTH_TIMEOUT_MS = 2_000;
+
 function readConfigJson(path: string): ConfigFileState {
 	if (!existsSync(path)) return { values: {}, unreadable: false };
 	try {
@@ -735,7 +743,7 @@ export function resolveConfig(settings: Partial<SettingsValues>): Config {
 		localAutostartTimeoutMs: clampNumber(
 			fileConfig.localAutostartTimeoutMs ??
 				process.env.PI_LANGFUSE_AUTOSTART_TIMEOUT_MS,
-			200,
+			DEFAULT_AUTOSTART_HEALTH_TIMEOUT_MS,
 			50,
 			5_000,
 		),

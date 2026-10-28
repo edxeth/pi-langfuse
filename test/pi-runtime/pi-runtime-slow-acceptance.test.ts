@@ -40,8 +40,10 @@ describe("pi runtime slow OTLP acceptance on production timeouts", () => {
 			// handlers finish. Drain their exports before inspecting acceptance.
 			await flushClient();
 			expect(errors).toEqual([]);
-			expect(recorder.postsTotal).toBe(3);
-			expect(recorder.postsAccepted).toBe(3);
+			// The turn end sends the generation with its turn; the prompt end
+			// sends the root.
+			expect(recorder.postsTotal).toBe(2);
+			expect(recorder.postsAccepted).toBe(2);
 			expect(recorder.postsRejected).toBe(0);
 			const spans = recorder
 				.acceptedPosts()

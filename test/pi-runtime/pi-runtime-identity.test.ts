@@ -7,6 +7,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	flushClient,
 	getLastRuntimeError,
 	setRuntimeTimeoutsForTest,
 } from "../../src/langfuse-client.js";
@@ -157,6 +158,8 @@ describe("identity pseudonymization in a real Pi runtime", () => {
 
 		await runtimeCase.session.prompt("list my notes");
 		await runtimeCase.session.waitForIdle();
+		// Settling does not wait for delivery; wait for it before reading.
+		await flushClient();
 		runtimeCase.session.dispose();
 		drainRawTraceQueue();
 
@@ -266,6 +269,8 @@ describe("identity pseudonymization in a real Pi runtime", () => {
 		await waitForCondition("first prompt export", () =>
 			events.some((event) => event.type === "agent_settled"),
 		);
+		// Settling does not wait for delivery; wait for it before reading.
+		await flushClient();
 		drainRawTraceQueue();
 		const rawBefore = readRawTraceRecords(runtimeCase.rawTraceDir).length;
 		expect(rawBefore).toBeGreaterThan(0);
@@ -291,6 +296,8 @@ describe("identity pseudonymization in a real Pi runtime", () => {
 
 		await runtimeCase.session.prompt("second prompt after the failed reload");
 		await runtimeCase.session.waitForIdle();
+		// Settling does not wait for delivery; wait for it before reading.
+		await flushClient();
 		runtimeCase.session.dispose();
 		drainRawTraceQueue();
 

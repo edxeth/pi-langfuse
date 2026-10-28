@@ -436,6 +436,47 @@ describe("langfuse v5 local runtime", () => {
 		30_000,
 	);
 
+	it("retries a score through a brief server outage with one stable id", async () => {
+		// Langfuse answers 503 while its database restarts; the score must
+		// survive that window, and a retry must not create a second score.
+		const bodies: Array<Record<string, unknown>> = [];
+		const server = createServer((request, response) => {
+			const chunks: Buffer[] = [];
+			request.on("data", (chunk: Buffer) => chunks.push(chunk));
+			request.on("end", () => {
+				bodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+				const status = bodies.length <= 2 ? 503 : 200;
+				response.writeHead(status, { "content-type": "application/json" });
+				response.end(status === 200 ? '{"id":"accepted"}' : "{}");
+			});
+		});
+		await new Promise<void>((resolve) =>
+			server.listen(0, "127.0.0.1", resolve),
+		);
+		const errorsBefore = getLastRuntimeError();
+		try {
+			const runtime = await getRuntime({
+				...baseConfig,
+				host: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+			});
+			const delivered = await runtime.score({
+				name: "synthetic",
+				value: 1,
+				traceId: "b".repeat(32),
+			});
+
+			expect(delivered).toBe(true);
+			expect(bodies).toHaveLength(3);
+			expect(typeof bodies[0]?.id).toBe("string");
+			expect(new Set(bodies.map((body) => body.id)).size).toBe(1);
+			expect(getLastRuntimeError()).toBe(errorsBefore);
+		} finally {
+			await shutdownClient();
+			server.closeAllConnections();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		}
+	});
+
 	it("does not expose response bodies from rejected score writes", async () => {
 		const server = createServer((request, response) => {
 			request.resume();
@@ -502,6 +543,44 @@ describe("langfuse v5 local runtime", () => {
 		});
 		return { server, requests, receivedSpans };
 	}
+
+	it("flushes a span that just ended without waiting for its export window", async () => {
+		// The Langfuse processor hands an ended span to the exporter only after
+		// its own asynchronous preprocessing, so a flush that started first
+		// must not leave that span waiting for the batching window.
+		const restoreTimeouts = setRuntimeTimeoutsForTest({
+			exportMs: 10_000,
+			lingerMs: 60_000,
+		});
+		const { server, receivedSpans } = createAcceptOnlyOtelServer();
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", () => resolve());
+		});
+		try {
+			const address = server.address() as AddressInfo;
+			const runtime = await getRuntime({
+				...baseConfig,
+				host: `http://127.0.0.1:${address.port}`,
+			});
+			const trace = runtime.trace({ name: "pi-agent", id: "c".repeat(32) });
+			const span = runtime.span({ name: "tool:probe", traceId: trace.id });
+
+			const startedAt = Date.now();
+			// The flush starts first; the span ends while it runs.
+			const flushing = flushClient();
+			span.end();
+			await flushing;
+
+			expect(Date.now() - startedAt).toBeLessThan(5_000);
+			expect(receivedSpans.map((span) => span.name)).toContain("tool:probe");
+		} finally {
+			await shutdownClient();
+			restoreTimeouts();
+			server.closeAllConnections();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		}
+	}, 20_000);
 
 	it("delivers an accepted prompt with one-way export and no diagnostics", async () => {
 		const previousError = getLastRuntimeError();
@@ -980,7 +1059,10 @@ describe("langfuse v5 local runtime", () => {
 	});
 
 	it("stamps trace identity on child spans before the prompt root exports", async () => {
-		const restoreTimeouts = setRuntimeTimeoutsForTest({ exportMs: 200 });
+		// Short enough that a failed export ends well inside the test timeout,
+		// long enough for a loopback export on a heavily loaded machine (200 ms
+		// was not).
+		const restoreTimeouts = setRuntimeTimeoutsForTest({ exportMs: 2_000 });
 		const requests: Array<{ url: string; body: string }> = [];
 		const server = createServer((request, response) => {
 			const chunks: Buffer[] = [];

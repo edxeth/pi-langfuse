@@ -32,7 +32,7 @@ afterEach(() => {
 });
 
 describe("source metadata", () => {
-	it("sanitizes credentialed remotes and ignores unsafe override keys", () => {
+	it("sanitizes credentialed remotes and ignores unsafe override keys", async () => {
 		const { repo } = createRepository();
 		git(repo, [
 			"remote",
@@ -54,7 +54,7 @@ describe("source metadata", () => {
 			}),
 		);
 
-		const metadata = collectSourceMetadata(repo);
+		const metadata = await collectSourceMetadata(repo);
 		expect(metadata).toMatchObject({
 			source_type: "git-repo",
 			repo_root_name: "repo",
@@ -73,11 +73,11 @@ describe("source metadata", () => {
 		expect(JSON.stringify(metadata)).not.toContain(repo);
 	});
 
-	it("keeps repository identity safe for local remotes and missing remote metadata", () => {
+	it("keeps repository identity safe for local remotes and missing remote metadata", async () => {
 		const { repo } = createRepository();
 		const localRemote = join(repo, "../private-source.git");
 		git(repo, ["remote", "add", "origin", `file://${localRemote}`]);
-		const metadata = collectSourceMetadata(repo);
+		const metadata = await collectSourceMetadata(repo);
 
 		expect(metadata.source_type).toBe("git-repo");
 		expect(metadata.git_commit).toMatch(/^[0-9a-f]{40}$/);
@@ -86,7 +86,7 @@ describe("source metadata", () => {
 		expect(JSON.stringify(metadata)).not.toContain(repo);
 	});
 
-	it("returns only non-git markers outside usable repositories", () => {
+	it("returns only non-git markers outside usable repositories", async () => {
 		const root = mkdtempSync(join(tmpdir(), "pi-langfuse-non-git-"));
 		roots.push(root);
 		writeFileSync(
@@ -94,13 +94,13 @@ describe("source metadata", () => {
 			JSON.stringify({ repo_identity: "must-not-pass", token: "secret-token" }),
 		);
 
-		expect(collectSourceMetadata(root)).toEqual({
+		expect(await collectSourceMetadata(root)).toEqual({
 			source_type: "non-git",
 			metadata_source: "non-git",
 		});
 	});
 
-	it("rejects cross-platform absolute paths in metadata overrides", () => {
+	it("rejects cross-platform absolute paths in metadata overrides", async () => {
 		const { repo } = createRepository();
 		writeFileSync(
 			join(repo, ".pi-langfuse.metadata.json"),
@@ -111,12 +111,60 @@ describe("source metadata", () => {
 			}),
 		);
 
-		const metadata = collectSourceMetadata(repo);
+		const metadata = await collectSourceMetadata(repo);
 		expect(metadata).not.toHaveProperty("service_name");
 		expect(metadata).not.toHaveProperty("project_slug");
 		expect(metadata).not.toHaveProperty("environment");
 		expect(JSON.stringify(metadata)).not.toContain("private-project");
 		expect(JSON.stringify(metadata)).not.toContain("private-secret");
+	});
+
+	it("records the branch and commit, and the branch of a repository without commits", async () => {
+		const { repo } = createRepository();
+		git(repo, ["checkout", "-b", "feature/metadata"]);
+		const commit = execFileSync("git", ["rev-parse", "HEAD"], {
+			cwd: repo,
+			encoding: "utf8",
+		}).trim();
+		expect(await collectSourceMetadata(repo)).toMatchObject({
+			source_type: "git-repo",
+			repo_root_name: "repo",
+			git_branch: "feature/metadata",
+			git_commit: commit,
+		});
+		git(repo, ["checkout", "--detach"]);
+		const detached = await collectSourceMetadata(repo);
+		expect(detached).not.toHaveProperty("git_branch");
+		expect(detached.git_commit).toBe(commit);
+
+		const root = mkdtempSync(join(tmpdir(), "pi-langfuse-unborn-"));
+		roots.push(root);
+		const unborn = join(root, "fresh");
+		mkdirSync(unborn);
+		git(unborn, ["init"]);
+		const branch = execFileSync("git", ["branch", "--show-current"], {
+			cwd: unborn,
+			encoding: "utf8",
+		}).trim();
+		const metadata = await collectSourceMetadata(unborn);
+		expect(metadata).toMatchObject({
+			source_type: "git-repo",
+			repo_root_name: "fresh",
+			git_branch: branch,
+		});
+		expect(metadata).not.toHaveProperty("git_commit");
+	});
+
+	it("lets the event loop run while git answers", async () => {
+		// Prompt start awaits this; synchronous git calls froze Pi for their
+		// whole duration, about 30 ms on an idle machine.
+		const { repo } = createRepository();
+		let ticked = false;
+		setImmediate(() => {
+			ticked = true;
+		});
+		await collectSourceMetadata(repo);
+		expect(ticked).toBe(true);
 	});
 
 	it("normalizes supported remote forms without retaining credentials", () => {
