@@ -4,6 +4,14 @@ Notes for v2.1.2 and earlier are on the [GitHub releases page](https://github.co
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-10-28
+
+### New Features
+
+- **Pseudonymous identity mode**: Send traces without your home directory, user ID, or repository names in readable form. See [Identity pseudonymization](docs/privacy.md#identity-pseudonymization).
+- **Training review records**: Turn raw traces into OpenAI Chat, Anthropic Messages, or ShareGPT records for review, with a required secret scan. See [Training review records](README.md#training-review-records---format).
+- **Feedback scores**: Rate the last trace as good or bad from Pi with `/langfuse-score`. See [/langfuse-score](README.md#langfuse-score).
+
 ### Breaking Changes
 
 - Removed the per-response `input_tokens`, `output_tokens`, and `total_cost` scores. Token usage and cost stay on each `llm-response` generation (`usageDetails`, `costDetails`), where Langfuse's usage and cost views read them. Each copy cost one HTTP request and one stored server object; together they were 87% of all score traffic. Dashboards and queries that read these score names must read the generation's usage and cost instead. A total cost of exactly zero was kept as a score; an all-zero cost is not recorded on the generation.
@@ -13,6 +21,7 @@ Notes for v2.1.2 and earlier are on the [GitHub releases page](https://github.co
 
 - Added the `/langfuse-score <good|bad> [comment]` command. It writes a `user_feedback` score (`good` = 1, `bad` = 0) on the current session's last finalized trace and redacts the comment first. See [/langfuse-score](README.md#langfuse-score).
 - Added the prompt scores `last_tool_is_error`, `edit_write_call_count`, and `ask_user_wait_ms`, the time that [pi-ask](https://github.com/FasalZein/pi-ask) dialogs were open. See [Prompt scores](README.md#prompt-scores).
+- Added the `captureProvenance` field to raw `provider_request` and `assistant_output` records. For each content field it states whether capture policy or payload limits changed the value. Raw `provider_request` records also add `serverSideContext`, the names of fields such as `previous_response_id` that refer to context held by the provider. See [Truncation and privacy](docs/architecture.md#truncation-and-privacy).
 
 #### Pseudonymous identity mode
 Refs: `b8c638b`
@@ -45,10 +54,11 @@ Added `pi-langfuse-export --format openai-chat|anthropic-messages|sharegpt`. Bes
 - Changed raw `assistant_output` records: `text` holds only the answer, and the records add `toolCalls` and, when captured, visible `thinking`.
 - Changed PIN and OTP redaction markers to carry no fingerprint (for example `[REDACTED:pin]`), because short codes can be recovered from unsalted hashes.
 - Changed `/langfuse-privacy` to also show the identity mode.
+- Changed full provider-request copies in telemetry to keep OpenAI Responses `reasoning.summary` text under the assistant-output capture policy. Before, reasoning summaries were always left out. Reasoning `content`, `encrypted_content`, and other opaque reasoning data are still always left out, and the requests sent to providers do not change.
 
 ### Fixed
 
-- Fixed local autostart recreating running Langfuse containers. The health check gave up after 200 ms, which a healthy stack misses where `localhost` resolves to IPv6 first, so the first prompt of every Pi process ran `docker compose up -d` with that process's environment. A project environment that sets variables such as `POSTGRES_USER` changed the stack's configuration, and Compose recreated Postgres, which interrupted ingestion for every session. Autostart now checks in the background with a 2,000 ms deadline (`localAutostartTimeoutMs`), runs `docker compose up -d --no-recreate`, and passes only the variables the Docker client needs.
+- Fixed local autostart recreating running Langfuse containers. The health check gave up after 200 ms, which a healthy stack misses where `localhost` resolves to IPv6 first, so the first prompt of every Pi process ran `docker compose up -d` with that process's environment. A project environment that sets variables such as `POSTGRES_USER` changed the stack's configuration, and Compose recreated Postgres, which interrupted ingestion for every session. Autostart now checks in the background with a 2,000 ms deadline (`localAutostartTimeoutMs`, environment variable `PI_LANGFUSE_AUTOSTART_TIMEOUT_MS`), runs `docker compose up -d --no-recreate`, and passes only the variables the Docker client needs.
 - Fixed `agent.turn` spans recording no input. Each turn now records the messages newly delivered at its provider request, shaped by the capture policy.
 
 #### Runs started by extension messages are traced on Pi 1.2 and later
